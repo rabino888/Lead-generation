@@ -13,7 +13,7 @@ from agent.integrations.llm import call_llm
 from agent.models import ClientProfile, ICPProfile, RawCompany
 from agent.utils.logger import get_run_logger
 
-_BATCH_SIZE = 20  # Number of companies per Claude call
+_BATCH_SIZE = 10  # Companies per LLM call — smaller batches = more reliable JSON output
 
 
 def run(
@@ -116,7 +116,7 @@ Respond ONLY with a JSON array of objects, one per company, in the same order:
 """
 
     try:
-        results = call_llm(prompt, max_tokens=1000, expect_json=True)
+        results = call_llm(prompt, max_tokens=2000, expect_json=True)
         if not isinstance(results, list):
             raise ValueError("Expected a list")
 

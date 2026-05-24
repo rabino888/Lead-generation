@@ -9,7 +9,7 @@ import traceback
 from typing import Optional
 
 from agent.integrations.apollo import get_credits_used
-from agent.integrations.firecrawl import get_pages_crawled
+from agent.integrations.firecrawl import get_pages_crawled, reset_pages_crawled
 from agent.integrations.llm import get_tokens_used
 from agent.models import ClientProfile, RunRequest, RunStatus
 from agent.stages import contacts, discovery, hooks, prefilter, qualify, report, website
@@ -32,6 +32,9 @@ async def run_pipeline(
     log.info("PIPELINE START — run_id: %s | client: %s", run_id, client_profile.client_id)
     log.info("Mode: %s | max_leads: %d", request.mode.value, request.max_leads)
     log.info("=" * 60)
+
+    # Reset per-run counters
+    reset_pages_crawled()
 
     run_tracker.update_run(run_id, status=RunStatus.RUNNING)
 
@@ -63,9 +66,10 @@ async def run_pipeline(
             run_tracker.fail_run(run_id, "All companies filtered below ICP threshold")
             return
 
-        # Limit to a reasonable processing window
-        # (3x max_leads so we have enough to hit the qualified target)
-        processing_window = filtered_companies[:request.max_leads * 3]
+        # Initial processing window: enough candidates for a good pre-filter pass.
+        # At least 20 or 5× max_leads, whichever is greater.
+        initial_window_size = max(request.max_leads * 5, 20)
+        processing_window = filtered_companies[:initial_window_size]
         log.info("Processing window: %d companies", len(processing_window))
 
         # ── Stage 3: Website Enrichment ───────────────────────────────────────
@@ -92,18 +96,27 @@ async def run_pipeline(
         all_qualified.extend(qualified_batch)
         all_partial.extend(partial_batch)
 
-        # If we haven't hit max_leads yet and there are more filtered companies
-        # available beyond the initial window, process more in batches
-        remaining = filtered_companies[request.max_leads * 3:]
+        # If we haven't hit max_leads yet and there are more filtered companies,
+        # process up to MAX_EXTRA_BATCHES additional batches to find more.
+        # Hard cap prevents multi-hour runs when Apollo has no email data.
+        remaining = filtered_companies[initial_window_size:]
         batch_size = 20
+        MAX_EXTRA_BATCHES = 2  # At most 2 extra batches (40 more companies)
+        extra_batches_done = 0
 
-        while len(all_qualified) < request.max_leads and remaining:
+        while (
+            len(all_qualified) < request.max_leads
+            and remaining
+            and extra_batches_done < MAX_EXTRA_BATCHES
+        ):
+            extra_batches_done += 1
             extra_batch = remaining[:batch_size]
             remaining = remaining[batch_size:]
 
             log.info(
-                "Need more qualified leads (%d/%d) — processing %d more companies",
-                len(all_qualified), request.max_leads, len(extra_batch)
+                "Need more qualified leads (%d/%d) — processing %d more companies (batch %d/%d)",
+                len(all_qualified), request.max_leads, len(extra_batch),
+                extra_batches_done, MAX_EXTRA_BATCHES,
             )
 
             extra_website = website.run(extra_batch, client_profile, run_id, log)
@@ -117,6 +130,14 @@ async def run_pipeline(
             )
             all_qualified.extend(extra_qualified)
             all_partial.extend(extra_partial)
+
+        if len(all_qualified) < request.max_leads and not remaining:
+            log.info("Exhausted all candidate companies — generating partial report")
+        elif len(all_qualified) < request.max_leads:
+            log.info(
+                "Reached max extra batches (%d) — generating report with %d qualified, %d partial",
+                MAX_EXTRA_BATCHES, len(all_qualified), len(all_partial),
+            )
 
         # Trim to max_leads
         all_qualified = all_qualified[:request.max_leads]

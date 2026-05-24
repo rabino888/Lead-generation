@@ -25,17 +25,28 @@ def google_maps_search(keyword: str, location: str, max_results: int = 50) -> li
     Search Google Maps for businesses matching keyword + location.
     Used as Apollo fallback for local/niche businesses.
     """
-    log.info("Apify Google Maps: '%s' in '%s' (max %d)", keyword, location, max_results)
+    # Build a clean search string — avoid duplicating location in keyword
+    search_query = keyword.strip()
+    if location and location.lower() not in search_query.lower():
+        search_query = f"{search_query} {location}"
+
+    log.info("Apify Google Maps: '%s' (max %d)", search_query, max_results)
     client = _get_client()
 
     try:
         run = client.actor("compass/crawler-google-places").call(run_input={
-            "searchStringsArray": [f"{keyword} {location}"],
+            "searchStringsArray": [search_query],
             "maxCrawledPlaces": max_results,
             "language": "en",
             "exportPlaceUrls": False,
         })
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        # apify-client 3.x returns a Run model (attribute access), not a dict
+        dataset_id = (
+            run.default_dataset_id
+            if hasattr(run, "default_dataset_id")
+            else run.get("defaultDatasetId")
+        )
+        items = list(client.dataset(dataset_id).iterate_items())
     except Exception as e:
         log.error("Apify Google Maps failed: %s", e)
         return []
@@ -74,7 +85,12 @@ def google_search_companies(query: str, max_results: int = 20) -> list[RawCompan
             "resultsPerPage": max_results,
             "mobileResults": False,
         })
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        dataset_id = (
+            run.default_dataset_id
+            if hasattr(run, "default_dataset_id")
+            else run.get("defaultDatasetId")
+        )
+        items = list(client.dataset(dataset_id).iterate_items())
     except Exception as e:
         log.error("Apify Google Search failed: %s", e)
         return []
@@ -131,7 +147,12 @@ def get_linkedin_profile(company_name: str, website: Optional[str] = None) -> di
             "queries": [search_query],
             "proxy": {"useApifyProxy": True},
         })
-        items = list(client.dataset(run["defaultDatasetId"]).iterate_items())
+        dataset_id = (
+            run.default_dataset_id
+            if hasattr(run, "default_dataset_id")
+            else run.get("defaultDatasetId")
+        )
+        items = list(client.dataset(dataset_id).iterate_items())
         if items:
             item = items[0]
             return {

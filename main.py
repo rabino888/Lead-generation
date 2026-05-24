@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
-load_dotenv()
+load_dotenv(override=True)
 
 from agent.models import (
     ClientProfile,

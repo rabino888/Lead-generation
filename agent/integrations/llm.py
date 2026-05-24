@@ -51,7 +51,7 @@ def _call_claude(prompt: str, system: str, max_tokens: int) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     response = client.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-5",
         max_tokens=max_tokens,
         system=system,
         messages=[{"role": "user", "content": prompt}],
@@ -81,9 +81,18 @@ def _call_openai(prompt: str, system: str, max_tokens: int) -> str:
 def _call_gemini(prompt: str, system: str, max_tokens: int) -> str:
     import google.generativeai as genai
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    response = model.generate_content(f"{system}\n\n{prompt}")
-    return response.text
+    # Try flash first, fall back to pro
+    for model_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+        try:
+            model = genai.GenerativeModel(
+                model_name=model_name,
+                generation_config={"max_output_tokens": max_tokens},
+            )
+            response = model.generate_content(f"{system}\n\n{prompt}")
+            return response.text
+        except Exception:
+            continue
+    raise RuntimeError("No Gemini model available")
 
 
 def _has_key(provider: str) -> bool:

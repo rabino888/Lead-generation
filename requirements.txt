@@ -7,11 +7,11 @@ requests==2.32.3
 
 # LLMs
 anthropic==0.40.0
-openai==1.54.0
+openai==1.57.0
 google-generativeai==0.8.3
 
 # Data sources
-apify-client==1.8.1
+apify-client==3.0.1
 firecrawl-py==1.4.0
 
 # Google

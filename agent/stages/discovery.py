@@ -27,13 +27,20 @@ def run(
     log.info("Stage 1 — Discovery (mode: %s)", request.mode.value)
 
     icp = request.icp or client_profile.icp
-    target = request.max_leads * 3  # Fetch 3x — pre-filter will reduce this
+    # Fetch 10× candidates so the pre-filter has enough to work with.
+    # Minimum 25 so a small max_leads value still gives Apollo decent search room.
+    target = max(request.max_leads * 10, 25)
 
     # ── Mode 3: Company List ──────────────────────────────────────────────────
     if request.mode == InputMode.COMPANY_LIST:
         return _enrich_company_list(request.company_list or [], icp, run_id, log)
 
     # ── Mode 1 & 2: Apollo-first ──────────────────────────────────────────────
+    # Pre-extract location from keyword so Apify fallback uses a clean query
+    from agent.integrations.apollo import _split_keyword_and_location
+    clean_keyword, kw_location = _split_keyword_and_location(request.keyword or "")
+    effective_location = icp.location or kw_location
+
     companies = apollo.search_companies(
         icp=icp,
         keyword=request.keyword,
@@ -41,13 +48,16 @@ def run(
     )
     log.info("Apollo returned %d companies", len(companies))
 
-    # Apify fallback: if Apollo is short AND keyword suggests local/niche
-    if len(companies) < request.max_leads and _is_local_search(request.keyword, icp):
+    # Apify fallback: trigger when Apollo hasn't returned enough candidates to
+    # give the pre-filter real choice.  We need `target` candidates (not just
+    # max_leads) and the search must look like a local/agency-type query.
+    if len(companies) < target and _is_local_search(request.keyword, icp):
         log.info("Apollo results insufficient — triggering Apify fallback")
-        location = icp.location or _extract_location_from_keyword(request.keyword or "")
+        # Use clean keyword (location stripped out) + proper location separately
+        apify_keyword = clean_keyword or request.keyword or icp.industry or "business"
         apify_companies = apify.google_maps_search(
-            keyword=request.keyword or icp.industry or "business",
-            location=location or "",
+            keyword=apify_keyword,
+            location=effective_location or "",
             max_results=target - len(companies),
         )
         companies = _merge_and_deduplicate(companies, apify_companies)
@@ -112,8 +122,17 @@ def _merge_and_deduplicate(
 
 
 def _is_local_search(keyword: Optional[str], icp: ICPProfile) -> bool:
-    """Heuristic: does this search target local businesses?"""
-    local_terms = ["restaurant", "clinic", "gym", "shop", "store", "local", "near", "maps"]
+    """
+    Heuristic: does this search target local/niche businesses that benefit
+    from Google Maps / Apify augmentation?
+    """
+    local_terms = [
+        # Physical local businesses
+        "restaurant", "clinic", "gym", "shop", "store", "local", "near", "maps",
+        # Agency / boutique businesses that are geographically concentrated
+        "agency", "agencia", "studio", "boutique", "firm", "consultancy",
+        "marketing", "advertising", "branding", "creative", "pr ", "seo",
+    ]
     text = ((keyword or "") + " " + (icp.industry or "")).lower()
     return any(term in text for term in local_terms) or bool(icp.location)
 

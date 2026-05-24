@@ -63,29 +63,54 @@ def search_companies(
         "page": 1,
     }
 
-    # Build search filters from ICP
+    # Build keyword query — extract the business-type part, not the location
+    search_terms: list[str] = []
+    clean_keyword = keyword
     if keyword:
-        payload["q_keywords"] = keyword
-    if icp.industry:
-        payload["organization_industry_tag_ids"] = []
-        payload["q_organization_keyword_tags"] = [icp.industry]
+        # Extract location from keyword so we can filter separately
+        clean_keyword, extracted_location = _split_keyword_and_location(keyword)
+        if clean_keyword:
+            search_terms.append(clean_keyword)
+        # Use extracted location as fallback if ICP has no location
+        if extracted_location and not icp.location:
+            icp = icp.model_copy(update={"location": extracted_location})
+    if not search_terms and icp.industry:
+        search_terms.append(icp.industry)
+    if search_terms:
+        payload["q_keywords"] = " ".join(search_terms)
+
+    # Industry filtering — much more precise than keyword alone
+    # Maps keyword/ICP industry to Apollo's standardised industry categories
+    industries = _resolve_industries(clean_keyword or "", icp.industry or "")
+    if industries:
+        payload["organization_industries"] = industries
+
+    # Location filtering — use country code + city name separately for accuracy
     if icp.location:
+        country_code = _location_to_country_code(icp.location)
+        if country_code:
+            payload["organization_country_codes"] = [country_code]
+        # Also add city as a location string for narrower matching
         payload["organization_locations"] = [icp.location]
+
+    # Company size filtering
     if icp.company_size_min or icp.company_size_max:
-        size_range = []
-        if icp.company_size_min:
-            size_range.append(str(icp.company_size_min))
-        if icp.company_size_max:
-            size_range.append(str(icp.company_size_max))
-        payload["organization_num_employees_ranges"] = [",".join(size_range)]
+        low = icp.company_size_min or 1
+        high = icp.company_size_max or 10000
+        payload["organization_num_employees_ranges"] = [f"{low},{high}"]
+    else:
+        # Default: cap at 5 000 employees when no size is specified.
+        # This prevents Fortune-500 companies (Google, Amazon, etc.) from
+        # dominating results when searching for agencies / boutique firms.
+        payload["organization_num_employees_ranges"] = ["1,5000"]
 
-    try:
-        data = _post("mixed_companies/search", payload)
-    except Exception as e:
-        log.error("Apollo company search failed: %s", e)
-        return []
+    # Exclude keywords (e.g. "recruitment", "freelance")
+    if icp.excluded_keywords:
+        payload["q_not_keywords"] = " ".join(icp.excluded_keywords)
 
-    companies = data.get("organizations", []) or data.get("accounts", []) or []
+    log.info("Apollo search payload: %s", {k: v for k, v in payload.items() if k != "api_key"})
+
+    companies = _apollo_search_with_fallback(payload)
     log.info("Apollo returned %d companies", len(companies))
 
     results: list[RawCompany] = []
@@ -104,6 +129,48 @@ def search_companies(
         ))
 
     return results
+
+
+def _apollo_search_with_fallback(payload: dict) -> list:
+    """
+    Execute an Apollo company search with progressive filter relaxation.
+    If the strict payload returns 0 results:
+      1. Retry without industry filter (keeps location + size)
+      2. Retry without location filter too (keyword + size only)
+    Returns the first non-empty result list, or [] if all retries fail.
+    """
+    def _do_search(p: dict) -> list:
+        try:
+            data = _post("mixed_companies/search", p)
+            return data.get("organizations", []) or data.get("accounts", []) or []
+        except Exception as e:
+            log.error("Apollo company search failed: %s", e)
+            return []
+
+    # 1. Full search
+    companies = _do_search(payload)
+    if companies:
+        return companies
+
+    # 2. Drop industry filter (it can be too narrow on basic plan)
+    if "organization_industries" in payload:
+        relaxed = {k: v for k, v in payload.items() if k != "organization_industries"}
+        log.info("Apollo: 0 results with industry filter — retrying without it")
+        log.info("Apollo retry payload: %s", {k: v for k, v in relaxed.items() if k != "api_key"})
+        companies = _do_search(relaxed)
+        if companies:
+            return companies
+
+    # 3. Also drop location filter (keyword + size only)
+    if any(k in payload for k in ("organization_country_codes", "organization_locations")):
+        broad = {k: v for k, v in payload.items()
+                 if k not in ("organization_industries", "organization_country_codes", "organization_locations")}
+        log.info("Apollo: still 0 results — retrying without location filter")
+        log.info("Apollo broad payload: %s", {k: v for k, v in broad.items() if k != "api_key"})
+        companies = _do_search(broad)
+        return companies
+
+    return []
 
 
 def enrich_contacts(
@@ -260,3 +327,73 @@ def _guess_generic_email(website: str) -> Optional[str]:
     if domain:
         return f"info@{domain}"
     return None
+
+
+def _location_to_country_code(location: str) -> Optional[str]:
+    """Map common location strings to ISO 3166-1 alpha-2 country codes."""
+    location_lower = location.lower()
+    country_map = {
+        "spain": "ES", "españa": "ES", "madrid": "ES", "barcelona": "ES",
+        "uk": "GB", "united kingdom": "GB", "england": "GB", "london": "GB",
+        "usa": "US", "united states": "US", "america": "US",
+        "germany": "DE", "deutschland": "DE", "berlin": "DE",
+        "france": "FR", "paris": "FR",
+        "italy": "IT", "rome": "IT",
+        "netherlands": "NL", "amsterdam": "NL",
+        "portugal": "PT", "lisbon": "PT",
+        "mexico": "MX", "colombia": "CO", "argentina": "AR",
+        "brazil": "BR", "brasil": "BR",
+        "canada": "CA", "australia": "AU",
+    }
+    for key, code in country_map.items():
+        if key in location_lower:
+            return code
+    return None
+
+
+def _split_keyword_and_location(keyword: str) -> tuple[str, Optional[str]]:
+    """
+    Heuristically split a freeform keyword like "digital marketing agency Madrid"
+    into (business_type, location).  Returns (original_keyword, None) if no
+    recognisable location is found.
+    """
+    location_hints = [
+        "madrid", "barcelona", "spain", "españa", "london", "uk", "paris",
+        "berlin", "amsterdam", "lisbon", "rome", "new york", "los angeles",
+        "san francisco", "chicago", "toronto", "sydney", "melbourne",
+        "mexico city", "bogota", "buenos aires", "sao paulo",
+    ]
+    kw_lower = keyword.lower()
+    for hint in location_hints:
+        if hint in kw_lower:
+            # Remove the location word(s) from the keyword
+            clean = kw_lower.replace(hint, "").strip().strip(",").strip()
+            return clean or keyword, hint.title()
+    return keyword, None
+
+
+def _resolve_industries(keyword: str, icp_industry: str) -> list[str]:
+    """
+    Map a keyword + ICP industry to Apollo's standardised industry strings.
+    Returns an empty list if no confident mapping is found (Apollo will search
+    without industry restriction).
+    """
+    combined = (keyword + " " + icp_industry).lower()
+
+    if any(t in combined for t in ["marketing", "advertising", "agency", "branding", "creative", "media buy"]):
+        return ["marketing and advertising", "advertising services", "public relations and communications"]
+    if any(t in combined for t in ["software", "saas", "app", "platform", "startup"]):
+        return ["computer software", "internet", "information technology and services"]
+    if any(t in combined for t in ["consulting", "advisory", "management consulting"]):
+        return ["management consulting", "business consulting and services"]
+    if any(t in combined for t in ["seo", "sem", "content", "inbound", "digital"]):
+        return ["marketing and advertising", "internet", "advertising services"]
+    if any(t in combined for t in ["pr ", "public relations", "communications"]):
+        return ["public relations and communications", "marketing and advertising"]
+    if any(t in combined for t in ["restaurant", "food", "cafe", "catering"]):
+        return ["restaurants", "food and beverages"]
+    if any(t in combined for t in ["real estate", "property", "inmobiliaria"]):
+        return ["real estate"]
+    if any(t in combined for t in ["law firm", "legal", "attorney", "abogado"]):
+        return ["law practice", "legal services"]
+    return []
