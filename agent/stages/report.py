@@ -51,16 +51,19 @@ def run(
         qualified_leads, partial_leads, client_profile, run_state.run_id, log
     )
 
-    # Write Google Sheet
+    # Write Google Sheet (new file inside client's Drive folder)
     sheet_url = None
+    folder_url = None
     try:
-        sheet_url = write_leads_to_sheet(
+        sheet_url, folder_url = write_leads_to_sheet(
             sheet_name=sheet_name,
             qualified_leads=qualified_leads,
             partial_leads=partial_leads,
             recommendations=recommendations,
             run_id=run_state.run_id,
+            client_profile=client_profile,
         )
+        log.info("Client folder: %s", folder_url)
     except Exception as e:
         log.error("Failed to write Google Sheet: %s", e)
 

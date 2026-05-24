@@ -1,5 +1,7 @@
 # Secrets
 .env
+*.json
+!package.json
 
 # Data & outputs (client data stays local)
 data/

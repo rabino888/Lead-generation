@@ -63,6 +63,7 @@ class ClientProfile(BaseModel):
     client_id: str
     name: str
     api_key: str
+    client_email: Optional[str] = None   # shared with this email as viewer on their Drive folder
     icp: ICPProfile = Field(default_factory=ICPProfile)
     active: bool = True
 

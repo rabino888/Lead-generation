@@ -1,7 +1,8 @@
 """
 Google Sheets integration.
-- read_clients_sheet()  → list[ClientProfile]
-- write_leads_to_sheet() → sheet URL
+- read_clients_sheet()   → list[ClientProfile]   (reads management sheet)
+- write_leads_to_sheet() → (sheet_url, folder_url)
+    Creates a new standalone Google Sheet inside the client's Drive folder.
 """
 from __future__ import annotations
 
@@ -22,21 +23,39 @@ SCOPES = [
 ]
 
 
-def _get_client() -> gspread.Client:
-    """Authenticate and return a gspread client."""
-    raw = os.environ["GOOGLE_SERVICE_ACCOUNT"]
-    info = json.loads(raw)
-    creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+def _get_gspread_client() -> gspread.Client:
+    """
+    Authenticate gspread.
+    Prefers GOOGLE_SERVICE_ACCOUNT_FILE (local dev), falls back to
+    GOOGLE_SERVICE_ACCOUNT JSON string (Railway).
+    """
+    file_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    json_str = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "").strip()
+
+    if file_path and os.path.exists(file_path):
+        creds = Credentials.from_service_account_file(file_path, scopes=SCOPES)
+    elif json_str:
+        info = json.loads(json_str)
+        creds = Credentials.from_service_account_info(info, scopes=SCOPES)
+    else:
+        raise RuntimeError(
+            "No Google credentials configured. "
+            "Set GOOGLE_SERVICE_ACCOUNT_FILE or GOOGLE_SERVICE_ACCOUNT."
+        )
     return gspread.authorize(creds)
 
+
+# ── Client Management Sheet ───────────────────────────────────────────────────
 
 def read_clients_sheet() -> list[ClientProfile]:
     """
     Read the LeadGen Clients management sheet.
-    Expected columns: client_id | name | api_key | icp_industry | icp_location |
-                      icp_size_min | icp_size_max | icp_job_titles | active
+
+    Expected columns:
+    client_id | name | api_key | icp_industry | icp_location |
+    icp_size_min | icp_size_max | icp_job_titles | client_email | active
     """
-    gc = _get_client()
+    gc = _get_gspread_client()
     sheet_id = os.environ["CLIENTS_SHEET_ID"]
     ws = gc.open_by_key(sheet_id).sheet1
     rows = ws.get_all_records()
@@ -46,7 +65,6 @@ def read_clients_sheet() -> list[ClientProfile]:
         if not row.get("client_id"):
             continue
 
-        # Parse job titles (comma-separated string in sheet)
         job_titles_raw = str(row.get("icp_job_titles", "")).strip()
         job_titles = [t.strip() for t in job_titles_raw.split(",") if t.strip()] or [
             "CEO", "Founder", "Director", "Manager"
@@ -65,6 +83,7 @@ def read_clients_sheet() -> list[ClientProfile]:
             client_id=str(row["client_id"]),
             name=str(row.get("name", "")),
             api_key=str(row["api_key"]),
+            client_email=str(row.get("client_email", "")) or None,
             icp=icp,
             active=active_val in ("TRUE", "1", "YES"),
         ))
@@ -72,141 +91,132 @@ def read_clients_sheet() -> list[ClientProfile]:
     return clients
 
 
+# ── Lead Output Sheet ─────────────────────────────────────────────────────────
+
 def write_leads_to_sheet(
     sheet_name: str,
     qualified_leads: list[Lead],
     partial_leads: list[Lead],
     recommendations: Optional[str],
     run_id: str,
-) -> str:
+    client_profile: ClientProfile,
+) -> tuple[str, str]:
     """
-    Write all leads to a new tab in the outputs sheet.
-    Returns the URL of the sheet.
+    Creates a new Google Sheet inside the client's Drive folder.
+    Returns (sheet_url, folder_url).
     """
-    gc = _get_client()
-    sheet_id = os.environ["OUTPUTS_SHEET_ID"]
-    spreadsheet = gc.open_by_key(sheet_id)
+    from agent.integrations.drive import create_sheet_in_folder, get_or_create_client_folder
 
-    # Create new worksheet tab
-    tab_name = sheet_name[:100]  # Google Sheets tab name limit
-    try:
-        ws = spreadsheet.add_worksheet(title=tab_name, rows=2000, cols=30)
-    except Exception:
-        # Tab already exists — append timestamp to make unique
-        tab_name = f"{tab_name[:90]} {datetime.utcnow().strftime('%H%M%S')}"
-        ws = spreadsheet.add_worksheet(title=tab_name, rows=2000, cols=30)
+    # 1. Ensure client folder exists in shared Drive
+    folder_id, folder_url = get_or_create_client_folder(
+        client_name=client_profile.name,
+        client_email=client_profile.client_email or "",
+    )
+
+    # 2. Create a new Google Sheet file inside that folder
+    file_id = create_sheet_in_folder(sheet_name, folder_id)
+
+    # 3. Open with gspread and write data
+    gc = _get_gspread_client()
+    spreadsheet = gc.open_by_key(file_id)
+    ws = spreadsheet.sheet1
+    ws.update_title("Leads")
 
     headers = [
         "lead_id", "company_name", "website", "industry", "location",
         "company_size", "founded_year", "company_linkedin",
-        # Contacts
         "decision_maker_name", "decision_maker_title", "decision_maker_email",
         "decision_maker_linkedin", "decision_maker_direct_phone",
         "company_phone", "company_generic_email",
-        # Apollo signals
         "intent_topics", "intent_strength", "technologies_used",
         "funding_round", "hiring_signals",
-        # Website
         "tech_stack", "services_offered", "content_quality_score",
         "seo_health", "has_chatbot", "has_blog", "last_blog_post",
         "social_proof", "website_summary",
-        # Qualification
         "icp_match_score", "lead_score", "pain_points",
         "opportunities", "qualification_notes",
-        # Outreach
         "personalized_hook", "recommended_first_service",
-        # Meta
         "enrichment_status", "scraped_at",
     ]
 
     rows: list[list] = [headers]
 
-    def lead_to_row(lead: Lead) -> list:
-        dm = lead.decision_maker or {}
-        wa = lead.website_analysis
-        sig = lead.apollo_signals
-
-        def _get(obj, attr, default=""):
-            if obj is None:
-                return default
-            if isinstance(obj, dict):
-                return obj.get(attr, default)
-            return getattr(obj, attr, default) or default
-
-        return [
-            lead.lead_id,
-            lead.company_name,
-            lead.website or "",
-            lead.industry or "",
-            lead.location or "",
-            lead.company_size or "",
-            lead.founded_year or "",
-            lead.company_linkedin_url or "",
-            # Contacts
-            _get(lead.decision_maker, "name"),
-            _get(lead.decision_maker, "title"),
-            _get(lead.decision_maker, "email"),
-            _get(lead.decision_maker, "linkedin_url"),
-            _get(lead.decision_maker, "direct_phone"),
-            lead.company_phone or "",
-            lead.company_generic_email or "",
-            # Apollo signals
-            ", ".join(sig.intent_topics),
-            sig.intent_strength or "",
-            ", ".join(sig.technologies_used),
-            sig.funding_round or "",
-            ", ".join(sig.hiring_signals),
-            # Website
-            ", ".join(_get(wa, "tech_stack_detected", [])),
-            ", ".join(_get(wa, "services_offered", [])),
-            _get(wa, "content_quality_score"),
-            ", ".join(_get(wa, "seo_health", [])),
-            _get(wa, "has_chatbot"),
-            _get(wa, "has_blog"),
-            _get(wa, "last_blog_post_date"),
-            _get(wa, "social_proof"),
-            _get(wa, "website_summary"),
-            # Qualification
-            lead.icp_match_score or "",
-            lead.lead_score or "",
-            ", ".join(lead.pain_points),
-            ", ".join(lead.opportunities),
-            lead.qualification_notes or "",
-            # Outreach
-            lead.personalized_hook or "",
-            lead.recommended_first_service or "",
-            # Meta
-            lead.enrichment_status.value,
-            lead.scraped_at.strftime("%Y-%m-%d %H:%M:%S"),
-        ]
-
-    # Qualified leads
     for lead in qualified_leads:
-        rows.append(lead_to_row(lead))
+        rows.append(_lead_to_row(lead))
 
-    # Visual separator + partial leads section
     if partial_leads:
         rows.append([""] * len(headers))
         rows.append([f"── PARTIAL LEADS ({len(partial_leads)}) ──"] + [""] * (len(headers) - 1))
         rows.append(headers)
         for lead in partial_leads:
-            rows.append(lead_to_row(lead))
+            rows.append(_lead_to_row(lead))
 
-    # AI recommendations paragraph
     if recommendations:
         rows.append([""] * len(headers))
         rows.append(["── AI RECOMMENDATIONS ──"] + [""] * (len(headers) - 1))
         rows.append([recommendations] + [""] * (len(headers) - 1))
 
-    # Write all rows at once
     ws.update(rows, value_input_option="USER_ENTERED")
 
-    # Bold header row
     try:
         ws.format("1:1", {"textFormat": {"bold": True}})
     except Exception:
-        pass  # Formatting is nice-to-have, not critical
+        pass
 
-    sheet_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}"
-    log.info("Leads written to Google Sheet: %s (tab: %s)", sheet_url, tab_name)
-    return sheet_url
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{file_id}"
+    log.info("Sheet written: %s | Folder: %s", sheet_url, folder_url)
+    return sheet_url, folder_url
+
+
+# ── Row builder ───────────────────────────────────────────────────────────────
+
+def _lead_to_row(lead: Lead) -> list:
+    dm = lead.decision_maker
+    wa = lead.website_analysis
+    sig = lead.apollo_signals
+
+    def _attr(obj, attr, default=""):
+        if obj is None:
+            return default
+        return getattr(obj, attr, default) or default
+
+    return [
+        lead.lead_id,
+        lead.company_name,
+        lead.website or "",
+        lead.industry or "",
+        lead.location or "",
+        lead.company_size or "",
+        lead.founded_year or "",
+        lead.company_linkedin_url or "",
+        _attr(dm, "name"),
+        _attr(dm, "title"),
+        _attr(dm, "email"),
+        _attr(dm, "linkedin_url"),
+        _attr(dm, "direct_phone"),
+        lead.company_phone or "",
+        lead.company_generic_email or "",
+        ", ".join(sig.intent_topics),
+        sig.intent_strength or "",
+        ", ".join(sig.technologies_used),
+        sig.funding_round or "",
+        ", ".join(sig.hiring_signals),
+        ", ".join(_attr(wa, "tech_stack_detected", [])),
+        ", ".join(_attr(wa, "services_offered", [])),
+        _attr(wa, "content_quality_score"),
+        ", ".join(_attr(wa, "seo_health", [])),
+        _attr(wa, "has_chatbot"),
+        _attr(wa, "has_blog"),
+        _attr(wa, "last_blog_post_date"),
+        _attr(wa, "social_proof"),
+        _attr(wa, "website_summary"),
+        lead.icp_match_score or "",
+        lead.lead_score or "",
+        ", ".join(lead.pain_points),
+        ", ".join(lead.opportunities),
+        lead.qualification_notes or "",
+        lead.personalized_hook or "",
+        lead.recommended_first_service or "",
+        lead.enrichment_status.value,
+        lead.scraped_at.strftime("%Y-%m-%d %H:%M:%S"),
+    ]

@@ -18,6 +18,7 @@ firecrawl-py==1.4.0
 gspread==6.1.4
 google-auth==2.35.0
 google-auth-httplib2==0.2.0
+google-api-python-client==2.149.0
 
 # Utils
 python-multipart==0.0.12
