@@ -166,6 +166,32 @@ def enrich_contacts(
     return decision_maker, generic_email
 
 
+def enrich_company(
+    company_name: str,
+    website: Optional[str] = None,
+) -> dict:
+    """
+    Enrichment API: takes a known company name/domain and returns full Apollo data.
+    Used in Mode 3 (company list upload) to fill in missing company details.
+    Returns raw dict of whatever Apollo knows — may be empty on basic plan.
+    """
+    payload: dict = {"name": company_name}
+    if website:
+        domain = _extract_domain(website)
+        if domain:
+            payload["domain"] = domain
+
+    try:
+        data = _post("organizations/enrich", payload)
+        org = data.get("organization") or {}
+        if org:
+            log.info("Apollo enriched company: %s", company_name)
+        return org
+    except Exception as e:
+        log.warning("Apollo company enrichment failed for '%s': %s", company_name, e)
+        return {}
+
+
 def get_credits_used() -> int:
     """Return total Apollo credits used in this session."""
     return _credits_used

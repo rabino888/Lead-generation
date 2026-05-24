@@ -14,6 +14,7 @@ from agent.integrations.llm import get_tokens_used
 from agent.models import ClientProfile, RunRequest, RunStatus
 from agent.stages import contacts, discovery, hooks, prefilter, qualify, report, website
 from agent.utils import run_tracker
+from agent.utils.deduplication import filter_seen_leads, mark_leads_as_delivered
 from agent.utils.logger import get_run_logger
 
 
@@ -43,6 +44,13 @@ async def run_pipeline(
         if not companies:
             log.warning("No companies found — ending pipeline early")
             run_tracker.fail_run(run_id, "No companies discovered")
+            return
+
+        # ── Deduplication ─────────────────────────────────────────────────────
+        companies = filter_seen_leads(client_profile.client_id, companies, log)
+        if not companies:
+            log.warning("All discovered companies already delivered to this client")
+            run_tracker.fail_run(run_id, "No new companies found — all previously delivered")
             return
 
         # ── Stage 2: Pre-filter ───────────────────────────────────────────────
@@ -149,6 +157,13 @@ async def run_pipeline(
             run_state=state,
             sheet_name=request.output_sheet_name,
             logger=log,
+        )
+
+        # ── Mark delivered (deduplication registry) ───────────────────────────
+        mark_leads_as_delivered(
+            client_profile.client_id,
+            all_qualified + all_partial,
+            log,
         )
 
         # ── Complete ──────────────────────────────────────────────────────────

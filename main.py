@@ -6,11 +6,12 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 
 load_dotenv()
@@ -24,7 +25,8 @@ from agent.models import (
     RunStatus,
 )
 from agent.pipeline import run_pipeline
-from agent.utils.auth import get_current_client
+from agent.utils.auth import get_current_client, invalidate_cache
+from agent.utils.deduplication import clear_registry, get_seen_count
 from agent.utils.logger import log
 from agent.utils.run_tracker import create_run, get_run
 
@@ -186,6 +188,100 @@ async def submit_feedback(
 
 
 # ── Feedback Threshold Tuning ──────────────────────────────────────────────────
+
+# ── Admin Endpoints ────────────────────────────────────────────────────────────
+# Protected by ADMIN_SECRET env var (set this in Railway + .env)
+
+def _check_admin(x_admin_secret: str = Header(None)) -> None:
+    """Dependency: validate admin secret header."""
+    admin_secret = os.environ.get("ADMIN_SECRET", "")
+    if not admin_secret:
+        raise HTTPException(status_code=500, detail="ADMIN_SECRET not configured")
+    if x_admin_secret != admin_secret:
+        raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+
+@app.post("/admin/clients")
+async def create_client(
+    name: str,
+    client_id: str,
+    client_email: str = "",
+    _: None = Depends(_check_admin),
+):
+    """
+    Generate a new client API key and write the row to the Clients Google Sheet.
+    Returns the generated API key — save it, it won't be shown again.
+
+    Headers: X-Admin-Secret: <your ADMIN_SECRET>
+    Params:  name (display name), client_id (slug), client_email (optional)
+    """
+    from agent.integrations.sheets import _get_gspread_client
+
+    api_key = f"lgk-{secrets.token_urlsafe(32)}"
+
+    try:
+        gc = _get_gspread_client()
+        sheet_id = os.environ["CLIENTS_SHEET_ID"]
+        ws = gc.open_by_key(sheet_id).sheet1
+
+        # Append new client row (matches sheet column order)
+        new_row = [
+            client_id,      # client_id
+            name,           # name
+            api_key,        # api_key
+            "",             # icp_industry
+            "",             # icp_location
+            "",             # icp_size_min
+            "",             # icp_size_max
+            "",             # icp_job_titles
+            client_email,   # client_email
+            "TRUE",         # active
+        ]
+        ws.append_row(new_row, value_input_option="USER_ENTERED")
+        invalidate_cache()
+
+        log.info("Admin: created client '%s' (id: %s)", name, client_id)
+
+    except Exception as e:
+        log.error("Admin: failed to create client: %s", e)
+        raise HTTPException(status_code=500, detail=f"Failed to write to Clients sheet: {e}")
+
+    return {
+        "created": True,
+        "client_id": client_id,
+        "name": name,
+        "api_key": api_key,
+        "message": "Save this API key — it will not be shown again.",
+    }
+
+
+@app.get("/admin/clients/{client_id}/dedup")
+async def get_dedup_status(
+    client_id: str,
+    _: None = Depends(_check_admin),
+):
+    """Return how many unique companies have been delivered to a client."""
+    count = get_seen_count(client_id)
+    return {
+        "client_id": client_id,
+        "total_delivered_companies": count,
+        "message": f"{count} unique companies have been delivered and will not appear again.",
+    }
+
+
+@app.delete("/admin/clients/{client_id}/dedup")
+async def reset_dedup(
+    client_id: str,
+    _: None = Depends(_check_admin),
+):
+    """
+    Wipe the seen_leads registry for a client.
+    Use with care — this allows re-delivery of previously seen companies.
+    """
+    clear_registry(client_id)
+    log.warning("Admin: cleared dedup registry for client %s", client_id)
+    return {"cleared": True, "client_id": client_id}
+
 
 def _maybe_tune_threshold(client_id: str, feedback_entries: list, logger) -> None:
     """
