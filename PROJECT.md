@@ -1,5 +1,19 @@
 # Lead Generation Agent — Project Reference
 
+## Current Status
+**First full end-to-end run completed.** All 7 stages verified working locally.
+Not yet deployed to Railway — Apollo contact search stalling (~2 hrs/run) must be fixed first.
+
+| | |
+|-|-|
+| Last completed run | `run_20260524_203709_73b3ef` |
+| Output sheet | https://docs.google.com/spreadsheets/d/1wPXOF6XnfFJsEcMm06F9hr5MRzM3u7ph6NhPzFeUChw |
+| Client Drive folder | https://drive.google.com/drive/folders/1V3XsGQHJ-eXly4P-N8gWlOzQ_HUs1LBJ |
+| Result | 0 qualified / 60 partial leads (Apollo Basic — no emails) |
+| Blocking issue | Apollo contact search rate-throttles on Basic plan (~87 min stall) |
+
+---
+
 ## What This Is
 
 A multi-tenant B2B lead generation service built as a FastAPI agent on Railway.

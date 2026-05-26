@@ -112,7 +112,8 @@ The system must accept leads requests in three modes:
 
 ### TR-1: Performance
 - `POST /run` must return a `run_id` within 2 seconds (pipeline runs as background task)
-- A run for 3 leads should complete in under 30 minutes (primary bottleneck: Apollo rate limits)
+- A run for 3 leads must complete in under 20 minutes (**not yet met** — first run took ~2 hours
+  due to Apollo Basic rate-limiting on contact search; this is the primary bottleneck)
 - LLM calls must use batch processing where possible to reduce total API calls
 
 ### TR-2: Reliability
@@ -153,11 +154,13 @@ The system must accept leads requests in three modes:
 
 ## Known Limitations (as of current build)
 
-| Limitation | Impact | Fix |
-|------------|--------|-----|
-| Apollo Basic plan has no verified personal emails | All leads are "partial" | Upgrade to Apollo Professional |
-| Apollo rate throttling under heavy contact search | Runs take 30–90 min instead of 10 min | Add inter-request delays; upgrade plan |
-| `feedback_log.json` stored locally | Lost on Railway redeploy | Migrate to Sheets |
-| `icp_profile.json` stored locally | Threshold tuning lost on redeploy | Migrate to Sheets |
-| Run tracker is in-memory | Run history lost on server restart | Persist to Sheets or SQLite |
-| No completion webhook | Client must poll `/runs/{id}` | Add `callback_url` to RunRequest |
+| # | Limitation | Confirmed | Impact | Fix |
+|---|------------|-----------|--------|-----|
+| 1 | Apollo Basic has no verified personal emails | ✅ Yes — 0/60 leads qualified | All leads are "partial" | Upgrade to Apollo Professional, or add Hunter.io fallback |
+| 2 | Apollo contact search stalls under rate limits | ✅ Yes — 87-min gap in first run | Runs take ~2 hours instead of <20 min; blocks Railway deployment | Add inter-request delay + surface 429 in logs |
+| 3 | Targeted crawl (`includePaths`) not verified | ⚠️ Implemented, untested | May not reduce Firecrawl usage as intended | Run one clean test with new server |
+| 4 | `feedback_log.json` stored locally | ✅ Yes | Lost on Railway redeploy | Migrate to Sheets "Feedback" tab |
+| 5 | `icp_profile.json` stored locally | ✅ Yes | Threshold tuning lost on redeploy | Migrate to Sheets "Thresholds" column |
+| 6 | Run tracker is in-memory | ✅ Yes | Run history lost on server restart | Persist to Sheets or SQLite |
+| 7 | No completion webhook | ✅ Yes | Client must poll `/runs/{id}` | Add `callback_url` to RunRequest |
+| 8 | Server does not auto-restart | ✅ Yes | Process dies after a run completes on some platforms | Ensure Railway keeps uvicorn alive |
