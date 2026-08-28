@@ -1,11 +1,23 @@
 # Secrets
 .env
+credentials.json
+*credentials*.json
+!examples/**/*.json
+
+# Broad JSON ignore — allow package.json and published examples
 *.json
 !package.json
+!examples/**/*.json
 
-# Data & outputs (client data stays local)
+# Client data, runs, campaign outputs (local only)
 data/
 outputs/
+
+# Operator notes and client ICP docs (local only — not read by pipeline code)
+docs/
+
+# Local dev server artifacts (logs, ad-hoc server scripts)
+server*
 
 # Python
 __pycache__/
@@ -17,6 +29,7 @@ env/
 *.egg-info/
 dist/
 build/
+.pytest_cache/
 
 # IDE
 .vscode/

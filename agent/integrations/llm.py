@@ -1,5 +1,7 @@
 """
-LLM integration — Claude primary, OpenAI + Gemini fallbacks.
+LLM integration — provider chains for website enrichment and structured JSON extraction.
+
+Website enrichment: Gemini Flash → OpenAI (no Claude).
 Tracks token usage across the pipeline.
 """
 from __future__ import annotations
@@ -7,11 +9,36 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from typing import Any, Optional
 
 from agent.utils.logger import log
 
 _tokens_used = 0
+_tokens_lock = threading.Lock()
+
+
+def _report_tokens(count: int) -> None:
+    """Count tokens for the run and attribute them to the current lead."""
+    global _tokens_used
+    with _tokens_lock:
+        _tokens_used += count
+    from agent.utils.cost_tracker import get_cost_tracker
+    tracker = get_cost_tracker()
+    if tracker and count:
+        tracker.add_usage(llm_tokens=count)
+
+
+_PROVIDER_FNS = {
+    "claude": lambda p, s, m: _call_claude(p, s, m),
+    "openai": lambda p, s, m: _call_openai(p, s, m),
+    "gemini": lambda p, s, m: _call_gemini(p, s, m),
+}
+
+# Default chain for generic LLM calls (admin/diagnostics).
+DEFAULT_PROVIDERS = ("claude", "openai", "gemini")
+# Website enrichment: structured JSON from Firecrawl markdown — no Claude.
+WEBSITE_PROVIDERS = ("gemini", "openai")
 
 
 def call_llm(
@@ -19,19 +46,20 @@ def call_llm(
     system: str = "You are a precise B2B lead qualification analyst. Always respond with valid JSON.",
     max_tokens: int = 2000,
     expect_json: bool = True,
+    providers: Optional[tuple[str, ...] | list[str]] = None,
 ) -> Any:
     """
-    Call Claude (primary). Falls back to OpenAI then Gemini on failure.
+    Call LLM providers in order. Default: Claude → OpenAI → Gemini.
+    Pass ``providers`` to restrict the chain (e.g. WEBSITE_PROVIDERS skips Claude).
     Returns parsed JSON if expect_json=True, else raw string.
     """
-    providers = [
-        ("claude", _call_claude),
-        ("openai", _call_openai),
-        ("gemini", _call_gemini),
-    ]
+    chain = list(providers) if providers is not None else list(DEFAULT_PROVIDERS)
 
     last_error = None
-    for name, fn in providers:
+    for name in chain:
+        fn = _PROVIDER_FNS.get(name)
+        if not fn:
+            raise ValueError(f"Unknown LLM provider '{name}'")
         if not _has_key(name):
             continue
         try:
@@ -47,7 +75,6 @@ def call_llm(
 
 
 def _call_claude(prompt: str, system: str, max_tokens: int) -> str:
-    global _tokens_used
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     response = client.messages.create(
@@ -56,7 +83,7 @@ def _call_claude(prompt: str, system: str, max_tokens: int) -> str:
         system=system,
         messages=[{"role": "user", "content": prompt}],
     )
-    _tokens_used += response.usage.input_tokens + response.usage.output_tokens
+    _report_tokens(response.usage.input_tokens + response.usage.output_tokens)
     return response.content[0].text
 
 
@@ -64,31 +91,50 @@ def _call_openai(prompt: str, system: str, max_tokens: int) -> str:
     global _tokens_used
     from openai import OpenAI
     client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        max_tokens=max_tokens,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ],
-    )
-    usage = response.usage
-    if usage:
-        _tokens_used += usage.total_tokens
-    return response.choices[0].message.content or ""
+    # Prefer current mini; keep older IDs as fallback if the account hasn't rolled.
+    last_error: Exception | None = None
+    for model_name in ("gpt-5-mini", "gpt-4.1-mini", "gpt-4o-mini"):
+        try:
+            response = client.chat.completions.create(
+                model=model_name,
+                max_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            usage = response.usage
+            if usage:
+                _report_tokens(usage.total_tokens)
+            return response.choices[0].message.content or ""
+        except Exception as e:
+            last_error = e
+            continue
+    raise RuntimeError(f"No OpenAI mini model available: {last_error}")
 
 
 def _call_gemini(prompt: str, system: str, max_tokens: int) -> str:
     import google.generativeai as genai
     genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-    # Try flash first, fall back to pro
-    for model_name in ["gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]:
+    # Newest Flash first; older Flash IDs kept as fallbacks.
+    for model_name in (
+        "gemini-3.7-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-flash-latest",
+    ):
         try:
             model = genai.GenerativeModel(
                 model_name=model_name,
                 generation_config={"max_output_tokens": max_tokens},
             )
             response = model.generate_content(f"{system}\n\n{prompt}")
+            usage = getattr(response, "usage_metadata", None)
+            if usage:
+                _report_tokens(int(
+                    (getattr(usage, "prompt_token_count", 0) or 0)
+                    + (getattr(usage, "candidates_token_count", 0) or 0)
+                ))
             return response.text
         except Exception:
             continue
@@ -129,3 +175,24 @@ def _parse_json(text: str) -> Any:
 def get_tokens_used() -> int:
     """Return total LLM tokens used in this session."""
     return _tokens_used
+
+
+def reset_tokens_used() -> None:
+    """Reset per-run LLM token counter."""
+    global _tokens_used
+    _tokens_used = 0
+
+
+def call_gemini(
+    prompt: str,
+    system: str = "You are a precise B2B analyst. Always respond with valid JSON.",
+    max_tokens: int = 1000,
+    expect_json: bool = True,
+) -> Any:
+    """Call Gemini directly (no Claude/OpenAI fallback)."""
+    if not _has_key("gemini"):
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    result = _call_gemini(prompt, system, max_tokens)
+    if expect_json:
+        return _parse_json(result)
+    return result

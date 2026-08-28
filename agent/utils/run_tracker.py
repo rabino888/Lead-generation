@@ -59,6 +59,7 @@ def complete_run(
     apollo_credits: int = 0,
     firecrawl_pages: int = 0,
     llm_tokens: int = 0,
+    total_cost_usd: Optional[float] = None,
 ) -> RunState:
     """Mark run as complete, persist to JSON, and return final state."""
     state = update_run(
@@ -74,18 +75,20 @@ def complete_run(
         apollo_credits_used=apollo_credits,
         firecrawl_pages_crawled=firecrawl_pages,
         llm_tokens_used=llm_tokens,
+        total_cost_usd=total_cost_usd,
     )
     _persist(state)
     return state
 
 
-def fail_run(run_id: str, error: str) -> RunState:
+def fail_run(run_id: str, error: str, **kwargs) -> RunState:
     """Mark run as failed and persist."""
     state = update_run(
         run_id,
         status=RunStatus.FAILED,
         completed_at=datetime.utcnow(),
         error=error,
+        **kwargs,
     )
     _persist(state)
     return state

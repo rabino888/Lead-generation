@@ -13,9 +13,8 @@ from pydantic import BaseModel, Field
 # ── Enums ─────────────────────────────────────────────────────────────────────
 
 class InputMode(str, Enum):
-    KEYWORD = "keyword"
-    ICP = "icp"
-    COMPANY_LIST = "company_list"
+    CURATED_SEEDS = "curated_seeds"
+    APOLLO_CSV = "apollo_csv"
 
 
 class LeadSource(str, Enum):
@@ -47,45 +46,81 @@ class FeedbackOutcome(str, Enum):
 # ── ICP & Client ──────────────────────────────────────────────────────────────
 
 class ICPProfile(BaseModel):
-    """Structured Ideal Customer Profile."""
+    """Structured Ideal Customer Profile for pipeline /run requests.
+
+    Campaign-level deterministic matching config lives in
+    data/campaigns/{campaign_id}/icp.json (see CampaignIcpConfig).
+    """
     industry: Optional[str] = None
     location: Optional[str] = None
     company_size_min: Optional[int] = None
     company_size_max: Optional[int] = None
     job_titles: list[str] = Field(default_factory=lambda: ["CEO", "Founder", "Director", "Manager"])
+    # Where the decision-maker PERSON must be located (Apollo person_locations[]).
+    # Without this, Apollo matches titles globally — a Spain-hub campaign can get
+    # a Philippines-based director at the same company. Empty = no filter.
+    contact_locations: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     excluded_keywords: list[str] = Field(default_factory=list)
     prefilter_threshold: int = Field(default=40, ge=0, le=100)
+    # Website enrich: "full" = tech/SEO/blog + hiring; "hiring_first" = careers + open roles primary.
+    website_analysis_mode: str = "full"
+
+
+class SenderProfile(BaseModel):
+    """Business context for the person/company requesting leads."""
+    client_id: str = "local"
+    name: str = "Local Client"
+    client_email: Optional[str] = None
+    business_description: Optional[str] = None
+    core_offer: Optional[str] = None
+    services: list[str] = Field(default_factory=list)
+    proof_points: list[str] = Field(default_factory=list)
+    target_pain_points: list[str] = Field(default_factory=list)
+    positioning_notes: Optional[str] = None
 
 
 class ClientProfile(BaseModel):
-    """Loaded from the LeadGen Clients Google Sheet."""
+    """Client context for a run."""
     client_id: str
     name: str
-    api_key: str
+    api_key: str = "local"
     client_email: Optional[str] = None   # shared with this email as viewer on their Drive folder
     icp: ICPProfile = Field(default_factory=ICPProfile)
+    sender: SenderProfile = Field(default_factory=SenderProfile)
     active: bool = True
+
+
+class CompanySeed(BaseModel):
+    """Curated company seed that skips website lookup."""
+    company_name: str
+    website: Optional[str] = None
+    industry: Optional[str] = None
+    location: Optional[str] = None
+    company_size: Optional[str] = None
+    company_linkedin_url: Optional[str] = None
+    source_url: Optional[str] = None
+    notes: Optional[str] = None
 
 
 # ── Run Request ───────────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    """Body for POST /run."""
-    mode: InputMode = InputMode.KEYWORD
+    """Body for POST /run (curated seeds or Apollo CSV import only)."""
+    mode: InputMode = InputMode.CURATED_SEEDS
 
-    # Mode: keyword
-    keyword: Optional[str] = None
-
-    # Mode: icp
     icp: Optional[ICPProfile] = None
+    sender: Optional[SenderProfile] = None
 
-    # Mode: company_list
-    company_list: Optional[list[str]] = None
+    # Mode: curated_seeds
+    company_seeds: Optional[list[CompanySeed]] = None
+    company_seeds_csv: Optional[str] = None
 
-    # Run config
+    # Mode: apollo_csv
+    apollo_csv_path: Optional[str] = None
+
     max_leads: int = Field(default=50, ge=1, le=500)
-    output_sheet_name: Optional[str] = None  # defaults to "{date} - {keyword}"
+    output_sheet_name: Optional[str] = None
 
 
 # ── Raw Company (post-discovery, pre-enrichment) ──────────────────────────────
@@ -104,6 +139,7 @@ class ApolloSignals(BaseModel):
 
 class RawCompany(BaseModel):
     """Company record after discovery, before full enrichment."""
+    apollo_org_id: Optional[str] = None
     company_name: str
     website: Optional[str] = None
     industry: Optional[str] = None
@@ -119,7 +155,7 @@ class RawCompany(BaseModel):
 # ── Website Analysis ──────────────────────────────────────────────────────────
 
 class WebsiteAnalysis(BaseModel):
-    """Output of Stage 3 — Firecrawl + Claude analysis."""
+    """Output of website enrichment — Firecrawl crawl + LLM JSON mapped to these fields."""
     tech_stack_detected: list[str] = Field(default_factory=list)
     services_offered: list[str] = Field(default_factory=list)
     content_quality_score: Optional[int] = Field(default=None, ge=1, le=10)
@@ -130,17 +166,31 @@ class WebsiteAnalysis(BaseModel):
     social_proof: Optional[bool] = None
     website_summary: Optional[str] = None
     raw_markdown_length: Optional[int] = None
+    website_is_hiring: Optional[str] = None  # yes | no | None
+    website_hiring_signals: list[str] = Field(default_factory=list)
+    website_open_roles: list[str] = Field(default_factory=list)
+    website_careers_url: Optional[str] = None
 
 
 # ── Contact ───────────────────────────────────────────────────────────────────
 
 class Contact(BaseModel):
     """Decision-maker contact from Apollo enrichment."""
+    apollo_person_id: Optional[str] = None
     name: Optional[str] = None
     title: Optional[str] = None
     email: Optional[str] = None
+    email_status: Optional[str] = None
+    location: Optional[str] = None  # the person's own location (city, country) from Apollo
     linkedin_url: Optional[str] = None
     direct_phone: Optional[str] = None
+    mobile_phone: Optional[str] = None
+    linkedin_posts: list[dict[str, Any]] = Field(default_factory=list)
+    linkedin_interests: list[str] = Field(default_factory=list)
+    linkedin_post_summary: Optional[str] = None
+    linkedin_about: Optional[str] = None
+    linkedin_headline: Optional[str] = None
+    is_hiring: Optional[str] = None  # yes | no | None
 
 
 # ── Full Lead Record ──────────────────────────────────────────────────────────
@@ -150,6 +200,7 @@ class Lead(BaseModel):
     lead_id: str
 
     # Discovery
+    apollo_org_id: Optional[str] = None
     company_name: str
     website: Optional[str] = None
     industry: Optional[str] = None
@@ -157,6 +208,10 @@ class Lead(BaseModel):
     company_size: Optional[str] = None
     founded_year: Optional[int] = None
     company_linkedin_url: Optional[str] = None
+    company_linkedin_description: Optional[str] = None
+    company_is_hiring: Optional[str] = None  # yes | no | None
+    company_open_jobs_count: Optional[int] = None
+    company_open_jobs_summary: Optional[str] = None
     lead_source: LeadSource = LeadSource.APOLLO
     apollo_signals: ApolloSignals = Field(default_factory=ApolloSignals)
 
@@ -168,16 +223,25 @@ class Lead(BaseModel):
     # Website analysis
     website_analysis: Optional[WebsiteAnalysis] = None
 
-    # Qualification
+    # Qualification / scoring
     icp_match_score: Optional[int] = Field(default=None, ge=0, le=100)
     lead_score: Optional[int] = Field(default=None, ge=0, le=100)
+    # Deterministic path: "keyword_overlap". Future: "llm_pain_point".
+    score_method: Optional[str] = None
+    matched_terms: list[str] = Field(default_factory=list)
+    score_evidence: list[str] = Field(default_factory=list)
     pain_points: list[str] = Field(default_factory=list)
+    pain_point_evidence: list[str] = Field(default_factory=list)
     opportunities: list[str] = Field(default_factory=list)
     qualification_notes: Optional[str] = None
+    # Deterministic keyword-overlap scorer (agent/utils/keyword_score.py)
+    matched_terms: list[str] = Field(default_factory=list)
+    score_evidence: list[str] = Field(default_factory=list)
+    score_method: Optional[str] = None
+    score_reasons: list[str] = Field(default_factory=list)
 
-    # Outreach
-    personalized_hook: Optional[str] = None
-    recommended_first_service: Optional[str] = None
+    # Cost tracking
+    enrichment_cost_usd: Optional[float] = None
 
     # Meta
     run_id: str
@@ -211,6 +275,9 @@ class RunState(BaseModel):
     apollo_credits_used: int = 0
     firecrawl_pages_crawled: int = 0
     llm_tokens_used: int = 0
+    total_cost_usd: Optional[float] = None
+    cost_cap_triggered: bool = False
+    cost_diagnostic_path: Optional[str] = None
 
 
 # ── Feedback ──────────────────────────────────────────────────────────────────

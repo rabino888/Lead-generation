@@ -1,0 +1,39 @@
+{
+  "schema_version": "1",
+  "campaign_id": "example_campaign",
+  "industries": ["computer software", "information technology"],
+  "excluded_industries": ["staffing and recruiting"],
+  "geo": {
+    "primary_location": "United States",
+    "country_codes": { "United States": "US" },
+    "location_hints": ["united states", "usa", "california", "new york"],
+    "segments": ["US"]
+  },
+  "company_size_min": 5,
+  "company_size_max": 200,
+  "employee_ranges": ["11,50", "51,200"],
+  "include_keywords": ["SaaS", "B2B"],
+  "exclude_keywords": ["staffing agency", "recruitment agency"],
+  "excluded_name_patterns": "recruitment|staffing",
+  "excluded_domains": [],
+  "excluded_website_suffixes": [],
+  "exclude_mega_outsourcers": false,
+  "required_signals": {
+    "name_signal_required": false,
+    "name_signal_pattern": ""
+  },
+  "job_titles": [
+    "CEO",
+    "Founder",
+    "Co-Founder",
+    "CTO",
+    "VP Engineering",
+    "Head of Engineering"
+  ],
+  "contact_locations": ["United States"],
+  "prefilter_threshold": 30,
+  "apply_weak_seed_checks": false,
+  "weak_seed_rule_pack": "",
+  "weak_seed_extra_patterns": [],
+  "website_analysis_mode": "full"
+}

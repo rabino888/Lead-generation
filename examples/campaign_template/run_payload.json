@@ -1,0 +1,31 @@
+{
+  "sender": {
+    "client_id": "example_client",
+    "name": "Example Client",
+    "business_description": "Short description of what the client sells.",
+    "core_offer": "One-sentence value proposition for the outreach pitch.",
+    "services": [
+      "Primary service or product line",
+      "Secondary capability"
+    ],
+    "proof_points": [
+      "Credible metric or customer proof point"
+    ],
+    "target_pain_points": [
+      "Operational pain the offer solves",
+      "Buying trigger you want to detect in enrichment text"
+    ],
+    "positioning_notes": "Who to target, who to avoid, and tone constraints for human reviewers."
+  },
+  "icp": {
+    "industry": "computer software",
+    "location": "United States",
+    "company_size_min": 5,
+    "company_size_max": 200,
+    "job_titles": ["CEO", "Founder", "CTO"],
+    "contact_locations": ["United States"],
+    "prefilter_threshold": 30
+  },
+  "mode": "curated_seeds",
+  "campaign_id": "example_campaign"
+}

@@ -119,6 +119,117 @@ def mark_leads_as_delivered(
         _log.info("Dedup: all %d leads were already in the registry", len(leads))
 
 
+def contact_key(lead) -> str:
+    """
+    Stable identity key for a lead's revealed decision-maker:
+    email first, LinkedIn URL as fallback. Empty string when neither exists.
+    """
+    dm = getattr(lead, "decision_maker", None)
+    if not dm:
+        return ""
+    email = (getattr(dm, "email", None) or "").strip().lower()
+    if email:
+        return f"email:{email}"
+    linkedin = (getattr(dm, "linkedin_url", None) or "").strip().lower().rstrip("/")
+    if linkedin:
+        return f"linkedin:{linkedin}"
+    return ""
+
+
+def filter_seen_contacts(
+    client_id: str,
+    leads: list,  # list[Lead]
+    logger=None,
+) -> list:
+    """
+    Remove leads whose decision-maker was already delivered to this client in
+    a previous run (by email/LinkedIn), even if the company domain differs —
+    catches the same person surfacing via a parent company and a subsidiary.
+    Runs after the contactability gate and before expensive enrichment.
+    Leads without a contact key pass through unchanged.
+    """
+    _log = logger or log
+
+    if not leads:
+        return leads
+
+    try:
+        from agent.integrations.sheets import get_seen_contacts
+        seen = get_seen_contacts(client_id)
+    except Exception as e:
+        _log.warning("Dedup: could not load seen contacts from Sheets (%s) — treating all as new", e)
+        seen = set()
+
+    if not seen:
+        return leads
+
+    unseen = []
+    skipped = []
+    for lead in leads:
+        key = contact_key(lead)
+        if key and key in seen:
+            skipped.append(f"{lead.company_name} ({key})")
+        else:
+            unseen.append(lead)
+
+    if skipped:
+        _log.info(
+            "Dedup: filtered %d already-delivered contacts for client %s: %s%s",
+            len(skipped),
+            client_id,
+            ", ".join(skipped[:5]),
+            f" ... (+{len(skipped) - 5} more)" if len(skipped) > 5 else "",
+        )
+
+    return unseen
+
+
+def mark_contacts_as_delivered(
+    client_id: str,
+    leads: list,  # list[Lead]
+    logger=None,
+) -> None:
+    """
+    After a successful run, register each delivered decision-maker in the
+    ContactDedup tab so they are never delivered again for this client.
+    """
+    _log = logger or log
+
+    if not leads:
+        return
+
+    try:
+        from agent.integrations.sheets import get_seen_contacts
+        existing = get_seen_contacts(client_id)
+    except Exception as e:
+        _log.warning("Dedup: could not load existing contacts (%s) — writing all as new", e)
+        existing = set()
+
+    new_entries = []
+    for lead in leads:
+        key = contact_key(lead)
+        if not key or key in existing:
+            continue
+        existing.add(key)
+        dm = lead.decision_maker
+        new_entries.append({
+            "contact_key": key,
+            "contact_name": (dm.name if dm else "") or "",
+            "company_name": lead.company_name,
+        })
+
+    if new_entries:
+        try:
+            from agent.integrations.sheets import add_seen_contacts
+            add_seen_contacts(client_id, new_entries)
+            _log.info(
+                "Dedup: marked %d new contacts as delivered for client %s",
+                len(new_entries), client_id,
+            )
+        except Exception as e:
+            _log.error("Dedup: failed to write delivered contacts to Sheets: %s", e)
+
+
 def get_seen_count(client_id: str) -> int:
     """Return how many unique companies have been delivered to this client."""
     try:

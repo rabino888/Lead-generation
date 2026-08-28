@@ -12,13 +12,20 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from agent.models import ApolloSignals, Contact, ICPProfile, RawCompany, LeadSource
+from agent.utils.job_titles import (
+    primary_title,
+    seniorities_from_job_titles,
+    title_matches_icp,
+    title_priority,
+)
 from agent.utils.logger import log
+from agent.webhooks.apollo_phone import resolve_apollo_phone_webhook_url
 
 APOLLO_BASE = "https://api.apollo.io/api/v1"
 _credits_used = 0
@@ -33,14 +40,27 @@ def _headers() -> dict:
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
-def _post(endpoint: str, payload: dict) -> dict:
+def _post(
+    endpoint: str,
+    payload: Optional[dict] = None,
+    params: Optional[list[tuple[str, Any]]] = None,
+) -> dict:
     """POST to Apollo API with retry on transient errors."""
     url = f"{APOLLO_BASE}/{endpoint}"
     with httpx.Client(timeout=30) as client:
-        resp = client.post(url, json=payload, headers=_headers())
+        resp = client.post(url, json=payload or {}, params=params, headers=_headers())
+        if resp.status_code != 200:
+            # Log the real status and body BEFORE raise_for_status() hides it in RetryError
+            log.error(
+                "Apollo %s -> HTTP %d | body: %s",
+                endpoint,
+                resp.status_code,
+                resp.text[:400],
+            )
         if resp.status_code == 429:
-            log.warning("Apollo rate limit hit — waiting 10s")
-            time.sleep(10)
+            retry_after = int(resp.headers.get("retry-after", "10"))
+            log.warning("Apollo rate limit hit — waiting %ss", retry_after)
+            time.sleep(retry_after)
             raise Exception("Rate limited")
         resp.raise_for_status()
         return resp.json()
@@ -87,9 +107,9 @@ def search_companies(
 
     # Location filtering — use country code + city name separately for accuracy
     if icp.location:
-        country_code = _location_to_country_code(icp.location)
-        if country_code:
-            payload["organization_country_codes"] = [country_code]
+        country_codes = _location_to_country_codes(icp.location)
+        if country_codes:
+            payload["organization_country_codes"] = country_codes
         # Also add city as a location string for narrower matching
         payload["organization_locations"] = [icp.location]
 
@@ -117,6 +137,7 @@ def search_companies(
     for org in companies:
         signals = _extract_signals(org)
         results.append(RawCompany(
+            apollo_org_id=org.get("id") or org.get("organization_id"),
             company_name=org.get("name", "Unknown"),
             website=_clean_url(org.get("website_url") or org.get("primary_domain")),
             industry=org.get("industry"),
@@ -178,59 +199,297 @@ def enrich_contacts(
     website: Optional[str],
     job_titles: list[str],
     max_contacts: int = 1,
+    contact_locations: Optional[list[str]] = None,
 ) -> tuple[Optional[Contact], Optional[str]]:
     """
-    Stage 4: Find decision-makers at a company.
-    Returns (Contact | None, generic_email | None).
-    Each verified email costs 1 Apollo credit.
+    Stage 4: Find and reveal a contactable decision-maker at a company.
+    Returns (Contact | None, generic_email | None). A contact is returned only
+    when Apollo reveals a real email; generic emails are kept as metadata only.
+
+    contact_locations restricts the PERSON's location (Apollo person_locations[]).
+    Strict: if set and no candidate matches, the company yields no contact —
+    a global BPO's Manila HR director is useless for a Spain-hub campaign.
     """
-    global _credits_used
-
-    payload: dict = {
-        "per_page": max_contacts + 3,  # fetch a few extra, take best match
-        "page": 1,
-        "q_organization_name": company_name,
-        "person_titles": job_titles,
-        "contact_email_status": ["verified", "likely to engage"],
-    }
-    if website:
-        domain = _extract_domain(website)
-        if domain:
-            payload["q_organization_domains"] = [domain]
-
-    try:
-        data = _post("mixed_people/search", payload)
-    except Exception as e:
-        log.error("Apollo contact search failed for %s: %s", company_name, e)
-        return None, None
-
-    people = data.get("people", []) or []
-
-    # Pick the most senior match
-    decision_maker: Optional[Contact] = None
-    for person in people[:max_contacts]:
-        email = person.get("email")
-        if not email:
-            continue
-        _credits_used += 1
-        decision_maker = Contact(
-            name=person.get("name"),
-            title=person.get("title"),
-            email=email,
-            linkedin_url=person.get("linkedin_url"),
-            direct_phone=person.get("direct_phone_number") or person.get("phone_number"),
-        )
-        break  # Take first verified match
-
-    # Try to find a generic company email pattern
     generic_email = _guess_generic_email(website) if website else None
 
-    if decision_maker:
-        log.info("Found decision-maker: %s (%s) at %s", decision_maker.name, decision_maker.title, company_name)
-    else:
-        log.info("No decision-maker found for %s — will mark partial", company_name)
+    people = _search_contact_candidates(
+        company_name=company_name,
+        website=website,
+        job_titles=job_titles,
+        max_candidates=max(max_contacts + 5, 8),
+        contact_locations=contact_locations,
+    )
+    if not people:
+        log.info("Apollo: no contact candidates for %s", company_name)
+        return None, generic_email
 
-    return decision_maker, generic_email
+    # Only keep people whose primary title matches the campaign ICP job_titles.
+    matched = [
+        p for p in people
+        if title_matches_icp(str(p.get("title") or ""), job_titles)
+    ]
+    if not matched:
+        rejected_titles = [primary_title(str(p.get("title") or "")) or "?" for p in people[:5]]
+        log.info(
+            "Apollo: %d candidates for %s but none match ICP job_titles — sample titles: %s",
+            len(people),
+            company_name,
+            "; ".join(rejected_titles),
+        )
+        return None, generic_email
+
+    if len(matched) < len(people):
+        log.info(
+            "Apollo: ICP title filter kept %d/%d candidates for %s",
+            len(matched),
+            len(people),
+            company_name,
+        )
+
+    # Search is free but does not reveal emails. Spend credits only on people
+    # Apollo says are likely to have an email, trying the strongest ICP matches first.
+    prioritized = sorted(
+        matched,
+        key=lambda p: (
+            title_priority(str(p.get("title") or ""), job_titles),
+            not bool(p.get("has_email")),
+            _seniority_rank(str(p.get("seniority") or "")),
+        ),
+    )
+    # Phone reveal is opt-in via webhook URL; APOLLO_SKIP_PHONE=1 forces email-only.
+    skip_phone = os.environ.get("APOLLO_SKIP_PHONE", "").strip().lower() in ("1", "true", "yes")
+    reveal_phone = bool(resolve_apollo_phone_webhook_url()) and not skip_phone
+    max_attempts = max(1, int(os.environ.get("APOLLO_MAX_REVEAL_ATTEMPTS", "2")))
+
+    for person in prioritized[:max_attempts]:
+        if not person.get("has_email"):
+            continue
+        revealed = _reveal_person(person, reveal_phone=reveal_phone)
+        if revealed and revealed.email:
+            log.info(
+                "Apollo: revealed contactable decision-maker for %s: %s (%s)",
+                company_name,
+                revealed.name or "unknown",
+                revealed.title or "unknown title",
+            )
+            return revealed, generic_email
+
+    log.info("Apollo: candidates found for %s, but no email was revealed", company_name)
+    return None, generic_email
+
+
+def _search_contact_candidates(
+    company_name: str,
+    website: Optional[str],
+    job_titles: list[str],
+    max_candidates: int,
+    contact_locations: Optional[list[str]] = None,
+) -> list[dict]:
+    """Use Apollo People API Search with documented query-array filters."""
+    params: list[tuple[str, Any]] = [
+        ("per_page", min(max_candidates, 100)),
+        ("page", 1),
+        (
+            "include_similar_titles",
+            os.environ.get("APOLLO_INCLUDE_SIMILAR_TITLES", "true").lower(),
+        ),
+    ]
+    # Comma-separated list, e.g. "verified,unverified". Default keeps the
+    # original strict behaviour; relax for marginal accounts where Apollo has
+    # people but no verified-status email (the reveal step is still the gate).
+    email_statuses = os.environ.get("APOLLO_EMAIL_STATUSES", "verified")
+    for status in email_statuses.split(","):
+        status = status.strip()
+        if status:
+            params.append(("contact_email_status[]", status))
+
+    for location in contact_locations or []:
+        params.append(("person_locations[]", location))
+
+    domain = _extract_domain(website) if website else None
+    if domain:
+        params.append(("q_organization_domains_list[]", domain))
+    else:
+        params.append(("q_organization_name", company_name))
+
+    for title in job_titles:
+        if title:
+            params.append(("person_titles[]", title))
+
+    for seniority in seniorities_from_job_titles(job_titles):
+        params.append(("person_seniorities[]", seniority))
+
+    try:
+        data = _post("mixed_people/api_search", params=params)
+    except Exception as e:
+        log.error("Apollo contact search failed for %s: %s", company_name, e)
+        return []
+
+    people = data.get("people", []) or []
+    log.info(
+        "Apollo: %d contact candidates for %s (total_entries=%s)",
+        len(people),
+        company_name,
+        data.get("total_entries"),
+    )
+    return people
+
+
+def _record_apollo_credits(data: dict) -> int:
+    """Bump session + CostTracker from an Apollo people/match response."""
+    global _credits_used
+    credits = int(data.get("credits_consumed") or data.get("credit_consumed") or 0)
+    _credits_used += credits
+    if credits:
+        from agent.utils.cost_tracker import get_cost_tracker
+        tracker = get_cost_tracker()
+        if tracker:
+            tracker.add_usage(apollo_credits=credits)
+    return credits
+
+
+def _contact_from_match(match: dict, person: Optional[dict] = None) -> Optional[Contact]:
+    person = person or {}
+    email = match.get("email") or match.get("personal_email") or person.get("email")
+    if not email and not match.get("linkedin_url") and not person.get("linkedin_url"):
+        return None
+    person_id = match.get("id") or person.get("id")
+    return Contact(
+        apollo_person_id=person_id,
+        name=match.get("name") or person.get("name"),
+        title=primary_title(match.get("title") or person.get("title") or "")
+        or match.get("title")
+        or person.get("title"),
+        email=email,
+        email_status=match.get("email_status") or match.get("email_status_unavailable_reason"),
+        location=_person_location(match) or _person_location(person),
+        linkedin_url=match.get("linkedin_url") or person.get("linkedin_url"),
+        direct_phone=(
+            match.get("direct_phone_number")
+            or match.get("phone_number")
+            or match.get("sanitized_phone")
+        ),
+        mobile_phone=(
+            match.get("mobile_phone")
+            or match.get("mobile_phone_number")
+            or match.get("phone_number")
+        ),
+    )
+
+
+def _reveal_person(person: dict, reveal_phone: bool = False) -> Optional[Contact]:
+    """Reveal email/phone for a People Search candidate using People Enrichment."""
+    person_id = person.get("id")
+    if not person_id:
+        return None
+
+    params: list[tuple[str, Any]] = [
+        ("id", person_id),
+        ("reveal_personal_emails", "true"),
+        ("reveal_phone_number", "true" if reveal_phone else "false"),
+    ]
+    webhook_url = resolve_apollo_phone_webhook_url()
+    if reveal_phone and webhook_url:
+        params.append(("webhook_url", webhook_url))
+
+    try:
+        data = _post("people/match", params=params)
+    except Exception as e:
+        log.warning("Apollo person reveal failed for id=%s: %s", person_id, e)
+        return None
+
+    _record_apollo_credits(data)
+    match = _first_person_match(data)
+    if not match:
+        return None
+    contact = _contact_from_match(match, person)
+    if not contact or not contact.email:
+        return None
+    return contact
+
+
+def enrich_person_by_email(
+    email: str,
+    *,
+    reveal_personal_emails: bool = True,
+) -> Optional[Contact]:
+    """
+    People Enrichment by email — recovers LinkedIn URL / name / title for an
+    already-known address. Costs Apollo credits (tracked via get_credits_used()).
+    """
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return None
+
+    params: list[tuple[str, Any]] = [
+        ("email", email),
+        ("reveal_personal_emails", "true" if reveal_personal_emails else "false"),
+        ("reveal_phone_number", "false"),
+    ]
+    try:
+        data = _post("people/match", params=params)
+    except Exception as e:
+        log.warning("Apollo email enrich failed for %s: %s", email, e)
+        return None
+
+    credits = _record_apollo_credits(data)
+    match = _first_person_match(data)
+    if not match:
+        log.info("Apollo email enrich: no person for %s (credits=%s)", email, credits)
+        return None
+    contact = _contact_from_match(match)
+    log.info(
+        "Apollo email enrich: %s -> linkedin=%s name=%s (credits=%s)",
+        email,
+        "yes" if contact and contact.linkedin_url else "no",
+        (contact.name if contact else None) or "?",
+        credits,
+    )
+    return contact
+
+
+def _person_location(person: dict) -> Optional[str]:
+    """'Barcelona, Spain' from Apollo person fields (city/state/country)."""
+    if not person:
+        return None
+    parts = [person.get("city"), person.get("state"), person.get("country")]
+    location = ", ".join(str(p) for p in parts if p)
+    return location or None
+
+
+def _first_person_match(data: dict) -> dict:
+    """Normalize Apollo's single and bulk-ish enrichment response shapes."""
+    if isinstance(data.get("person"), dict):
+        return data["person"]
+    matches = data.get("matches") or []
+    if matches and isinstance(matches[0], dict):
+        return matches[0]
+    if isinstance(data.get("contact"), dict):
+        return data["contact"]
+    return {}
+
+
+def _seniority_rank(value: str) -> int:
+    value = value.lower()
+    order = ["owner", "founder", "chief", "ceo", "cmo", "vp", "head", "director", "manager"]
+    for i, token in enumerate(order):
+        if token in value:
+            return i
+    return len(order)
+
+
+def get_company_linkedin_url(
+    company_name: str,
+    website: Optional[str] = None,
+) -> Optional[str]:
+    """Best-effort company LinkedIn URL from Apollo org enrich (no Apify)."""
+    org = enrich_company(company_name, website)
+    raw = (org.get("linkedin_url") or "").strip()
+    if not raw:
+        return None
+    if not raw.startswith("http"):
+        raw = f"https://{raw}"
+    return raw.split("?")[0].rstrip("/")
 
 
 def enrich_company(
@@ -250,6 +509,7 @@ def enrich_company(
 
     try:
         data = _post("organizations/enrich", payload)
+        _record_apollo_credits(data)
         org = data.get("organization") or {}
         if org:
             log.info("Apollo enriched company: %s", company_name)
@@ -264,18 +524,41 @@ def get_credits_used() -> int:
     return _credits_used
 
 
+def reset_credits_used() -> None:
+    """Reset per-run Apollo credit counter."""
+    global _credits_used
+    _credits_used = 0
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _extract_signals(org: dict) -> ApolloSignals:
     """Extract Apollo intelligence signals — empty on basic plan, populated on premium."""
     try:
+        technologies = org.get("technologies") or org.get("current_technologies") or []
+        technology_names = org.get("technology_names") or []
+        if not technology_names:
+            technology_names = [t.get("name", "") for t in technologies if isinstance(t, dict)]
+
+        job_postings = org.get("job_postings") or org.get("latest_job_postings") or []
+        hiring_signals = [
+            j.get("title", "")
+            for j in job_postings[:5]
+            if isinstance(j, dict) and j.get("title")
+        ]
+
+        growth = (
+            org.get("headcount_six_month_growth")
+            or org.get("headcount_growth")
+            or org.get("employee_growth")
+        )
         return ApolloSignals(
-            intent_topics=org.get("intent_keywords", []) or [],
-            intent_strength=org.get("intent_strength"),
-            technologies_used=[t.get("name", "") for t in (org.get("technologies") or [])],
-            funding_round=org.get("latest_funding_stage"),
-            hiring_signals=[j.get("title", "") for j in (org.get("job_postings") or [])[:5]],
-            growth_signals=org.get("headcount_six_month_growth"),
+            intent_topics=org.get("intent_keywords", []) or org.get("intent_topics", []) or [],
+            intent_strength=org.get("intent_strength") or org.get("overall_intent"),
+            technologies_used=[name for name in technology_names if name],
+            funding_round=org.get("latest_funding_stage") or org.get("latest_funding_round"),
+            hiring_signals=hiring_signals,
+            growth_signals=str(growth) if growth is not None else None,
             job_change_alert=bool(org.get("job_change_alert")),
             apollo_lead_score=org.get("score"),
         )
@@ -331,6 +614,12 @@ def _guess_generic_email(website: str) -> Optional[str]:
 
 def _location_to_country_code(location: str) -> Optional[str]:
     """Map common location strings to ISO 3166-1 alpha-2 country codes."""
+    codes = _location_to_country_codes(location)
+    return codes[0] if codes else None
+
+
+def _location_to_country_codes(location: str) -> list[str]:
+    """Map common location strings to ISO 3166-1 alpha-2 country codes."""
     location_lower = location.lower()
     country_map = {
         "spain": "ES", "españa": "ES", "madrid": "ES", "barcelona": "ES",
@@ -345,10 +634,11 @@ def _location_to_country_code(location: str) -> Optional[str]:
         "brazil": "BR", "brasil": "BR",
         "canada": "CA", "australia": "AU",
     }
+    codes: list[str] = []
     for key, code in country_map.items():
-        if key in location_lower:
-            return code
-    return None
+        if key in location_lower and code not in codes:
+            codes.append(code)
+    return codes
 
 
 def _split_keyword_and_location(keyword: str) -> tuple[str, Optional[str]]:
@@ -358,7 +648,7 @@ def _split_keyword_and_location(keyword: str) -> tuple[str, Optional[str]]:
     recognisable location is found.
     """
     location_hints = [
-        "madrid", "barcelona", "spain", "españa", "london", "uk", "paris",
+        "madrid", "barcelona", "spain", "españa", "portugal", "london", "uk", "paris",
         "berlin", "amsterdam", "lisbon", "rome", "new york", "los angeles",
         "san francisco", "chicago", "toronto", "sydney", "melbourne",
         "mexico city", "bogota", "buenos aires", "sao paulo",
@@ -386,6 +676,12 @@ def _resolve_industries(keyword: str, icp_industry: str) -> list[str]:
         return ["computer software", "internet", "information technology and services"]
     if any(t in combined for t in ["consulting", "advisory", "management consulting"]):
         return ["management consulting", "business consulting and services"]
+    if any(t in combined for t in [
+        "bpo", "business process outsourcing", "outsourcing", "offshoring",
+        "contact center", "call center", "customer support", "customer service",
+        "atención al cliente", "soporte telefónico",
+    ]):
+        return ["outsourcing/offshoring", "consumer services", "telecommunications"]
     if any(t in combined for t in ["seo", "sem", "content", "inbound", "digital"]):
         return ["marketing and advertising", "internet", "advertising services"]
     if any(t in combined for t in ["pr ", "public relations", "communications"]):

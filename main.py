@@ -1,6 +1,6 @@
 """
 Lead Generation Agent — FastAPI Application
-Endpoints: POST /run | GET /runs/{run_id} | POST /feedback | GET /health
+Endpoints: POST /run | GET /runs/{run_id} | POST /feedback | POST /webhooks/apollo-phone/{secret} | GET /health
 """
 from __future__ import annotations
 
@@ -11,8 +11,16 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+from agent.webhooks.apollo_phone import (
+    load_payloads,
+    payload_stats,
+    resolve_apollo_phone_webhook_url,
+    store_payload,
+    verify_webhook_secret,
+)
 
 load_dotenv(override=True)
 
@@ -20,12 +28,14 @@ from agent.models import (
     ClientProfile,
     FeedbackEntry,
     FeedbackRequest,
+    ICPProfile,
     InputMode,
     RunRequest,
     RunStatus,
+    SenderProfile,
 )
 from agent.pipeline import run_pipeline
-from agent.utils.auth import get_current_client, invalidate_cache
+from agent.utils.auth import invalidate_cache
 from agent.utils.deduplication import clear_registry, get_seen_count
 from agent.utils.logger import log
 from agent.utils.run_tracker import create_run, get_run
@@ -45,32 +55,70 @@ async def health():
     return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
 
+# ── Apollo Phone Webhook ───────────────────────────────────────────────────────
+
+@app.post("/webhooks/apollo-phone/{secret}")
+async def apollo_phone_webhook(secret: str, request: Request):
+    """
+    Receive async phone reveal callbacks from Apollo.io.
+    URL must match APOLLO_PHONE_WEBHOOK_URL (includes APOLLO_PHONE_WEBHOOK_SECRET).
+    """
+    if not verify_webhook_secret(secret):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
+    store_payload(payload)
+    people = payload.get("people")
+    person_count = len(people) if isinstance(people, list) else 0
+    log.info("Apollo phone webhook received — people: %d | status: %s", person_count, payload.get("status"))
+    return {"received": True, "people": person_count}
+
+
 # ── Start a Run ────────────────────────────────────────────────────────────────
 
 @app.post("/run")
 async def start_run(
     request: RunRequest,
     background_tasks: BackgroundTasks,
-    client: ClientProfile = Depends(get_current_client),
 ):
     """
-    Start a lead generation run (async).
-    Returns run_id immediately — poll /runs/{run_id} for status and results.
+    Start a deterministic lead generation run (async).
+    Modes: curated_seeds (default) or apollo_csv.
     """
-    # Validate request
-    if request.mode == InputMode.KEYWORD and not request.keyword:
-        raise HTTPException(status_code=422, detail="keyword is required for mode='keyword'")
-    if request.mode == InputMode.ICP and not request.icp:
-        raise HTTPException(status_code=422, detail="icp is required for mode='icp'")
-    if request.mode == InputMode.COMPANY_LIST and not request.company_list:
-        raise HTTPException(status_code=422, detail="company_list is required for mode='company_list'")
+    if request.mode == InputMode.CURATED_SEEDS:
+        if not (request.company_seeds or request.company_seeds_csv):
+            raise HTTPException(
+                status_code=422,
+                detail="company_seeds or company_seeds_csv is required for mode='curated_seeds'",
+            )
+        if request.company_seeds_csv and not Path(request.company_seeds_csv).exists():
+            raise HTTPException(
+                status_code=422,
+                detail=f"company_seeds_csv file not found: {request.company_seeds_csv}",
+            )
+    elif request.mode == InputMode.APOLLO_CSV:
+        if not request.apollo_csv_path:
+            raise HTTPException(status_code=422, detail="apollo_csv_path is required for mode='apollo_csv'")
+    else:
+        raise HTTPException(status_code=422, detail=f"Unsupported mode: {request.mode.value}")
 
-    # Create run state
+    if not request.sender:
+        raise HTTPException(status_code=422, detail="sender is required and must describe the offer/business")
+
+    client = _client_from_request(request)
+
     run_state = create_run(
         client_id=client.client_id,
         input_mode=request.mode,
         max_leads=request.max_leads,
-        keyword=request.keyword,
+        keyword=request.apollo_csv_path or "curated_seeds",
     )
 
     log.info(
@@ -93,7 +141,6 @@ async def start_run(
 @app.get("/runs/{run_id}")
 async def get_run_status(
     run_id: str,
-    client: ClientProfile = Depends(get_current_client),
 ):
     """
     Check the status of a lead generation run.
@@ -103,10 +150,6 @@ async def get_run_status(
 
     if not state:
         raise HTTPException(status_code=404, detail=f"Run '{run_id}' not found")
-
-    # Security: clients can only see their own runs
-    if state.client_id != client.client_id:
-        raise HTTPException(status_code=403, detail="Access denied")
 
     response: dict = {
         "run_id": state.run_id,
@@ -123,7 +166,8 @@ async def get_run_status(
         response.update({
             "completed_at": state.completed_at.isoformat() if state.completed_at else None,
             "qualified_leads": state.qualified_count,
-            "partial_leads": state.partial_count,
+            "rejected_leads": state.partial_count,
+            "partial_leads": 0,
             "sheet_url": state.sheet_url,
             "csv_path": state.csv_path,
             "recommendations": state.recommendations,
@@ -145,7 +189,6 @@ async def get_run_status(
 @app.post("/feedback")
 async def submit_feedback(
     feedback: FeedbackRequest,
-    client: ClientProfile = Depends(get_current_client),
 ):
     """
     Submit lead outcome feedback. Updates the per-client feedback log
@@ -159,7 +202,10 @@ async def submit_feedback(
     )
 
     # Append to per-client feedback log
-    feedback_dir = Path("data") / "clients" / client.client_id
+    state = get_run(feedback.run_id)
+    client_id = state.client_id if state else "local"
+
+    feedback_dir = Path("data") / "clients" / client_id
     feedback_dir.mkdir(parents=True, exist_ok=True)
     feedback_path = feedback_dir / "feedback_log.json"
 
@@ -176,15 +222,26 @@ async def submit_feedback(
     with open(feedback_path, "w", encoding="utf-8") as f:
         json.dump(existing, f, indent=2, default=str)
 
-    # Analyse recent feedback to auto-tune prefilter threshold
-    _maybe_tune_threshold(client.client_id, existing, log)
-
     log.info(
         "Feedback saved — client: %s | lead: %s | outcome: %s",
-        client.client_id, feedback.lead_id, feedback.outcome.value
+        client_id, feedback.lead_id, feedback.outcome.value
     )
 
     return {"saved": True, "total_feedback_entries": len(existing)}
+
+
+def _client_from_request(request: RunRequest) -> ClientProfile:
+    """Build run client context directly from the request payload."""
+    sender = request.sender or SenderProfile()
+    return ClientProfile(
+        client_id=sender.client_id,
+        name=sender.name,
+        api_key="local",
+        client_email=sender.client_email,
+        icp=request.icp or ICPProfile(),
+        sender=sender,
+        active=True,
+    )
 
 
 # ── Feedback Threshold Tuning ──────────────────────────────────────────────────
@@ -283,58 +340,30 @@ async def reset_dedup(
     return {"cleared": True, "client_id": client_id}
 
 
-def _maybe_tune_threshold(client_id: str, feedback_entries: list, logger) -> None:
-    """
-    After every 10 feedback entries, analyse conversion patterns
-    and update the ICP prefilter threshold in icp_profile.json.
-    """
-    if len(feedback_entries) < 10 or len(feedback_entries) % 10 != 0:
-        return
+@app.get("/admin/webhooks/apollo-phone")
+async def list_apollo_phone_webhooks(
+    since: str | None = None,
+    _: None = Depends(_check_admin),
+):
+    """Return stored Apollo phone webhook payloads (for local import scripts)."""
+    from agent.webhooks.apollo_phone import PAYLOADS_FILE
 
-    recent = feedback_entries[-20:]  # Analyse last 20 entries
-    converted = sum(1 for e in recent if e.get("outcome") == "converted")
-    wrong_fit = sum(1 for e in recent if e.get("outcome") == "wrong_fit")
-    total = len(recent)
+    payloads = load_payloads(since=since)
+    return {
+        "count": len(payloads),
+        "payloads": payloads,
+        "webhook_url": resolve_apollo_phone_webhook_url(),
+        "storage_path": str(PAYLOADS_FILE),
+    }
 
-    conversion_rate = converted / total
-    wrong_fit_rate = wrong_fit / total
 
-    profile_path = Path("data") / "clients" / client_id / "icp_profile.json"
-
-    # Load existing profile or create default
-    profile: dict = {"prefilter_threshold": 40}
-    if profile_path.exists():
-        try:
-            with open(profile_path, "r", encoding="utf-8") as f:
-                profile = json.load(f)
-        except Exception:
-            pass
-
-    current_threshold = profile.get("prefilter_threshold", 40)
-    new_threshold = current_threshold
-
-    # Tighten if too many wrong-fit leads
-    if wrong_fit_rate > 0.4 and current_threshold < 70:
-        new_threshold = min(current_threshold + 5, 70)
-        logger.info(
-            "Client %s: wrong_fit rate %.0f%% — tightening threshold %d → %d",
-            client_id, wrong_fit_rate * 100, current_threshold, new_threshold
+@app.get("/admin/webhooks/apollo-phone/url")
+async def get_apollo_phone_webhook_url(_: None = Depends(_check_admin)):
+    """Return the webhook URL to configure in Apollo / APOLLO_PHONE_WEBHOOK_URL."""
+    url = resolve_apollo_phone_webhook_url()
+    if not url:
+        raise HTTPException(
+            status_code=500,
+            detail="Set APOLLO_PHONE_WEBHOOK_URL or PUBLIC_BASE_URL + APOLLO_PHONE_WEBHOOK_SECRET",
         )
-
-    # Loosen if conversion rate is high (we're being too selective)
-    elif conversion_rate > 0.5 and current_threshold > 25:
-        new_threshold = max(current_threshold - 5, 25)
-        logger.info(
-            "Client %s: conversion rate %.0f%% — loosening threshold %d → %d",
-            client_id, conversion_rate * 100, current_threshold, new_threshold
-        )
-
-    if new_threshold != current_threshold:
-        profile["prefilter_threshold"] = new_threshold
-        profile["last_updated"] = datetime.utcnow().isoformat()
-        profile["conversion_rate"] = round(conversion_rate, 2)
-        profile["wrong_fit_rate"] = round(wrong_fit_rate, 2)
-
-        profile_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(profile_path, "w", encoding="utf-8") as f:
-            json.dump(profile, f, indent=2)
+    return {"webhook_url": url, **payload_stats()}

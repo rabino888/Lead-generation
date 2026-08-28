@@ -1,0 +1,18 @@
+{
+  "schema_version": "1",
+  "campaign_id": "example_campaign",
+  "sources": [
+    {
+      "id": "csv_ingest",
+      "type": "csv_ingest",
+      "name": "Curated CSV ingest",
+      "why_chosen": "Hand-curated company+website list — preferred over Apollo company search.",
+      "enabled": true,
+      "tier": "primary",
+      "config": {
+        "csv_path": "data/campaigns/example_campaign/seeds.csv"
+      },
+      "last_run_ref": null
+    }
+  ]
+}
