@@ -53,8 +53,11 @@ def _flat_tracker(run_totals: dict[str, Any]) -> dict[str, Any]:
         "apify_usd": run_totals.get("apify_usd"),
         "firecrawl_usd": run_totals.get("firecrawl_usd"),
         "firecrawl_pages": run_totals.get("firecrawl_pages"),
+        "firecrawl_credits": run_totals.get("firecrawl_credits"),
         "llm_usd": run_totals.get("llm_usd"),
         "llm_tokens": run_totals.get("llm_tokens"),
+        "llm_providers": run_totals.get("llm_providers"),
+        "llm_primary_provider": run_totals.get("llm_primary_provider"),
         "apollo_usd": run_totals.get("apollo_usd"),
         "total_usd": run_totals.get("total_usd"),
     }
@@ -111,22 +114,29 @@ def build_manifest_entry_from_report(
             entry["cost_tracker"] = _flat_tracker(run_totals)
 
     elif stage == "enrichment":
+        apify_api = report.get("apify_api_reconcile") or {}
         entry["apify"] = {
             "cost_tracker_usd": run_totals.get("apify_usd"),
             "api_truth_usd": apify_truth,
             "drift_usd": drift,
+            "by_actor": apify_api.get("by_actor"),
             "source": "CostTracker + Apify API reconcile",
         }
+        fc_credits = run_totals.get("firecrawl_credits") or run_totals.get("firecrawl_pages")
         entry["firecrawl"] = {
+            "credits": fc_credits,
             "pages": run_totals.get("firecrawl_pages"),
             "usd": run_totals.get("firecrawl_usd"),
-            "confidence": "estimate",
+            "basis": "firecrawl_plan_credits",
             "source": "CostTracker",
         }
+        llm_summary = run_totals.get("llm_providers") or {}
         entry["llm"] = {
             "tokens": run_totals.get("llm_tokens"),
             "usd": run_totals.get("llm_usd"),
-            "confidence": "estimate",
+            "providers": llm_summary,
+            "primary_provider": run_totals.get("llm_primary_provider"),
+            "basis": "llm_flat_rate_est",
             "source": "CostTracker flat rate",
         }
         entry["cost_tracker"] = _flat_tracker(run_totals)
@@ -169,23 +179,12 @@ def append_manifest_run(
 
 def rebuild_cost_dashboard(campaign_id: str, root: Optional[Path] = None) -> Path:
     """Rebuild cost_log.json, cost_log.md, cost_dashboard.html."""
+    from agent.utils.cost_report import build_campaign_report, write_campaign_cost_artifacts
+
     root = root or Path("data")
     campaign_dir = root / "campaigns" / campaign_id
-    from scripts.build_campaign_cost_report import build_report, write_html, write_markdown
-
-    report = build_report(campaign_id)
-    json_path = campaign_dir / "cost_log.json"
-    md_path = campaign_dir / "cost_log.md"
-    html_path = campaign_dir / "cost_dashboard.html"
-    json_path.write_text(json.dumps(report, indent=2, default=str), encoding="utf-8")
-    write_markdown(report, md_path)
-    write_html(report, html_path)
-    try:
-        from scripts.open_campaign_cost_dashboard import _inject_funnel_html
-
-        _inject_funnel_html(campaign_dir, report)
-    except Exception:
-        pass
+    report = build_campaign_report(campaign_id, root=root)
+    _, _, html_path = write_campaign_cost_artifacts(report, campaign_dir=campaign_dir)
     return html_path
 
 

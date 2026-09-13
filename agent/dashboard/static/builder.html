@@ -1,0 +1,1453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>List-building control</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+  <div class="page">
+    <div class="appnav" aria-label="App navigation">
+    <a href="/dashboard" class="brand brand-title">Lead List Ledger</a>
+    <div class="nav-btns">
+      <a href="/dashboard">Overview</a>
+      <a href="/builder" class="here">Campaign builder</a>
+    </div>
+  </div>
+
+    <div id="view-create" class="hidden">
+      <header class="top">
+        <span class="eyebrow">Campaign builder</span>
+        <h1>Build new campaign</h1>
+        <p class="lede">Register outreach under a client, then set ICP and enrichment modules. The cost ledger stays the home page.</p>
+      </header>
+
+      <div class="panel create-panel" id="create-panel">
+        <div class="panel-head">
+          <h3>New campaign</h3>
+          <span class="hint">Client → ICP → name the list</span>
+        </div>
+        <div class="field-stack">
+          <p class="create-step">1 · Client</p>
+          <label>Who is this for?
+            <select id="create-client-mode">
+              <option value="existing">Use existing client</option>
+              <option value="new">Create new client</option>
+            </select></label>
+          <label id="create-client-existing-wrap">Existing client
+            <select id="create-client"></select></label>
+          <div id="create-client-new-wrap" class="hidden">
+            <label>Client name
+              <input id="create-client-name" type="text" placeholder="e.g. Allyjob" autocomplete="organization"></label>
+            <label>Client id <span class="hint" style="text-transform:none;letter-spacing:0;font-weight:400">(folder key · auto from name)</span>
+              <input id="create-client-new" type="text" placeholder="e.g. allyjob" autocomplete="off"></label>
+          </div>
+
+          <p class="create-step">2 · ICP</p>
+          <label>ICP source
+            <select id="create-icp-mode">
+              <option value="new">Create new ICP</option>
+              <option value="existing">Use existing ICP (copy targeting)</option>
+            </select></label>
+          <label id="create-icp-source-wrap" class="hidden">Existing ICP
+            <select id="create-icp-source">
+              <option value="">Select an ICP…</option>
+            </select></label>
+          <p class="savehint" id="create-icp-hint">New ICP opens blank/heuristic setup next. Existing copies rules into this campaign.</p>
+
+          <p class="create-step">3 · Campaign name</p>
+          <label>ICP / campaign name
+            <input id="create-label" type="text" placeholder="e.g. Headhunting US 1-50" required></label>
+          <p class="savehint" id="create-folder-hint">Folder id is auto-assigned; this name is what you see on the ledger.</p>
+
+          <div class="segwrap" style="margin:0">
+            <span class="seglabel">Outreach type</span>
+            <div class="segmented" id="create-type">
+              <button type="button" class="segbtn on" data-type="company_outreach">Company outreach</button>
+              <button type="button" class="segbtn" data-type="talent_search">Talent search</button>
+            </div>
+          </div>
+          <label>Client brief (optional)
+            <textarea id="create-brief" placeholder="e.g. COOs, CTOs, marketing directors of headhunting companies in USA between 1 and 50 employees. Prefills ICP locally — no Gemini/OpenAI."></textarea></label>
+        </div>
+        <div class="create-actions">
+          <button type="button" class="btn primary" id="btn-create">Create &amp; open ICP setup</button>
+          <a class="btn ghost" id="btn-hide-create" href="/dashboard">Cancel</a>
+          <span class="savehint" id="create-status"></span>
+        </div>
+        <div class="setup-note">A client can have many ICPs / campaigns. Name each list clearly (e.g. Headhunting US 1-50).</div>
+      </div>
+    </div>
+
+    <div id="view-board" class="hidden">
+      <div class="board-nav">
+        <a class="back" href="/dashboard" id="back">← Cost ledger</a>
+      </div>
+      <header class="top">
+        <span class="eyebrow">Campaign</span>
+        <div class="h1row">
+          <h1 id="board-title">Campaign</h1>
+        </div>
+        <p class="lede" id="board-lede"></p>
+      </header>
+
+      <div class="panel icp-detail hidden" id="icp-detail">
+        <div class="panel-head">
+          <h3 id="icp-detail-title">Targeting and billing basis</h3>
+          <button type="button" class="btn" id="btn-edit-icp">Edit ICP &amp; seeds</button>
+        </div>
+        <dl class="facts" id="icp-detail-facts"></dl>
+      </div>
+
+      <div class="panel setup hidden" id="setup-panel">
+        <div class="panel-head">
+          <h3>ICP + seed setup</h3>
+          <span class="hint">Local disk · Cursor planning · no paid LLM</span>
+        </div>
+        <div class="setup-note" id="setup-note">
+          Your ICP has been created. You can fill it out manually below, or navigate into this
+          project locally at <code id="setup-note-path">…</code> from your harness
+          (Claude Code, Cursor, etc.) and generate a full ICP by speaking directly to your
+          personalised AI. Your harness should match the gold shape in
+          <code>data/clients/automata/icps/</code> (or legacy
+          <code>data/campaigns/automata_us_rnd/icp.json</code>)
+          (skill: <code>icp-draft</code>) and personalise the rest to this campaign’s brief.
+        </div>
+        <div class="brief-block" id="setup-brief-block">
+          <div class="brief-head">
+            <h3>Client brief</h3>
+            <span class="hint" id="setup-brief-hint">Editable · saved with the campaign</span>
+          </div>
+          <textarea id="setup-brief-edit" class="brief-edit" rows="4" placeholder="Titles, industry, geo, size, must-haves…"></textarea>
+          <div class="setup-actions" style="margin-top:8px">
+            <button type="button" class="btn" id="btn-save-brief">Save brief</button>
+            <span class="savehint" id="brief-status"></span>
+          </div>
+        </div>
+        <div class="plan-ai-block" id="setup-plan-ai">
+          <div class="brief-head">
+            <h3>ICP in Cursor (recommended)</h3>
+            <span class="hint">Stay in the IDE — avoid browser↔chat bounce</span>
+          </div>
+          <p class="setup-note" style="border:0;padding:0 0 10px;background:transparent">
+            Open <code id="setup-campaign-path">…</code> in your harness, ask for a full ICP
+            (match <code>automata_us_rnd/icp.json</code> · skill <code>icp-draft</code>), then
+            click <b>Reload ICP from disk</b>. Optional starter prompt is only if you need a fresh chat.
+          </p>
+          <div class="setup-actions" style="margin:0">
+            <button type="button" class="btn primary" id="btn-reload-icp">Reload ICP from disk</button>
+            <button type="button" class="btn" id="btn-copy-icp-prompt">Copy optional starter prompt</button>
+            <span class="savehint" id="plan-ai-status"></span>
+          </div>
+        </div>
+        <div class="setup-grid">
+          <div class="setup-col">
+            <h3 style="margin-bottom:10px">Edit ICP</h3>
+            <div class="field-stack" id="icp-fields"></div>
+            <div class="setup-actions">
+              <button type="button" class="btn primary" id="save-icp">Save icp.json</button>
+              <span class="savehint" id="icp-status"></span>
+            </div>
+          </div>
+          <div class="setup-col">
+            <h3 style="margin-bottom:10px">Identify initial seeds</h3>
+            <div id="seed-fields"></div>
+            <div class="setup-actions">
+              <button type="button" class="btn primary" id="save-seeds">Save seed_sources.json</button>
+              <span class="savehint" id="seed-status"></span>
+            </div>
+          </div>
+        </div>
+        <div class="setup-footer">
+          <p class="enrich-prompt hidden" id="enrich-prompt">
+            Would you like to configure the enrichment modules now?
+          </p>
+          <button type="button" class="btn primary" id="btn-continue-modules">Continue to enrichment modules</button>
+          <span class="savehint" id="continue-status"></span>
+        </div>
+      </div>
+
+      <div id="plan-modules" class="hidden">
+        <div class="segwrap">
+          <span class="seglabel">Enrichment modules for this campaign</span>
+          <span class="ctype-locked" id="board-type-locked"></span>
+        </div>
+
+        <div class="grid2">
+          <div class="panel" id="board-left"></div>
+          <div class="panel" id="board-right"></div>
+        </div>
+
+        <div class="savebar">
+          <span class="savehint" id="save-hint">PUT /builder/api/campaigns/…/plan</span>
+          <div style="display:flex;gap:8px;align-items:center">
+            <span class="savehint" id="save-status"></span>
+            <button type="button" class="btn primary" id="save-btn">Save plan</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="email-overlay" class="overlay hidden">
+    <div class="dialog">
+      <h3 style="font-family:var(--display);font-size:1rem;letter-spacing:0;text-transform:none;color:var(--ink)">Turn off email reveal?</h3>
+      <p style="margin:0;color:var(--ink-2);font-size:.9rem">Delivery becomes <b>LinkedIn-only</b>. Under DECISIONS D3 those rows are not contactable. v1 recommendation: keep email on.</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn ghost" id="email-keep">Keep email on</button>
+        <button type="button" class="btn danger" id="email-off">Turn off anyway</button>
+      </div>
+    </div>
+  </div>
+
+<script>
+  const qs = new URLSearchParams(location.search);
+  const state = {
+    campaigns: [],
+    clientId: null,
+    clientName: null,
+    activeCampaignId: null,
+    current: null,
+    plan: null,
+    estimate: null,
+    dirty: false,
+    icp: null,
+    seeds: null,
+    setupVisible: false,
+    icpDetailVisible: false,
+    modulesVisible: false,
+  };
+
+  const META = [
+    ['icp_match', 'ICP match', 'Local', 'Essential'],
+    ['dedupe', 'Deduplication', 'Local + Sheets', 'Essential'],
+    ['apollo_email', 'Email reveal', 'Apollo', 'Core'],
+    ['apify_dm_profile', 'LinkedIn DM profile', 'Apify', 'Core'],
+    ['apify_dm_posts', 'LinkedIn DM recent posts', 'Apify', 'Core'],
+    ['website_scrape', 'Website scrape', 'Apify / Firecrawl', 'Core'],
+    ['apify_company_profile', 'LinkedIn company profile', 'Apify', 'Optional'],
+    ['apify_company_jobs', 'LinkedIn company open jobs', 'Apify', 'Optional'],
+    ['apollo_phone', 'Decision-maker phone reveal', 'Apollo', 'Optional'],
+  ];
+  const KNOB = {
+    icp_match: 'always on — match_campaign_icp',
+    dedupe: 'always on — stage_dedupe',
+    apollo_email: 'off → LinkedIn-only mode',
+    apify_dm_profile: 'off → APIFY_SKIP_PERSON_PROFILE=1',
+    apify_dm_posts: 'off → APIFY_SKIP_LINKEDIN_POSTS=1',
+    website_scrape: 'WEBSITE_CRAWLER · off → skip website stage',
+    apify_company_profile: 'off → skip company-profile branch',
+    apify_company_jobs: 'off → APIFY_SKIP_LINKEDIN_JOBS=1',
+    apollo_phone: 'off → APOLLO_SKIP_PHONE=1',
+  };
+
+  function money(n) { return '$' + (Math.round((n || 0) * 100) / 100).toFixed(2); }
+  function intfmt(n) { return Math.round(n || 0).toLocaleString('en-US'); }
+
+  /** FastAPI may return detail as string, object, or list of {msg,loc} — never alert raw objects. */
+  function formatApiDetail(detail, fallback) {
+    if (detail == null || detail === '') return fallback || 'Request failed';
+    if (typeof detail === 'string') return detail;
+    if (Array.isArray(detail)) {
+      return detail.map((item) => {
+        if (typeof item === 'string') return item;
+        if (item && typeof item === 'object') {
+          const loc = Array.isArray(item.loc) ? item.loc.filter((x) => x !== 'body').join('.') : '';
+          const msg = item.msg || item.message || JSON.stringify(item);
+          return loc ? (loc + ': ' + msg) : msg;
+        }
+        return String(item);
+      }).filter(Boolean).join('; ') || (fallback || 'Request failed');
+    }
+    if (typeof detail === 'object') {
+      if (detail.msg || detail.message) return detail.msg || detail.message;
+      try { return JSON.stringify(detail); } catch (_) { return fallback || 'Request failed'; }
+    }
+    return String(detail);
+  }
+
+  function errText(err, fallback) {
+    if (!err) return fallback || 'Unknown error';
+    if (typeof err === 'string') return err;
+    if (err.message && typeof err.message === 'string' && err.message !== '[object Object]') {
+      return err.message;
+    }
+    return formatApiDetail(err.detail || err.message, fallback || 'Request failed');
+  }
+
+  function api(path, opts) {
+    return fetch(path, Object.assign({ headers: { 'Content-Type': 'application/json' } }, opts || {}))
+      .then(async (r) => {
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) {
+          throw new Error(formatApiDetail(data.detail, r.statusText || ('HTTP ' + r.status)));
+        }
+        return data;
+      });
+  }
+
+  async function loadList() {
+    const data = await api('/builder/api/campaigns');
+    state.campaigns = data.campaigns || [];
+    fillClientFilters();
+
+    const campaignId = qs.get('campaign');
+    const clientParam = qs.get('client');
+    const isNew = qs.get('new') === '1';
+
+    if (campaignId && state.campaigns.some((c) => c.campaign_id === campaignId)) {
+      await openCampaign(campaignId);
+      return;
+    }
+    if (clientParam && !isNew) {
+      location.replace('/dashboard/clients/' + encodeURIComponent(clientParam));
+      return;
+    }
+    if (isNew || (clientParam && isNew)) {
+      showCreateView(true);
+      const client = clientParam;
+      const ctype = qs.get('type');
+      if (ctype === 'talent_search' || ctype === 'company_outreach') {
+        document.querySelectorAll('#create-type .segbtn').forEach((b) => {
+          b.classList.toggle('on', b.dataset.type === ctype);
+        });
+      }
+      if (client) {
+        const known = [...document.querySelectorAll('#create-client option')].some((o) => o.value === client);
+        const mode = document.getElementById('create-client-mode');
+        if (known) {
+          if (mode) mode.value = 'existing';
+          document.getElementById('create-client').value = client;
+        } else {
+          if (mode) mode.value = 'new';
+          document.getElementById('create-client-new').value = client;
+        }
+        syncClientMode();
+      }
+      try {
+        const brief = sessionStorage.getItem('builder_brief');
+        if (brief) {
+          document.getElementById('create-brief').value = brief;
+          sessionStorage.removeItem('builder_brief');
+        }
+      } catch (e) { /* ignore */ }
+      return;
+    }
+    // No builder context — cost ledger is the only home page
+    location.replace('/dashboard');
+  }
+
+  function showCreateView(on) {
+    document.getElementById('view-board').classList.add('hidden');
+    const create = document.getElementById('view-create');
+    if (create) create.classList.toggle('hidden', !on);
+    if (on) {
+      syncClientMode();
+      updateFolderHint();
+      fillCreateIcpSource();
+    }
+  }
+
+  function currentCreateClientId() {
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    if (mode === 'new') {
+      return (document.getElementById('create-client-new').value || '').trim()
+        || slugPart(document.getElementById('create-client-name').value, '');
+    }
+    return (document.getElementById('create-client').value || '').trim();
+  }
+
+  async function fillCreateIcpSource() {
+    const sel = document.getElementById('create-icp-source');
+    if (!sel) return;
+    const prev = sel.value;
+    const clientId = currentCreateClientId();
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    let rows = [];
+    if (mode === 'existing' && clientId) {
+      try {
+        const res = await api('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps');
+        rows = res.icps || [];
+      } catch (_) {
+        // Fall back to campaign-linked summaries if ICP library not ready
+        rows = state.campaigns
+          .filter((c) => (c.client_id || '') === clientId)
+          .map((c) => ({
+            icp_id: c.icp_id || c.campaign_id,
+            display_name: c.display_name || c.campaign_id,
+            campaign_type: c.campaign_type,
+            icp: c.icp,
+          }));
+      }
+    }
+    sel.innerHTML = '<option value="">Select an ICP…</option>'
+      + rows.map((c) => {
+        const ctype = String(c.campaign_type || 'company_outreach').replace(/_/g, ' ');
+        const name = c.display_name || c.icp_id;
+        const titles = ((c.icp && c.icp.job_titles) || []).slice(0, 2).join(', ');
+        const label = name + ' · ' + ctype + (titles ? ' · ' + titles : '');
+        return `<option value="${c.icp_id}" data-type="${c.campaign_type || 'company_outreach'}">${label}</option>`;
+      }).join('');
+    if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
+    else sel.value = '';
+    const hint = document.getElementById('create-icp-hint');
+    if (hint && mode === 'existing') {
+      hint.textContent = rows.length
+        ? rows.length + ' saved ICP(s) for this client — one ICP can power many campaigns.'
+        : 'No ICPs for this client yet. Create a new ICP first, or switch to “Create new ICP”.';
+    }
+    syncIcpMode();
+  }
+
+  function syncIcpMode() {
+    const mode = (document.getElementById('create-icp-mode') || {}).value || 'new';
+    const wrap = document.getElementById('create-icp-source-wrap');
+    if (wrap) wrap.classList.toggle('hidden', mode !== 'existing');
+    const hint = document.getElementById('create-icp-hint');
+    if (hint) {
+      if (mode === 'existing') {
+        hint.textContent = 'Copies targeting into a new campaign folder. You still name this list in step 3.';
+      } else {
+        hint.textContent = 'Opens ICP setup next (brief heuristics + Cursor planning). Name the list in step 3.';
+      }
+    }
+    updateFolderHint();
+  }
+
+  function applyCreateIcpSourceType() {
+    const sel = document.getElementById('create-icp-source');
+    if (!sel || !sel.value) return;
+    const opt = sel.options[sel.selectedIndex];
+    const ctype = (opt && opt.dataset.type) || 'company_outreach';
+    document.querySelectorAll('#create-type .segbtn').forEach((b) => {
+      b.classList.toggle('on', b.dataset.type === ctype);
+    });
+    const labelEl = document.getElementById('create-label');
+    if (labelEl && !labelEl.value.trim() && opt) {
+      const text = (opt.textContent || '').split(' · ')[0];
+      if (text && text !== 'Select an ICP…') labelEl.value = text + ' (new list)';
+    }
+    updateFolderHint();
+  }
+
+  function slugPart(value, fallback) {
+    const raw = String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return (raw.slice(0, 40) || fallback || 'list');
+  }
+
+  function syncClientMode() {
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    const existingWrap = document.getElementById('create-client-existing-wrap');
+    const newWrap = document.getElementById('create-client-new-wrap');
+    const isNew = mode === 'new';
+    if (existingWrap) existingWrap.classList.toggle('hidden', isNew);
+    if (newWrap) newWrap.classList.toggle('hidden', !isNew);
+    updateFolderHint();
+    fillCreateIcpSource();
+  }
+
+  function updateFolderHint() {
+    const hint = document.getElementById('create-folder-hint');
+    if (!hint) return;
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    let clientId = '';
+    if (mode === 'new') {
+      clientId = (document.getElementById('create-client-new').value || '').trim()
+        || slugPart(document.getElementById('create-client-name').value, 'client');
+    } else {
+      clientId = (document.getElementById('create-client').value || '').trim() || 'client';
+    }
+    const label = (document.getElementById('create-label') || {}).value || '';
+    const typeBtn = document.querySelector('#create-type .segbtn.on');
+    const ctype = (typeBtn && typeBtn.dataset.type) || 'company_outreach';
+    const suffix = label.trim()
+      ? slugPart(label, ctype === 'talent_search' ? 'talent' : 'outreach')
+      : (ctype === 'talent_search' ? 'talent' : 'outreach');
+    hint.textContent = 'Ledger name is what you type above. Folder example: data/clients/'
+      + slugPart(clientId, 'client') + '/campaigns/'
+      + slugPart(clientId, 'client') + '_' + suffix + '/';
+  }
+
+  async function createCampaign() {
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    let client_id = '';
+    let client_name = '';
+    if (mode === 'new') {
+      client_name = (document.getElementById('create-client-name').value || '').trim();
+      client_id = (document.getElementById('create-client-new').value || '').trim()
+        || slugPart(client_name, '');
+      if (!client_name) {
+        alert('Enter a client name.');
+        return;
+      }
+      if (!client_id) {
+        alert('Enter a client id (or a name we can turn into one).');
+        return;
+      }
+      document.getElementById('create-client-new').value = client_id;
+    } else {
+      client_id = (document.getElementById('create-client').value || '').trim();
+      if (!client_id) {
+        alert('Select an existing client, or choose “Create new client”.');
+        return;
+      }
+      const opt = document.querySelector('#create-client option:checked');
+      client_name = (opt && opt.textContent.split(' (')[0]) || client_id;
+    }
+    const label = (document.getElementById('create-label').value || '').trim();
+    if (!label) {
+      alert('Enter an ICP / campaign name (e.g. Headhunting US 1-50).');
+      return;
+    }
+    const icpMode = (document.getElementById('create-icp-mode') || {}).value || 'new';
+    const icpSource = icpMode === 'existing'
+      ? ((document.getElementById('create-icp-source') || {}).value || '')
+      : '';
+    if (icpMode === 'existing' && !icpSource) {
+      alert('Select an existing ICP to link, or switch to “Create new ICP”.');
+      return;
+    }
+    const brief = (document.getElementById('create-brief').value || '').trim();
+    if (icpSource) applyCreateIcpSourceType();
+    const typeBtn = document.querySelector('#create-type .segbtn.on');
+    const campaign_type = (typeBtn && typeBtn.dataset.type) || 'company_outreach';
+    const status = document.getElementById('create-status');
+    status.textContent = 'Creating…';
+    try {
+      const payload = {
+        client_id,
+        client_name,
+        label,
+        brief,
+        campaign_type,
+      };
+      if (icpSource) payload.icp_id = icpSource;
+      const res = await api('/builder/api/campaigns', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      });
+      const campaign_id = res.campaign.campaign_id;
+      status.textContent = 'Created ' + label + ' — opening ICP setup';
+      qs.delete('new');
+      qs.delete('campaign');
+      const refreshed = await api('/builder/api/campaigns');
+      state.campaigns = refreshed.campaigns || [];
+      fillClientFilters();
+      await openClient(client_id, {
+        focusCampaignId: campaign_id,
+        showModules: false,
+        openSetup: true,
+        editOnly: true,
+      });
+    } catch (err) {
+      const msg = errText(err, 'Create failed');
+      status.textContent = msg;
+      alert(msg);
+    }
+  }
+
+  function clientOptions() {
+    const map = {};
+    state.campaigns.forEach((c) => {
+      const id = c.client_id || '';
+      if (!id) return;
+      map[id] = c.client_name || id;
+    });
+    return Object.entries(map).sort((a, b) => a[1].localeCompare(b[1]));
+  }
+
+  function fillClientFilters() {
+    const createSel = document.getElementById('create-client');
+    if (!createSel) return;
+    const opts = clientOptions();
+    const preferred = qs.get('client') || '';
+    const existing = createSel.value;
+    const known = new Set(opts.map(([id]) => id));
+    createSel.innerHTML = opts.length
+      ? opts.map(([id, name]) => `<option value="${id}">${name} (${id})</option>`).join('')
+      : '<option value="">No clients yet — register a new one</option>';
+    if (preferred && known.has(preferred)) {
+      createSel.value = preferred;
+    } else if (existing && known.has(existing)) {
+      createSel.value = existing;
+    } else if (opts.length) {
+      createSel.selectedIndex = 0;
+    }
+    const mode = document.getElementById('create-client-mode');
+    if (mode && preferred && !known.has(preferred) && qs.get('new') === '1') {
+      mode.value = 'new';
+      const idInput = document.getElementById('create-client-new');
+      if (idInput) idInput.value = preferred;
+    } else if (mode && preferred && known.has(preferred)) {
+      mode.value = 'existing';
+    } else if (mode && !opts.length) {
+      mode.value = 'new';
+    }
+    syncClientMode();
+    fillCreateIcpSource();
+  }
+
+  function appendFactHtml(label, value) {
+    if (value === undefined || value === null || value === '' ||
+        (Array.isArray(value) && !value.length)) return '';
+    let dd;
+    if (Array.isArray(value)) {
+      dd = `<div class="tags">${value.map((v) => `<span class="tag">${String(v)}</span>`).join('')}</div>`;
+    } else {
+      dd = String(value);
+    }
+    return `<dt>${label}</dt><dd>${dd}</dd>`;
+  }
+
+  function renderIcpDetailPanel() {
+    const panel = document.getElementById('icp-detail');
+    const facts = document.getElementById('icp-detail-facts');
+    const title = document.getElementById('icp-detail-title');
+    if (!state.icpDetailVisible || !state.activeCampaignId || !state.current) {
+      panel.classList.add('hidden');
+      return;
+    }
+    panel.classList.remove('hidden');
+    title.textContent = 'Targeting and billing basis · ' + state.activeCampaignId;
+    const icp = state.icp || (state.current.icp) || {};
+    const ctype = (state.plan && state.plan.campaign_type) || state.current.campaign_type || 'company_outreach';
+    let html = appendFactHtml('Campaign type', String(ctype).replace(/_/g, ' '));
+    html += appendFactHtml('Titles', icp.job_titles);
+    html += appendFactHtml('Contact locations', icp.contact_locations);
+    html += appendFactHtml('Geo', icp.primary_location || (icp.geo && icp.geo.primary_location) || icp.location);
+    if (icp.company_size_min || icp.company_size_max) {
+      html += appendFactHtml('Company size', (icp.company_size_min || '?') + ' – ' + (icp.company_size_max || '?'));
+    }
+    html += appendFactHtml('Industry', icp.industries);
+    html += appendFactHtml('Excluded industries', icp.excluded_industries);
+    html += appendFactHtml('Company keywords', icp.include_keywords);
+    html += appendFactHtml('Exclude keywords', icp.exclude_keywords);
+    html += appendFactHtml('Website mode', icp.website_analysis_mode);
+    const pm = icp.person_match;
+    if (pm && typeof pm === 'object') {
+      html += appendFactHtml('Skills', pm.skills);
+      html += appendFactHtml('Exclude titles', pm.exclude_titles);
+      if (pm.min_years_experience != null || pm.max_years_experience != null) {
+        html += appendFactHtml('Experience years',
+          (pm.min_years_experience ?? '?') + ' – ' + (pm.max_years_experience ?? '?'));
+      }
+    }
+    facts.innerHTML = html || '<dd style="grid-column:1/-1;color:var(--ink-3)">No ICP details saved for this campaign.</dd>';
+  }
+
+  function setModulesVisible(on) {
+    state.modulesVisible = !!on;
+    const el = document.getElementById('plan-modules');
+    if (el) el.classList.toggle('hidden', !state.modulesVisible);
+  }
+
+  function setSetupVisible(on) {
+    state.setupVisible = !!on;
+    const setup = document.getElementById('setup-panel');
+    if (setup) setup.classList.toggle('hidden', !state.setupVisible);
+    if (state.setupVisible) renderSetup();
+  }
+
+  function updateBoardHeader(campaignId) {
+    const id = campaignId || state.activeCampaignId || '';
+    const label = (state.current && state.current.display_name) || id || 'Campaign';
+    document.getElementById('board-title').textContent = label;
+    const clientLabel = state.clientName || state.clientId || '';
+    const folder = id && label !== id ? ('Folder · ' + id) : '';
+    document.getElementById('board-lede').textContent = [clientLabel ? ('Client · ' + clientLabel) : '', folder]
+      .filter(Boolean).join(' · ');
+  }
+
+  async function openClient(clientId, opts) {
+    opts = opts || {};
+    // Client browse lives on the ledger — only keep builder for create / campaign edit
+    if (!opts.focusCampaignId && !opts.editOnly) {
+      location.replace('/dashboard/clients/' + encodeURIComponent(clientId));
+      return;
+    }
+    state.clientId = clientId;
+    const clientRows = state.campaigns.filter((c) => (c.client_id || '') === clientId);
+    state.clientName = (clientRows[0] && clientRows[0].client_name) || clientId;
+    const focus = opts.focusCampaignId;
+    history.replaceState(null, '', focus
+      ? ('?campaign=' + encodeURIComponent(focus))
+      : ('?client=' + encodeURIComponent(clientId)));
+    document.getElementById('view-create').classList.add('hidden');
+    document.getElementById('view-board').classList.remove('hidden');
+    const back = document.getElementById('back');
+    if (back) {
+      if (focus) {
+        back.href = '/dashboard#/campaign/' + encodeURIComponent(focus);
+        back.textContent = '← Campaign on ledger';
+      } else {
+        back.href = '/dashboard#/client/' + encodeURIComponent(clientId);
+        back.textContent = '← ' + (state.clientName || clientId) + ' on ledger';
+      }
+    }
+    updateBoardHeader(focus);
+    if (opts.focusCampaignId) {
+      const selectOpts = Object.assign({}, opts);
+      if (!('showModules' in opts)) selectOpts.showModules = true;
+      await selectCampaign(opts.focusCampaignId, selectOpts);
+    }
+  }
+
+  async function openCampaign(id) {
+    let summary = state.campaigns.find((c) => c.campaign_id === id);
+    let clientId = summary && summary.client_id;
+    if (!clientId) {
+      const data = await api('/builder/api/campaigns/' + encodeURIComponent(id));
+      clientId = data.client_id;
+      if (!state.campaigns.some((c) => c.campaign_id === id)) {
+        state.campaigns.push({
+          campaign_id: data.campaign_id,
+          client_id: data.client_id,
+          client_name: data.client_name,
+          display_name: data.display_name,
+          campaign_type: data.campaign_type,
+          icp: data.icp,
+          has_saved_plan: data.has_saved_plan,
+        });
+      }
+    }
+    if (!clientId) {
+      alert('Campaign has no client_id');
+      return;
+    }
+    await openClient(clientId, { focusCampaignId: id, showModules: true, editOnly: true });
+  }
+
+  async function selectCampaign(id, opts) {
+    opts = opts || {};
+    const data = await api('/builder/api/campaigns/' + encodeURIComponent(id));
+    state.activeCampaignId = id;
+    state.current = data;
+    state.plan = JSON.parse(JSON.stringify(data.plan));
+    state.dirty = false;
+    state.setupVisible = false;
+    if (data.client_id) state.clientId = data.client_id;
+    if (data.client_name) state.clientName = data.client_name;
+    const [icpRes, seedRes] = await Promise.all([
+      api('/builder/api/campaigns/' + encodeURIComponent(id) + '/icp'),
+      api('/builder/api/campaigns/' + encodeURIComponent(id) + '/seed_sources'),
+    ]);
+    state.icp = icpRes.data || {};
+    state.seeds = seedRes.data || { sources: [] };
+    document.getElementById('setup-panel').classList.add('hidden');
+    state.icpDetailVisible = !!opts.showIcpDetail;
+    state.modulesVisible = !!opts.showModules;
+    setModulesVisible(state.modulesVisible);
+    updateBoardHeader(id);
+    // Local estimate math only when the enrichment board is shown — never for ICP-first setup.
+    if (state.modulesVisible) {
+      await refreshEstimate();
+      renderBoard();
+    }
+    renderIcpDetailPanel();
+    if (opts.openSetup) {
+      showEnrichPrompt(false);
+      setSetupVisible(true);
+      const setup = document.getElementById('setup-panel');
+      if (setup) setup.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (state.icpDetailVisible && !state.modulesVisible) {
+      const panel = document.getElementById('icp-detail');
+      if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } else if (state.modulesVisible) {
+      const plan = document.getElementById('plan-modules');
+      if (plan) plan.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  async function continueToModules() {
+    const status = document.getElementById('continue-status');
+    let titles = (state.icp && state.icp.job_titles) || [];
+    let locs = (state.icp && state.icp.contact_locations) || [];
+    if (state.setupVisible && document.getElementById('icp-titles')) {
+      try {
+        const draft = collectIcpFromForm();
+        titles = draft.job_titles || [];
+        locs = draft.contact_locations || [];
+      } catch (_) { /* form not ready */ }
+    }
+    if ((!titles.length || !locs.length) && status) {
+      status.textContent = 'Tip: titles or contact locations still empty — save ICP first, or continue anyway.';
+    } else if (status) {
+      status.textContent = '';
+    }
+    setModulesVisible(true);
+    try {
+      await refreshEstimate();
+      renderBoard();
+      const plan = document.getElementById('plan-modules');
+      if (plan) plan.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      if (status) status.textContent = errText(err);
+      alert(errText(err));
+    }
+  }
+
+  function icpFieldsHtml(icp, ctype, prefix) {
+    const p = prefix || 'icp';
+    const isTalent = ctype === 'talent_search';
+    const pm = icp.person_match || {};
+    const mode = icp.website_analysis_mode || 'full';
+    const geo = icp.geo || {};
+    if (isTalent) {
+      return `
+        <p style="margin:0 0 8px;font-size:.8rem;color:var(--ink-2)">Talent search ICP — person rules.</p>
+        <label>Target titles / roles (one per line)
+          <textarea id="${p}-titles">${lines(icp.job_titles)}</textarea></label>
+        <label>Person locations (comma-separated)
+          <input id="${p}-locs" type="text" value="${(icp.contact_locations || []).join(', ')}"></label>
+        <label>Must-have skills / keywords (one per line)
+          <textarea id="${p}-skills">${lines(pm.skills || icp.include_keywords || [])}</textarea></label>
+        <label>Exclude keywords (one per line)
+          <textarea id="${p}-exc">${lines(pm.exclude_keywords || icp.exclude_keywords || [])}</textarea></label>
+        <label>Exclude titles (one per line)
+          <textarea id="${p}-excl-titles">${lines(pm.exclude_titles || [])}</textarea></label>
+        <div class="field-row">
+          <label>Min years experience<input id="${p}-min-years" type="number" min="0" value="${pm.min_years_experience ?? ''}"></label>
+          <label>Max years experience<input id="${p}-max-years" type="number" min="0" value="${pm.max_years_experience ?? ''}"></label>
+        </div>
+        <label>Headline allow regex (optional)
+          <input id="${p}-headline" type="text" value="${pm.headline_allow || ''}"></label>`;
+    }
+    return `
+      <p style="margin:0 0 8px;font-size:.8rem;color:var(--ink-2)">Company outreach ICP — same shape as <code>automata_us_rnd/icp.json</code>.</p>
+      <label>Job titles (one per line)
+        <textarea id="${p}-titles">${lines(icp.job_titles)}</textarea></label>
+      <label>Contact locations (comma-separated)
+        <input id="${p}-locs" type="text" value="${(icp.contact_locations || []).join(', ')}"></label>
+      <label>Primary geo
+        <input id="${p}-geo" type="text" value="${geo.primary_location || icp.primary_location || ''}" placeholder="e.g. United States"></label>
+      <div class="field-row">
+        <label>Company size min<input id="${p}-min" type="number" value="${icp.company_size_min ?? ''}"></label>
+        <label>Company size max<input id="${p}-max" type="number" value="${icp.company_size_max ?? ''}"></label>
+      </div>
+      <label>Industry (one per line)
+        <textarea id="${p}-industries">${lines(icp.industries)}</textarea></label>
+      <label>Excluded industries (one per line)
+        <textarea id="${p}-excl-industries">${lines(icp.excluded_industries)}</textarea></label>
+      <label>Company keywords / signals (one per line)
+        <textarea id="${p}-keywords">${lines(icp.include_keywords)}</textarea></label>
+      <label>Exclude keywords (one per line)
+        <textarea id="${p}-exc">${lines(icp.exclude_keywords)}</textarea></label>
+      <label>Excluded name patterns (regex)
+        <input id="${p}-name-pat" type="text" value="${icp.excluded_name_patterns || ''}"></label>
+      <label>Website analysis mode
+        <select id="${p}-mode">
+          <option value="hiring_first"${mode === 'hiring_first' ? ' selected' : ''}>hiring_first</option>
+          <option value="full"${mode === 'full' ? ' selected' : ''}>full</option>
+        </select></label>`;
+  }
+
+  function deriveEmployeeRanges(minVal, maxVal) {
+    const buckets = [[1, 10], [11, 50], [51, 200], [201, 500], [501, 1000], [1001, 5000], [5001, 10000], [10001, 50000]];
+    if (minVal == null && maxVal == null) return [];
+    const lo = minVal == null ? 1 : minVal;
+    const hi = maxVal == null ? 50000 : maxVal;
+    return buckets
+      .filter(([a, b]) => b >= lo && a <= hi)
+      .map(([a, b]) => a + ',' + b);
+  }
+
+  function collectIcpFromPrefix(prefix, ctype, base) {
+    const p = prefix || 'icp';
+    const out = Object.assign({}, base || {});
+    const isTalent = ctype === 'talent_search';
+    out.job_titles = splitLines(document.getElementById(p + '-titles').value);
+    out.contact_locations = splitCsv(document.getElementById(p + '-locs').value);
+    out.exclude_keywords = splitLines(document.getElementById(p + '-exc').value);
+    if (isTalent) {
+      const minY = document.getElementById(p + '-min-years');
+      const maxY = document.getElementById(p + '-max-years');
+      const skills = splitLines((document.getElementById(p + '-skills') || {}).value);
+      out.person_match = Object.assign({}, out.person_match || {}, {
+        skills,
+        exclude_keywords: out.exclude_keywords,
+        exclude_titles: splitLines((document.getElementById(p + '-excl-titles') || {}).value),
+        min_years_experience: minY && minY.value !== '' ? parseInt(minY.value, 10) : null,
+        max_years_experience: maxY && maxY.value !== '' ? parseInt(maxY.value, 10) : null,
+        headline_allow: ((document.getElementById(p + '-headline') || {}).value || '').trim() || null,
+      });
+      out.include_keywords = skills;
+      delete out.website_analysis_mode;
+    } else {
+      const minEl = document.getElementById(p + '-min');
+      const maxEl = document.getElementById(p + '-max');
+      const min = minEl ? minEl.value : '';
+      const max = maxEl ? maxEl.value : '';
+      out.company_size_min = min === '' ? null : parseInt(min, 10);
+      out.company_size_max = max === '' ? null : parseInt(max, 10);
+      out.industries = splitLines((document.getElementById(p + '-industries') || {}).value);
+      out.excluded_industries = splitLines((document.getElementById(p + '-excl-industries') || {}).value);
+      out.include_keywords = splitLines((document.getElementById(p + '-keywords') || {}).value);
+      out.excluded_name_patterns = ((document.getElementById(p + '-name-pat') || {}).value || '').trim();
+      out.website_analysis_mode = document.getElementById(p + '-mode').value;
+      const primaryGeo = ((document.getElementById(p + '-geo') || {}).value || '').trim()
+        || (out.contact_locations[0] || '');
+      out.geo = Object.assign({}, out.geo || {}, {
+        primary_location: primaryGeo || undefined,
+        segments: out.geo && out.geo.segments ? out.geo.segments : (primaryGeo ? [primaryGeo] : []),
+        location_hints: out.geo && out.geo.location_hints ? out.geo.location_hints : [],
+        country_codes: out.geo && out.geo.country_codes ? out.geo.country_codes : {},
+      });
+      if (!out.employee_ranges || !out.employee_ranges.length) {
+        out.employee_ranges = deriveEmployeeRanges(out.company_size_min, out.company_size_max);
+      }
+      if (!out.schema_version) out.schema_version = '1';
+    }
+    return out;
+  }
+
+  function lines(v) {
+    if (Array.isArray(v)) return v.join('\n');
+    return (v == null ? '' : String(v));
+  }
+  function splitLines(s) {
+    return String(s || '').split(/\r?\n/).map((x) => x.trim()).filter(Boolean);
+  }
+  function splitCsv(s) {
+    return String(s || '').split(',').map((x) => x.trim()).filter(Boolean);
+  }
+
+  function buildIcpPlanningPrompt() {
+    const id = (state.current && state.current.campaign_id) || '';
+    const disk = campaignDiskPath();
+    const brief = ((state.current && state.current.brief) || '').trim();
+    const ctype = (state.plan && state.plan.campaign_type) || 'company_outreach';
+    return [
+      'Draft a complete deterministic ICP for this lead-gen campaign.',
+      '',
+      'Constraints:',
+      '- No paid LLM/vendor APIs for this step — edit local files only.',
+      '- Campaign folder: ' + disk,
+      '- Write / update: ' + disk.replace(/[\\/]+$/, '') + '/icp.json',
+      '- Match the gold shape and depth of data/campaigns/automata_us_rnd/icp.json',
+      '  (schema_version, industries, excluded_industries, geo, company_size_*,',
+      '  employee_ranges, include_keywords, exclude_keywords, excluded_name_patterns,',
+      '  excluded_domains, job_titles, contact_locations, website_analysis_mode, …).',
+      '- Prefer the icp-draft skill / SOP-ICP-PLANNING.md when available.',
+      '- Also follow docs/ICP-INTAKE-TEMPLATE.md for field meaning.',
+      '- Campaign type: ' + ctype,
+      '- Personalise every field to this client brief — do not leave a thin stub.',
+      '- Ask me clarifying questions before writing if the brief is thin.',
+      '- After writing the file, summarize what you set and what is still uncertain.',
+      '',
+      'Client brief:',
+      brief || '(no brief saved — ask me for titles, industry, geo, size, excludes)',
+      '',
+      'When done, I will click “Reload ICP from disk” in /builder.',
+    ].join('\n');
+  }
+
+  async function copyIcpPlanningPrompt() {
+    const status = document.getElementById('plan-ai-status');
+    const text = buildIcpPlanningPrompt();
+    try {
+      await navigator.clipboard.writeText(text);
+      if (status) status.textContent = 'Prompt copied — paste into Cursor chat';
+    } catch (_) {
+      // Fallback for older browsers / insecure context
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      ta.remove();
+      if (status) status.textContent = 'Prompt copied — paste into Cursor chat';
+    }
+  }
+
+  async function reloadIcpFromDisk() {
+    const status = document.getElementById('plan-ai-status');
+    const id = state.current && state.current.campaign_id;
+    if (!id) {
+      alert('No campaign open');
+      return;
+    }
+    try {
+      const icpRes = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/icp');
+      state.icp = icpRes.data || {};
+      if (state.current) {
+        state.current.icp = {
+          job_titles: state.icp.job_titles,
+          contact_locations: state.icp.contact_locations,
+          industries: state.icp.industries,
+          company_size_min: state.icp.company_size_min,
+          company_size_max: state.icp.company_size_max,
+          website_analysis_mode: state.icp.website_analysis_mode,
+        };
+      }
+      renderSetup();
+      renderIcpDetailPanel();
+      if (status) status.textContent = 'Reloaded icp.json from disk';
+      const icpStatus = document.getElementById('icp-status');
+      if (icpStatus) icpStatus.textContent = 'Reloaded';
+    } catch (err) {
+      if (status) status.textContent = errText(err);
+      alert(errText(err));
+    }
+  }
+
+  function campaignDiskPath() {
+    const fromApi = (state.current && state.current.disk_path) || '';
+    if (fromApi) return fromApi;
+    const id = (state.current && state.current.campaign_id) || '';
+    return id ? ('data/campaigns/' + id) : 'data/campaigns/…';
+  }
+
+  function renderSetupBrief() {
+    const briefEl = document.getElementById('setup-brief-edit');
+    const hintEl = document.getElementById('setup-brief-hint');
+    const pathEl = document.getElementById('setup-campaign-path');
+    const notePath = document.getElementById('setup-note-path');
+    const disk = campaignDiskPath();
+    if (pathEl) pathEl.textContent = disk;
+    if (notePath) notePath.textContent = disk;
+    if (!briefEl) return;
+    const brief = ((state.current && state.current.brief) || '').trim();
+    briefEl.value = brief;
+    if (hintEl) {
+      hintEl.textContent = brief
+        ? 'Editable · also in campaign.json for Cursor'
+        : 'Optional · edit here or in Cursor';
+    }
+  }
+
+  function showEnrichPrompt(on) {
+    const el = document.getElementById('enrich-prompt');
+    if (el) el.classList.toggle('hidden', !on);
+  }
+
+  function renderSetup() {
+    renderSetupBrief();
+    const icp = state.icp || {};
+    const isTalent = state.plan && state.plan.campaign_type === 'talent_search';
+    document.getElementById('icp-fields').innerHTML = icpFieldsHtml(
+      icp, isTalent ? 'talent_search' : 'company_outreach', 'icp');
+
+    const seeds = state.seeds || { sources: [] };
+    const sources = Array.isArray(seeds.sources) ? seeds.sources : [];
+    const cards = sources.length ? sources.map((s, i) => `
+      <div class="seed-card" data-i="${i}">
+        <label class="en"><input type="checkbox" class="seed-en" ${s.enabled ? 'checked' : ''}>
+          <span class="sid">${s.type || s.id || 'source'} · ${s.name || s.id || ''}</span></label>
+        <div class="smeta">${s.why_chosen || s.tier || ''}</div>
+        ${(s.type === 'csv_ingest' || (s.config && s.config.csv_path))
+          ? `<label style="margin-top:8px">CSV path<input class="seed-csv" type="text" value="${(s.config && s.config.csv_path) || ''}"></label>`
+          : ''}
+      </div>`).join('')
+      : '<p style="margin:0;font-size:.84rem;color:var(--ink-3)">No sources yet. Ask the IDE agent to draft <code>seed_sources.json</code> from directories / notes, or add a csv_ingest entry after save.</p>';
+    document.getElementById('seed-fields').innerHTML = `
+      <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">Primary path is usually <b>csv_ingest</b> ($0). LinkedIn jobs spends Apify.</p>
+      ${cards}
+      <div class="setup-actions" style="margin-top:4px">
+        <button type="button" class="btn" id="add-csv-seed">+ csv_ingest source</button>
+      </div>`;
+    const addBtn = document.getElementById('add-csv-seed');
+    if (addBtn) addBtn.onclick = () => {
+      const doc = state.seeds && typeof state.seeds === 'object' ? state.seeds : { sources: [] };
+      if (!Array.isArray(doc.sources)) doc.sources = [];
+      doc.sources.push({
+        id: 'csv_ingest_' + (doc.sources.length + 1),
+        type: 'csv_ingest',
+        name: 'Curated CSV ingest',
+        why_chosen: 'Operator-curated seed list',
+        enabled: true,
+        tier: 'primary',
+        config: { csv_path: 'data/campaigns/' + state.current.campaign_id + '/seeds.csv' },
+      });
+      state.seeds = doc;
+      renderSetup();
+    };
+  }
+
+  function collectIcpFromForm() {
+    const isTalent = state.plan && state.plan.campaign_type === 'talent_search';
+    const data = collectIcpFromPrefix('icp', isTalent ? 'talent_search' : 'company_outreach', state.icp || {});
+    data.campaign_id = state.current.campaign_id;
+    return data;
+  }
+
+  function collectSeedsFromForm() {
+    const doc = Object.assign({}, state.seeds || {});
+    if (!Array.isArray(doc.sources)) doc.sources = [];
+    document.querySelectorAll('.seed-card').forEach((card) => {
+      const i = parseInt(card.dataset.i, 10);
+      if (!doc.sources[i]) return;
+      const en = card.querySelector('.seed-en');
+      doc.sources[i].enabled = !!(en && en.checked);
+      const csv = card.querySelector('.seed-csv');
+      if (csv) {
+        doc.sources[i].config = Object.assign({}, doc.sources[i].config || {}, { csv_path: csv.value.trim() });
+      }
+    });
+    doc.campaign_id = state.current.campaign_id;
+    return doc;
+  }
+
+  async function refreshEstimate() {
+    if (!state.current) return;
+    const id = state.current.campaign_id;
+    state.estimate = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/estimate', {
+      method: 'POST',
+      body: JSON.stringify({ plan: state.plan }),
+    });
+  }
+
+  function lineById(id) {
+    return (state.estimate && state.estimate.line_items || []).find((x) => x.module_id === id);
+  }
+
+  function renderBoard() {
+    const c = state.current, p = state.plan, e = state.estimate;
+    if (!c || !p || !state.modulesVisible) return;
+    const isTalent = p.campaign_type === 'talent_search';
+    const locked = document.getElementById('board-type-locked');
+    if (locked) {
+      locked.textContent = String(p.campaign_type || 'company_outreach').replace(/_/g, ' ')
+        + ' · locked at ICP creation';
+    }
+    document.getElementById('save-hint').textContent = `PUT /builder/api/campaigns/${c.campaign_id}/plan · ${p.campaign_type}`;
+    document.getElementById('save-status').textContent = state.dirty ? 'Unsaved changes' : (p.updated_at_utc ? 'Saved ' + p.updated_at_utc : 'Using defaults until save');
+    document.getElementById('board-left').innerHTML = isTalent ? talentLeft() : companyLeft();
+    document.getElementById('board-right').innerHTML = estimateRight(isTalent);
+    bindBoardControls(isTalent);
+  }
+
+  function toggleHtml(on, locked) {
+    if (locked) return '<span class="lockpill">Locked</span>';
+    return `<button type="button" class="toggle${on ? ' on' : ''}" aria-pressed="${on}"><span class="knob"></span></button>`;
+  }
+
+  function companyLeft() {
+    const p = state.plan, m = p.modules;
+    const rows = META.map(([id, label, vendor, tier]) => {
+      const locked = id === 'icp_match' || id === 'dedupe';
+      const on = !!m[id];
+      let amt = '—';
+      if (locked) amt = '$0 · local';
+      else if (on) {
+        if (id === 'website_scrape') {
+          const a = lineById('website_scrape'), b = lineById('website_llm');
+          amt = money((a ? a.line_usd : 0) + (b ? b.line_usd : 0));
+        } else {
+          const x = lineById(id); amt = x ? money(x.line_usd) : '—';
+        }
+      }
+      return `<div class="mrow" data-mod="${id}" style="opacity:${(!on && !locked) ? 0.5 : 1}">
+        <div class="mrow-ctl">${toggleHtml(on, locked)}</div>
+        <div>
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <span class="mrow-label">${label}</span>
+            ${id === 'apollo_email' ? '<span class="recpill">Recommended</span>' : ''}
+            <span class="tier ${tier === 'Essential' ? 'ess' : ''}">${tier}</span>
+          </div>
+          <div class="mrow-sub"><span>${vendor}</span><span>${KNOB[id] || ''}</span></div>
+        </div>
+        <div class="amt ${on || locked ? '' : 'off'}">${amt}</div>
+      </div>`;
+    }).join('');
+    return `
+      <div class="panel-head"><h3>Module board</h3><span class="hint">9 modules</span></div>
+      <div class="vol">
+        <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end">
+          <div><div class="field-label" style="font-size:.7rem;color:var(--ink-3)">Target contactable leads</div>
+            <input class="num" id="target-leads" type="number" min="0" value="${p.target_leads || 0}"></div>
+          <div class="presets">
+            <button type="button" data-n="25">25</button><button type="button" data-n="50">50</button>
+            <button type="button" data-n="100">100</button>
+          </div>
+          <label class="crawler">Website crawler
+            <select id="crawler"><option value="apify">apify</option><option value="firecrawl">firecrawl</option></select>
+          </label>
+        </div>
+      </div>
+      <div class="mod-legend"><span><b>Essential</b> locked</span><span><b>Core</b> recommended</span><span><b>Optional</b> off by default</span></div>
+      ${rows}`;
+  }
+
+  function talentLeft() {
+    const p = state.plan;
+    const pr = p.talent_pass_rates || { after_dedupe: 0.9, after_icp: 0.4, email_success: 0.7 };
+    const phone = !!p.modules.apollo_phone;
+    const e = state.estimate || {};
+    const by = Object.fromEntries((e.line_items || []).map((x) => [x.module_id, x]));
+    const steps = [
+      ['1', 'fixed', 'Initial seed scrape', 'Apify LinkedIn people / jobs → person URLs', by.talent_seed],
+      ['2', 'fixed', 'Personal profile scrape', 'apimaestro · every seed', by.talent_profile],
+      ['3', 'locked', 'Deduplication', 'LinkedIn URL / ContactDedup', by.dedupe],
+      ['4', 'locked', 'ICP match', 'person ICP rules', by.icp_match],
+      ['5', 'fixed', 'Apollo email reveal', 'ICP survivors', by.apollo_email],
+      ['6', 'toggle', 'Apollo phone reveal', 'async webhook · email successes', by.apollo_phone],
+    ];
+    const rows = steps.map(([n, kind, label, sub, line]) => {
+      const locked = kind === 'locked';
+      const isPhone = n === '6';
+      const on = isPhone ? phone : true;
+      const amt = (!on && isPhone) ? '—' : (line ? money(line.line_usd) : (locked ? '$0 · local' : '—'));
+      const ctl = locked ? '<span class="lockpill">Locked</span>'
+        : isPhone ? toggleHtml(phone, false)
+        : `<span class="ctype" style="font-size:.56rem">Fixed</span>`;
+      return `<div class="srow" data-step="${n}" style="opacity:${(!on && isPhone) ? 0.5 : 1}">
+        <div>${ctl}</div>
+        <div><div class="mrow-label">${n}. ${label}</div><div class="mrow-sub"><span>${sub}</span></div></div>
+        <div class="amt">${amt}</div>
+      </div>`;
+    }).join('');
+    return `
+      <div class="panel-head"><h3>Talent pipeline</h3><span class="hint">6 fixed steps · phone optional</span></div>
+      <div class="inputs">
+        <div class="field"><span>Expected seed volume</span>
+          <input class="num" id="seed-count" type="number" min="0" value="${p.seed_count || 0}"></div>
+        <div class="rates">
+          <label>After dedupe %<input id="r-dedupe" type="number" min="0" max="100" value="${Math.round(pr.after_dedupe * 100)}"></label>
+          <label>After ICP %<input id="r-icp" type="number" min="0" max="100" value="${Math.round(pr.after_icp * 100)}"></label>
+          <label>Email success %<input id="r-email" type="number" min="0" max="100" value="${Math.round(pr.email_success * 100)}"></label>
+        </div>
+      </div>
+      ${rows}`;
+  }
+
+  function estimateRight(isTalent) {
+    const e = state.estimate || { line_items: [], warnings: [], usd_run_total: 0, usd_per_lead: 0, billable_leads: 0, confidence: 'est' };
+    const lines = (e.line_items || []).map((x) => `
+      <div class="line"><div><div>${x.label}</div><div class="lmeta">${x.basis}</div></div>
+      <div class="amt">${money(x.line_usd)}</div></div>`).join('');
+    const warns = (e.warnings || []).map((w) => {
+      const cls = w.includes('OFF') || w.includes('D3') ? 'danger' : (w.includes('webhook') || w.includes('profile spend') ? 'warn' : 'info');
+      return `<div class="w ${cls}">${w}</div>`;
+    }).join('');
+    let funnel = '';
+    if (isTalent && e.funnel) {
+      const f = e.funnel, max = Math.max(1, f.seeds || 1);
+      const bar = (v) => Math.max(1.5, (v / max) * 100);
+      funnel = `<div class="panel-head" style="border-top:1px solid var(--line-soft)"><h3>Funnel</h3></div><div class="talent-funnel">
+        ${[['Seeds in', f.seeds], ['After dedupe', f.after_dedupe], ['After ICP', f.after_icp], ['Email ok', f.email_successes], ['Phone', f.phone_reveals]].map(([l, v]) =>
+          `<div class="fbar"><span>${l}</span><div class="ftrack"><div class="ffill" style="width:${bar(v)}%"></div></div><span>${intfmt(v)}</span></div>`
+        ).join('')}
+      </div>`;
+    }
+    return `
+      <div class="panel-head"><h3>Cost estimate</h3><span class="hint">${e.confidence || 'est'}</span></div>
+      <div class="est-tiles">
+        <div class="est-tile"><span class="tl">Run total</span><span class="tv">${money(e.usd_run_total)}</span><span class="tf">${isTalent ? 'seed × pass rates' : intfmt(e.billable_leads) + ' leads'}</span></div>
+        <div class="est-tile"><span class="tl">Per lead</span><span class="tv">${money(e.usd_per_lead)}</span><span class="tf">${isTalent ? 'per email success' : 'typical'}</span></div>
+      </div>
+      <div class="lines">${lines}</div>
+      <div class="warns">${warns}</div>
+      ${funnel}`;
+  }
+
+  function bindBoardControls(isTalent) {
+    if (!isTalent) {
+      const crawler = document.getElementById('crawler');
+      if (crawler) {
+        crawler.value = state.plan.website_crawler || 'apify';
+        crawler.onchange = () => { state.plan.website_crawler = crawler.value; bump(); };
+      }
+      const leads = document.getElementById('target-leads');
+      if (leads) leads.onchange = () => { state.plan.target_leads = Math.max(0, parseInt(leads.value, 10) || 0); bump(); };
+      document.querySelectorAll('.presets button').forEach((b) => {
+        b.onclick = () => { state.plan.target_leads = parseInt(b.dataset.n, 10); bump(); };
+      });
+      document.querySelectorAll('.mrow[data-mod]').forEach((row) => {
+        const id = row.dataset.mod;
+        if (id === 'icp_match' || id === 'dedupe') return;
+        const btn = row.querySelector('.toggle');
+        if (!btn) return;
+        btn.onclick = () => {
+          if (id === 'apollo_email' && state.plan.modules.apollo_email) {
+            document.getElementById('email-overlay').classList.remove('hidden');
+            return;
+          }
+          state.plan.modules[id] = !state.plan.modules[id];
+          bump();
+        };
+      });
+    } else {
+      const seed = document.getElementById('seed-count');
+      if (seed) seed.onchange = () => { state.plan.seed_count = Math.max(0, parseInt(seed.value, 10) || 0); bump(); };
+      const setRate = (el, key) => {
+        if (!el) return;
+        el.onchange = () => {
+          state.plan.talent_pass_rates = state.plan.talent_pass_rates || {};
+          state.plan.talent_pass_rates[key] = Math.max(0, Math.min(100, parseInt(el.value, 10) || 0)) / 100;
+          bump();
+        };
+      };
+      setRate(document.getElementById('r-dedupe'), 'after_dedupe');
+      setRate(document.getElementById('r-icp'), 'after_icp');
+      setRate(document.getElementById('r-email'), 'email_success');
+      const phoneRow = document.querySelector('.srow[data-step="6"] .toggle');
+      if (phoneRow) phoneRow.onclick = () => {
+        state.plan.modules.apollo_phone = !state.plan.modules.apollo_phone;
+        bump();
+      };
+    }
+  }
+
+  function bump() {
+    state.dirty = true;
+    refreshEstimate().then(renderBoard).catch((err) => alert(errText(err)));
+  }
+
+  document.getElementById('create-client-mode').addEventListener('change', syncClientMode);
+  document.getElementById('create-client').addEventListener('change', () => {
+    updateFolderHint();
+    fillCreateIcpSource();
+  });
+  document.getElementById('create-icp-mode').addEventListener('change', syncIcpMode);
+  document.getElementById('create-icp-source').addEventListener('change', applyCreateIcpSourceType);
+  const createLabel = document.getElementById('create-label');
+  if (createLabel) createLabel.addEventListener('input', updateFolderHint);
+  ['create-client-name', 'create-client-new'].forEach((id) => {
+    const node = document.getElementById(id);
+    if (node) {
+      node.addEventListener('input', () => {
+        if (id === 'create-client-name') {
+          const idInput = document.getElementById('create-client-new');
+          if (idInput && !idInput.dataset.touched) {
+            idInput.value = slugPart(node.value, '');
+          }
+        }
+        if (id === 'create-client-new') {
+          node.dataset.touched = '1';
+        }
+        updateFolderHint();
+        fillCreateIcpSource();
+      });
+    }
+  });
+  document.getElementById('btn-create').addEventListener('click', () => createCampaign());
+  document.querySelectorAll('#create-type .segbtn').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('#create-type .segbtn').forEach((b) => b.classList.remove('on'));
+      btn.classList.add('on');
+      updateFolderHint();
+    });
+  });
+  document.getElementById('btn-edit-icp').addEventListener('click', () => {
+    setSetupVisible(true);
+    showEnrichPrompt(false);
+    const setup = document.getElementById('setup-panel');
+    if (setup) setup.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  document.getElementById('btn-continue-modules').addEventListener('click', () => {
+    showEnrichPrompt(false);
+    continueToModules();
+  });
+  document.getElementById('btn-copy-icp-prompt').addEventListener('click', () => {
+    copyIcpPlanningPrompt();
+  });
+  document.getElementById('btn-reload-icp').addEventListener('click', () => {
+    reloadIcpFromDisk();
+  });
+  document.getElementById('btn-save-brief').addEventListener('click', async () => {
+    const status = document.getElementById('brief-status');
+    const id = state.current && state.current.campaign_id;
+    if (!id) return;
+    const brief = (document.getElementById('setup-brief-edit').value || '').trim();
+    try {
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/meta', {
+        method: 'PUT',
+        body: JSON.stringify({
+          display_name: state.current.display_name || id,
+          brief,
+        }),
+      });
+      state.current.brief = (res.campaign && res.campaign.brief) || brief;
+      if (status) status.textContent = 'Brief saved';
+    } catch (err) {
+      if (status) status.textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('email-keep').addEventListener('click', () => document.getElementById('email-overlay').classList.add('hidden'));
+  document.getElementById('email-off').addEventListener('click', () => {
+    document.getElementById('email-overlay').classList.add('hidden');
+    state.plan.modules.apollo_email = false;
+    bump();
+  });
+  document.getElementById('save-icp').addEventListener('click', async () => {
+    try {
+      const id = state.current.campaign_id;
+      const data = collectIcpFromForm();
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/icp', {
+        method: 'PUT',
+        body: JSON.stringify({ data }),
+      });
+      state.icp = res.data;
+      state.current.icp = {
+        job_titles: data.job_titles,
+        contact_locations: data.contact_locations,
+        industries: data.industries,
+        location: data.geo && data.geo.primary_location,
+        company_size_min: data.company_size_min,
+        company_size_max: data.company_size_max,
+        website_analysis_mode: data.website_analysis_mode,
+      };
+      document.getElementById('icp-status').textContent = 'Saved under client folder';
+      showEnrichPrompt(true);
+      const prompt = document.getElementById('enrich-prompt');
+      if (prompt) prompt.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      renderIcpDetailPanel();
+      if (state.modulesVisible) renderBoard();
+    } catch (err) {
+      document.getElementById('icp-status').textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('save-seeds').addEventListener('click', async () => {
+    try {
+      const id = state.current.campaign_id;
+      const data = collectSeedsFromForm();
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/seed_sources', {
+        method: 'PUT',
+        body: JSON.stringify({ data }),
+      });
+      state.seeds = res.data;
+      document.getElementById('seed-status').textContent = 'Saved';
+      renderSetup();
+    } catch (err) {
+      document.getElementById('seed-status').textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('save-btn').addEventListener('click', async () => {
+    try {
+      const id = state.current.campaign_id;
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/plan', {
+        method: 'PUT',
+        body: JSON.stringify({ plan: state.plan }),
+      });
+      state.plan = res.plan;
+      state.dirty = false;
+      state.current.has_saved_plan = true;
+      state.current.plan = res.plan;
+      await refreshEstimate();
+      renderBoard();
+    } catch (err) {
+      alert(errText(err));
+    }
+  });
+
+  loadList().catch((err) => {
+    const create = document.getElementById('view-create');
+    const msg = errText(err);
+    if (create) {
+      create.classList.remove('hidden');
+      create.insertAdjacentHTML('afterbegin',
+        `<div class="err" style="padding:20px">${msg}</div>`);
+    } else {
+      alert(msg);
+    }
+  });
+  </script>
+</body>
+</html>

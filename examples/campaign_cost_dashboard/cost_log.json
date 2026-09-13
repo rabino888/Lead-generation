@@ -1,0 +1,177 @@
+{
+  "schema_version": "3",
+  "campaign_id": "example_campaign",
+  "logged_at": "2026-08-28T12:00:00+00:00",
+  "unit_rates_usd": {
+    "apollo_per_credit": 0.02,
+    "firecrawl_per_page": 0.01,
+    "llm_per_1k_tokens": 0.003
+  },
+  "campaign_context": {
+    "campaign_id": "example_campaign",
+    "summary": {
+      "client_name": "Example Client",
+      "core_offer": "One-sentence value proposition for the outreach pitch.",
+      "primary_geo": "United States",
+      "industries": [
+        "computer software",
+        "information technology"
+      ],
+      "excluded_industries": [
+        "staffing and recruiting"
+      ],
+      "company_size_band": "5\u2013200 employees",
+      "job_titles": [
+        "CEO",
+        "Founder",
+        "CTO",
+        "VP Engineering"
+      ],
+      "contact_locations": [
+        "United States"
+      ],
+      "include_keywords": [
+        "SaaS",
+        "B2B"
+      ],
+      "exclude_keywords": [
+        "staffing agency"
+      ],
+      "website_analysis_mode": "full",
+      "services": [
+        "Primary service line",
+        "Secondary capability"
+      ],
+      "target_pain_points": [
+        "Operational pain the offer solves"
+      ]
+    },
+    "paths": {
+      "run_payload_json": "data/campaigns/example_campaign/run_payload.json"
+    }
+  },
+  "by_workflow_step": {
+    "seeding": {
+      "usd_billed": 0.15,
+      "usd_estimated": 0.0,
+      "usd_total": 0.15,
+      "runs": 2
+    },
+    "apollo_contact": {
+      "usd_billed": 1.2,
+      "usd_estimated": 2.0,
+      "usd_total": 3.2,
+      "runs": 2
+    },
+    "enrichment": {
+      "usd_billed": 4.5,
+      "usd_estimated": 1.0,
+      "usd_total": 5.5,
+      "runs": 1
+    }
+  },
+  "by_cost_center": {
+    "seeding": {
+      "usd_billed": 0.15,
+      "usd_estimated": 0.0,
+      "usd_total": 0.15,
+      "runs": 2
+    },
+    "apollo_contact": {
+      "usd_billed": 1.2,
+      "usd_estimated": 2.0,
+      "usd_total": 3.2,
+      "runs": 2
+    },
+    "enrichment": {
+      "usd_billed": 4.5,
+      "usd_estimated": 1.0,
+      "usd_total": 5.5,
+      "runs": 1
+    }
+  },
+  "by_source": {
+    "apify": {
+      "usd_billed": 3.0,
+      "usd_estimated": 0.0,
+      "usd_total": 3.0
+    },
+    "apollo": {
+      "usd_billed": 1.2,
+      "usd_estimated": 2.0,
+      "usd_total": 3.2
+    },
+    "firecrawl": {
+      "usd_billed": 0.0,
+      "usd_estimated": 0.8,
+      "usd_total": 0.8
+    },
+    "llm": {
+      "usd_billed": 0.0,
+      "usd_estimated": 0.65,
+      "usd_total": 0.65
+    }
+  },
+  "by_run": [
+    {
+      "run_key": "seed_batch_1",
+      "label": "LinkedIn jobs scrape (batch 1)",
+      "workflow_step": "seeding",
+      "total_usd": 0.1,
+      "outcome": {
+        "raw_seeds": 50
+      },
+      "sources": {
+        "apify_linkedin_jobs_seed": {
+          "usd": 0.1
+        }
+      }
+    },
+    {
+      "run_key": "apollo_batch_1",
+      "label": "Apollo contact (batch 1)",
+      "workflow_step": "apollo_contact",
+      "total_usd": 1.6,
+      "outcome": {
+        "contactable": 25,
+        "rejected": 8
+      },
+      "sources": {
+        "apollo_org_enrich": {
+          "usd_est": 0.9
+        },
+        "apollo_email_reveal": {
+          "usd_est": 0.7
+        }
+      }
+    },
+    {
+      "run_key": "enrich_batch_1",
+      "label": "Firecrawl + Apify enrich (25 leads)",
+      "workflow_step": "enrichment",
+      "total_usd": 5.5,
+      "outcome": {
+        "leads": 25
+      },
+      "sources": {
+        "apify_linkedin_company_person": {
+          "usd": 2.9
+        },
+        "firecrawl": {
+          "usd": 0.8
+        },
+        "llm": {
+          "usd": 0.65
+        }
+      }
+    }
+  ],
+  "totals": {
+    "usd_billed": 5.65,
+    "usd_estimated": 3.0,
+    "usd_total_est": 8.65,
+    "per_contactable_est_usd": 0.346,
+    "contactable_leads": 25
+  },
+  "note": "Template data \u2014 replace by running open_campaign_cost_dashboard.py --campaign {id}"
+}

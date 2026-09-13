@@ -1,0 +1,1635 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Lead List Ledger</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="appnav" aria-label="App navigation">
+    <a href="/dashboard" class="brand brand-title">Lead List Ledger</a>
+    <div class="nav-btns">
+      <a href="/dashboard" class="here">Overview</a>
+    </div>
+  </div>
+  <nav class="crumbs" id="crumbs" aria-label="Breadcrumb"></nav>
+  <header class="masthead">
+    <p class="eyebrow" id="eyebrow"></p>
+    <div class="h1row">
+      <h1 id="page-title"></h1>
+      <div class="header-actions" id="header-actions"></div>
+    </div>
+    <p class="sub" id="page-sub"></p>
+    <p class="brand-mark" id="brand-mark" hidden>LEAD GENERATION</p>
+  </header>
+  <main id="view"></main>
+  <footer>
+    <p>Built from <code>data/clients/*/campaigns/</code> cost logs (legacy
+    <code>data/campaigns/</code> junctions), stage CSVs, and ICP library
+    <code>data/clients/*/icps/</code>. Rebuild with
+    <code>python scripts/build_cost_dashboard.py</code>.
+    Plan enrichment from a client or campaign via <b>Build new campaign</b>.</p>
+    <p id="stamp"></p>
+  </footer>
+</div>
+
+<script id="ledger-data" type="application/json">__DATA__</script>
+<script>
+(function () {
+  const VENDORS = ['apify', 'apollo', 'firecrawl', 'llm'];
+  const VENDOR_LABEL = { apify: 'Apify', apollo: 'Apollo', firecrawl: 'Firecrawl', llm: 'LLM (est)' };
+  const BASIS_LABEL = {
+    apify_api: 'Apify API usage',
+    apollo_credits: 'Apollo credits consumed',
+    apollo_credit_estimate: 'Apollo credits, modelled',
+    firecrawl_plan_credits: 'Firecrawl plan credits',
+    firecrawl_flat_rate_est: 'Firecrawl pages x rate',
+    llm_flat_rate_est: 'Tokens x rate',
+    legacy_cost_log: 'Pre-v4 cost log'
+  };
+  const STAGES = [
+    ['seeds', 'Raw seeds'],
+    ['icp_matched', 'ICP matched'],
+    ['deduped', 'Deduped'],
+    ['contactable', 'Apollo contactable'],
+    ['enriched', 'Enriched'],
+    ['scored', 'Scored']
+  ];
+  const TYPE_LABEL = { company_outreach: 'company outreach', talent_search: 'talent search' };
+  const LEAD_COLS = [
+    'company_name',
+    'decision_maker_name',
+    'decision_maker_title',
+    'decision_maker_email',
+    'decision_maker_linkedin',
+    'lead_score',
+    'run_id'
+  ];
+
+  const usd = (n) => '$' + (Number(n) || 0).toFixed(2);
+  const usd4 = (n) => '$' + (Number(n) || 0).toFixed(4);
+  const int = (n) => (Number(n) || 0).toLocaleString('en-US');
+  const pct = (a, b) => (b ? (a / b * 100).toFixed(0) + '%' : '--');
+
+  function el(tag, cls, text) {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text !== undefined && text !== null) node.textContent = text;
+    return node;
+  }
+  function clear(node) { while (node.firstChild) node.removeChild(node.firstChild); }
+
+  let DATA = { campaigns: [], runs: [], by_client: {}, totals: {}, scope: { kind: 'all', id: null } };
+
+  function campaignById(id) { return (DATA.campaigns || []).find((c) => c.campaign_id === id); }
+  function clientById(id) { return (DATA.by_client || {})[id]; }
+  function campaignsOfClient(id) { return (DATA.campaigns || []).filter((c) => c.client_id === id); }
+
+  /** Executed lists only — cost runs and/or stage lead CSVs on disk (not ICP stubs). */
+  function isGeneratedList(c) {
+    if (!c) return false;
+    if (c.cost_basis && c.cost_basis !== 'none') return true;
+    if (Number(c.usd_total) > 0) return true;
+    if (Number(c.delivered_leads) > 0) return true;
+    const counts = c.lead_counts || {};
+    return ['seeds', 'icp_matched', 'deduped', 'contactable', 'enriched', 'scored']
+      .some((k) => Number(counts[k]) > 0);
+  }
+
+  function generatedLists(campaigns) {
+    return (campaigns || []).filter(isGeneratedList);
+  }
+  function runsOf(pred) { return (DATA.runs || []).filter(pred); }
+
+  function campaignTypeOf(c) {
+    return (c && (c.campaign_type || (c.plan && c.plan.campaign_type))) || 'company_outreach';
+  }
+
+  function runCampaignType(r) {
+    if (r && r.campaign_type) return r.campaign_type;
+    const c = campaignById(r && r.campaign_id);
+    return campaignTypeOf(c);
+  }
+
+  function runKeyOf(r) {
+    return (r && (r.run_key || r.pipeline_run_id || r.label)) || '';
+  }
+
+  function findRun(campaignId, runKey) {
+    const key = String(runKey || '');
+    return (DATA.runs || []).find((r) =>
+      r.campaign_id === campaignId && runKeyOf(r) === key
+    );
+  }
+
+  /* ---------------- shared builders ---------------- */
+
+  function tiles(items) {
+    const box = el('section', 'tiles');
+    items.forEach((t) => {
+      const tile = el('div', 'tile');
+      tile.append(el('span', 'label', t.label));
+      tile.append(el('span', 'value' + (t.lead ? ' lead' : ''), t.value));
+      tile.append(el('span', 'foot', t.foot || ''));
+      box.append(tile);
+    });
+    return box;
+  }
+
+  function section(title, note, body) {
+    const sec = el('section', 'section');
+    const head = el('div', 'section-head');
+    head.append(el('h2', null, title));
+    if (note) head.append(el('p', 'note', note));
+    sec.append(head);
+    if (body) sec.append(body);
+    return sec;
+  }
+
+  function vendorAmounts(sources) {
+    const totals = {};
+    Object.entries(sources || {}).forEach(([key, d]) => {
+      const vendor = (d && d.source) || key;
+      totals[vendor] = (totals[vendor] || 0) + (Number(d && d.usd) || 0);
+    });
+    return VENDORS.map((v) => totals[v] || 0);
+  }
+
+  function splitBar(sources, tall, emptyText) {
+    const split = el('div', 'split');
+    const amounts = vendorAmounts(sources);
+    const total = amounts.reduce((a, b) => a + b, 0);
+    if (total <= 0) {
+      split.append(el('div', 'legend', emptyText || 'No spend recorded for this list.'));
+      return split;
+    }
+    const bar = el('div', 'split-bar' + (tall ? ' tall' : ''));
+    VENDORS.forEach((v, i) => {
+      if (!amounts[i]) return;
+      const seg = el('span', 'seg-' + v);
+      seg.style.width = (amounts[i] / total * 100) + '%';
+      seg.title = VENDOR_LABEL[v] + ' ' + usd4(amounts[i]);
+      bar.append(seg);
+    });
+    split.append(bar);
+    const legend = el('div', 'legend');
+    VENDORS.forEach((v, i) => {
+      if (!amounts[i]) return;
+      const item = el('span');
+      const dot = el('span', 'dot');
+      dot.style.background = 'var(--' + v + ')';
+      item.append(dot, document.createTextNode(VENDOR_LABEL[v] + ' '));
+      item.append(el('b', null, usd4(amounts[i])));
+      legend.append(item);
+    });
+    split.append(legend);
+    return split;
+  }
+
+  function basisChipFor(c) {
+    if (c.cost_basis === 'cost_runs') return ['chip tracked', 'tracked'];
+    if (c.cost_basis === 'legacy_cost_log') return ['chip legacy', 'legacy log'];
+    if (c.cost_basis === 'error') return ['chip error', 'build failed'];
+    return ['chip', 'no cost data'];
+  }
+
+  function listRow(c, linked) {
+    const counts = c.lead_counts || {};
+    const tag = linked ? 'a' : 'div';
+    const row = el(tag, 'list-row' + (c.cost_basis === 'none' ? ' untracked' : ''));
+    if (linked) row.href = '#/campaign/' + encodeURIComponent(c.campaign_id);
+
+    const id = el('div', 'id-cell');
+    id.append(el('span', 'name', c.campaign_id));
+    const meta = el('div', 'meta');
+    meta.append(el('span', null, c.client_name || c.client_id || 'unknown client'));
+    const ctype = campaignTypeOf(c);
+    meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'), ctype.replace(/_/g, ' ')));
+    const chip = basisChipFor(c);
+    meta.append(el('span', chip[0], chip[1]));
+    if (c.error) meta.append(el('span', null, c.error));
+    id.append(meta);
+    row.append(id);
+
+    const funnel = el('div', 'funnel');
+    const bars = el('div', 'funnel-bars');
+    const steps = [counts.seeds || 0, counts.icp_matched || 0, c.delivered_leads || 0];
+    const peak = Math.max.apply(null, steps.concat([1]));
+    steps.forEach((v, i) => {
+      const bar = el('div', 'funnel-bar' + (i ? ' s' + (i + 1) : ''));
+      bar.style.width = Math.max(2, Math.round((v / peak) * 100)) + '%';
+      bar.title = ['seeds', 'ICP matched', 'contactable'][i] + ': ' + int(v);
+      bars.append(bar);
+    });
+    funnel.append(bars);
+    funnel.append(el('span', 'caption', steps.map(int).join('  →  ')));
+    row.append(funnel);
+    row.append(splitBar(c.by_source));
+
+    const money = el('div', 'money');
+    if (c.usd_total) {
+      money.append(el('span', 'total', usd(c.usd_total)));
+      money.append(el('span', 'per', c.per_lead_usd ? usd4(c.per_lead_usd) + ' / lead' : 'no leads'));
+    } else {
+      money.append(el('span', 'none', c.cost_basis === 'error' ? 'unknown' : 'untracked'));
+      money.append(el('span', 'per', int(c.delivered_leads) + ' leads'));
+    }
+    row.append(money);
+    return row;
+  }
+
+  function listPanel(campaigns, linked) {
+    const panel = el('div', 'panel');
+    if (!campaigns.length) {
+      panel.append(el('div', 'empty', 'No executed lists yet. Run a campaign to see it here.'));
+      return panel;
+    }
+    campaigns.forEach((c) => panel.append(listRow(c, linked)));
+    return panel;
+  }
+
+  function vendorTable(campaigns) {
+    const totals = {};
+    const bases = {};
+    campaigns.forEach((c) => {
+      Object.entries(c.by_source || {}).forEach(([name, d]) => {
+        totals[name] = (totals[name] || 0) + (Number(d.usd) || 0);
+        if (d.basis) (bases[name] = bases[name] || new Set()).add(d.basis);
+      });
+    });
+    const grand = Object.values(totals).reduce((a, b) => a + b, 0);
+
+    const panel = el('div', 'panel table-scroll');
+    if (!grand) {
+      panel.append(el('div', 'empty', 'No vendor spend recorded in this scope.'));
+      return panel;
+    }
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['Vendor', 'USD', 'Share', 'Basis'].forEach((h, i) => {
+      hr.append(el('th', i === 1 || i === 2 ? 'r' : null, h));
+    });
+    thead.append(hr);
+    table.append(thead);
+
+    const tbody = document.createElement('tbody');
+    Object.entries(totals).sort((a, b) => b[1] - a[1]).forEach(([name, amount]) => {
+      const tr = document.createElement('tr');
+      const label = document.createElement('td');
+      const dot = el('span', 'dot');
+      dot.style.background = 'var(--' + name + ', var(--ink-3))';
+      label.append(dot, document.createTextNode(VENDOR_LABEL[name] || name));
+      tr.append(label);
+      tr.append(el('td', 'r', usd4(amount)));
+      tr.append(el('td', 'r', grand ? (amount / grand * 100).toFixed(1) + '%' : '--'));
+      tr.append(el('td', null,
+        Array.from(bases[name] || []).map((b) => BASIS_LABEL[b] || b).join(' · ') || '--'));
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    panel.append(table);
+    return panel;
+  }
+
+  function clientTable() {
+    const panel = el('div', 'panel table-scroll');
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['Client', 'Campaigns', 'USD', 'Leads', 'USD / lead'].forEach((h, i) => {
+      hr.append(el('th', i > 0 ? 'r' : null, h));
+    });
+    thead.append(hr);
+    table.append(thead);
+    const tbody = document.createElement('tbody');
+    const clients = Object.values(DATA.by_client || {});
+    if (!clients.length) {
+      panel.append(el('div', 'empty', 'No clients in the cost index yet.'));
+      return panel;
+    }
+    clients
+      .sort((a, b) => (b.usd_total || 0) - (a.usd_total || 0))
+      .forEach((b) => {
+        const tr = el('tr', 'clickable');
+        tr.tabIndex = 0;
+        const go = () => {
+          const next = { kind: 'client', id: b.client_id };
+          if (routeResolves(next)) navigate(next, false);
+        };
+        tr.addEventListener('click', (e) => { if (!(e.target.closest && e.target.closest('a'))) go(); });
+        tr.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+        const name = document.createElement('td');
+        const link = el('a', null, b.client_name || b.client_id);
+        link.href = '#/client/' + encodeURIComponent(b.client_id);
+        name.append(link);
+        tr.append(name);
+        tr.append(el('td', 'r', int((b.campaign_ids || []).length)));
+        tr.append(el('td', 'r', usd4(b.usd_total)));
+        tr.append(el('td', 'r', int(b.contactable_leads)));
+        tr.append(el('td', 'r', b.per_lead_usd ? usd4(b.per_lead_usd) : '--'));
+        tbody.append(tr);
+      });
+    table.append(tbody);
+    panel.append(table);
+    return panel;
+  }
+
+  function ledger(runs, opts) {
+    opts = opts || {};
+    const holder = el('div');
+    const controls = el('div', 'filters');
+    const made = {};
+
+    function makeSelect(key, label, values, getValue) {
+      const vals = values || Array.from(new Set(runs.map((r) => (getValue ? getValue(r) : r[key])).filter(Boolean))).sort();
+      if (vals.length < 1 && key !== 'campaign_type') return null;
+      if (vals.length < 2 && key !== 'campaign_type') return null;
+      const wrap = el('label', null, label);
+      const sel = document.createElement('select');
+      sel.append(new Option('All', ''));
+      vals.forEach((v) => sel.append(new Option(TYPE_LABEL[v] || String(v).replace(/_/g, ' '), v)));
+      wrap.append(sel);
+      controls.append(wrap);
+      made[key] = { sel: sel, getValue: getValue || ((r) => r[key]) };
+      return sel;
+    }
+    function makeDate(id, label) {
+      const wrap = el('label', null, label);
+      const input = document.createElement('input');
+      input.type = 'date';
+      wrap.append(input);
+      controls.append(wrap);
+      made[id] = { sel: input, getValue: null };
+      return input;
+    }
+
+    if (opts.filters !== false) {
+      makeSelect('client_id', 'Client');
+      makeSelect('campaign_id', 'Campaign');
+      makeSelect('campaign_type', 'Type', ['company_outreach', 'talent_search'], runCampaignType);
+      if (runs.length > 1) { makeDate('from', 'From'); makeDate('to', 'To'); }
+      if (controls.children.length) holder.append(controls);
+    }
+
+    const panel = el('div', 'panel table-scroll');
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['Date', 'List', 'Type', 'Run', 'Step', 'USD', 'Vendors'].forEach((h) => {
+      hr.append(el('th', h === 'USD' ? 'r' : null, h));
+    });
+    thead.append(hr);
+    table.append(thead);
+
+    const tbody = document.createElement('tbody');
+    runs.forEach((r) => {
+      const tr = document.createElement('tr');
+      tr.append(el('td', 'mono', r.run_date || '--'));
+
+      const listCell = document.createElement('td');
+      if (opts.linkList !== false) {
+        const link = el('a', 'mono', r.campaign_id || '');
+        link.href = '#/campaign/' + encodeURIComponent(r.campaign_id || '');
+        listCell.append(link);
+      } else {
+        listCell.className = 'mono';
+        listCell.textContent = r.campaign_id || '';
+      }
+      tr.append(listCell);
+
+      const ctype = runCampaignType(r);
+      tr.append(el('td', null, TYPE_LABEL[ctype] || ctype.replace(/_/g, ' ')));
+      tr.append(el('td', null, r.label || r.run_key || ''));
+      tr.append(el('td', null, (r.workflow_step || '').replace(/_/g, ' ')));
+      tr.append(el('td', 'r', usd4(r.total_usd)));
+
+      const vendors = document.createElement('td');
+      const seen = {};
+      Object.values(r.sources || {}).forEach((d) => {
+        const key = d.source || 'other';
+        seen[key] = (seen[key] || 0) + (Number(d.usd) || 0);
+      });
+      let lines = Object.entries(seen).sort((a, b) => b[1] - a[1]);
+      if (lines.some(([, amount]) => amount > 0)) lines = lines.filter(([, amount]) => amount > 0);
+      lines.forEach(([name, amount], i) => {
+        if (i) vendors.append(document.createTextNode('  '));
+        const dot = el('span', 'dot');
+        dot.style.background = 'var(--' + name + ', var(--ink-3))';
+        vendors.append(dot, document.createTextNode((VENDOR_LABEL[name] || name) + ' ' + usd4(amount)));
+      });
+      tr.append(vendors);
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    panel.append(table);
+
+    const emptyNode = el('div', 'empty', 'No pipeline stages match these filters.');
+    emptyNode.hidden = runs.length > 0;
+    panel.append(emptyNode);
+    holder.append(panel);
+
+    const count = el('p', 'note');
+    function apply() {
+      let shown = 0;
+      let sum = 0;
+      Array.from(tbody.children).forEach((row, i) => {
+        const r = runs[i];
+        let ok = true;
+        Object.entries(made).forEach(([key, ctrl]) => {
+          const val = ctrl.sel.value;
+          if (!val) return;
+          if (key === 'from') { if ((r.run_date || '') < val) ok = false; }
+          else if (key === 'to') { if ((r.run_date || '') > val) ok = false; }
+          else if (ctrl.getValue) { if (ctrl.getValue(r) !== val) ok = false; }
+          else if (r[key] !== val) ok = false;
+        });
+        row.hidden = !ok;
+        if (ok) { shown += 1; sum += Number(r.total_usd) || 0; }
+      });
+      emptyNode.hidden = shown > 0;
+      count.textContent = shown + ' of ' + runs.length + ' pipeline stages · ' + usd4(sum);
+    }
+    Object.values(made).forEach((ctrl) => ctrl.sel.addEventListener('change', apply));
+    apply();
+    return { node: holder, count: count };
+  }
+
+  function campaignListDate(c) {
+    if (c.logged_at) return String(c.logged_at).slice(0, 10);
+    const dates = runsOf((r) => r.campaign_id === c.campaign_id)
+      .map((r) => r.run_date)
+      .filter(Boolean)
+      .sort();
+    return dates.length ? dates[dates.length - 1] : '--';
+  }
+
+  /** One row per delivered list (campaign) — not per stage micro-run. */
+  function listLedger(campaigns, opts) {
+    opts = opts || {};
+    const rows = (campaigns || []).slice().sort((a, b) => {
+      const da = campaignListDate(a);
+      const db = campaignListDate(b);
+      if (da !== db) return db.localeCompare(da);
+      return (b.usd_total || 0) - (a.usd_total || 0);
+    });
+    const holder = el('div');
+    const controls = el('div', 'filters');
+    const made = {};
+
+    function makeSelect(key, label, values, getValue) {
+      const vals = values || Array.from(new Set(rows.map((r) => (getValue ? getValue(r) : r[key])).filter(Boolean))).sort();
+      if (vals.length < 2 && key !== 'campaign_type') return null;
+      const wrap = el('label', null, label);
+      const sel = document.createElement('select');
+      sel.append(new Option('All', ''));
+      vals.forEach((v) => sel.append(new Option(TYPE_LABEL[v] || String(v).replace(/_/g, ' '), v)));
+      wrap.append(sel);
+      controls.append(wrap);
+      made[key] = { sel: sel, getValue: getValue || ((r) => r[key]) };
+      return sel;
+    }
+    function makeDate(id, label) {
+      const wrap = el('label', null, label);
+      const input = document.createElement('input');
+      input.type = 'date';
+      wrap.append(input);
+      controls.append(wrap);
+      made[id] = { sel: input };
+      return input;
+    }
+
+    if (opts.filters !== false) {
+      makeSelect('client_id', 'Client');
+      makeSelect('campaign_type', 'Type', ['company_outreach', 'talent_search'], campaignTypeOf);
+      if (rows.length > 1) { makeDate('from', 'From'); makeDate('to', 'To'); }
+      if (controls.children.length) holder.append(controls);
+    }
+
+    const panel = el('div', 'panel table-scroll');
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    ['Date', 'Client', 'Campaign / ICP', 'Type', 'Leads', 'USD', 'USD / lead', 'Vendors'].forEach((h) => {
+      hr.append(el('th', (h === 'USD' || h === 'Leads' || h === 'USD / lead') ? 'r' : null, h));
+    });
+    thead.append(hr);
+    table.append(thead);
+
+    const tbody = document.createElement('tbody');
+    rows.forEach((c) => {
+      const tr = document.createElement('tr');
+      tr.dataset.date = campaignListDate(c);
+      tr.append(el('td', 'mono', tr.dataset.date));
+
+      const co = document.createElement('td');
+      if (c.client_id) {
+        const link = el('a', null, c.client_name || c.client_id);
+        link.href = '#/client/' + encodeURIComponent(c.client_id);
+        co.append(link);
+      } else {
+        co.textContent = '—';
+      }
+      tr.append(co);
+
+      const listCell = document.createElement('td');
+      const label = c.display_name || c.campaign_id || '';
+      const listLink = el('a', null, label);
+      listLink.href = '#/campaign/' + encodeURIComponent(c.campaign_id || '');
+      listLink.title = c.campaign_id || '';
+      listCell.append(listLink);
+      if (c.display_name && c.campaign_id && c.display_name !== c.campaign_id) {
+        listCell.append(document.createElement('br'));
+        listCell.append(el('span', 'mono', c.campaign_id));
+      }
+      const icp = c.icp || {};
+      const titles = (icp.job_titles || []).slice(0, 2).join(' · ');
+      if (titles) {
+        listCell.append(document.createElement('br'));
+        listCell.append(el('span', 'note', titles));
+      }
+      tr.append(listCell);
+
+      const ctype = campaignTypeOf(c);
+      tr.append(el('td', null, TYPE_LABEL[ctype] || ctype.replace(/_/g, ' ')));
+      tr.append(el('td', 'r', int(c.delivered_leads)));
+      tr.append(el('td', 'r', usd4(c.usd_total)));
+      tr.append(el('td', 'r', c.per_lead_usd ? usd4(c.per_lead_usd) : '--'));
+
+      const vendors = document.createElement('td');
+      const src = c.by_source || {};
+      let lines = Object.entries(src)
+        .map(([name, d]) => [name, Number((d && d.usd) || 0)])
+        .sort((a, b) => b[1] - a[1]);
+      if (lines.some(([, amount]) => amount > 0)) lines = lines.filter(([, amount]) => amount > 0);
+      if (!lines.length) {
+        vendors.append(el('span', 'note', c.cost_basis === 'none' ? 'no cost data' : '—'));
+      } else {
+        lines.forEach(([name, amount], i) => {
+          if (i) vendors.append(document.createTextNode('  '));
+          const dot = el('span', 'dot');
+          dot.style.background = 'var(--' + name + ', var(--ink-3))';
+          vendors.append(dot, document.createTextNode((VENDOR_LABEL[name] || name) + ' ' + usd4(amount)));
+        });
+      }
+      tr.append(vendors);
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    panel.append(table);
+
+    const emptyNode = el('div', 'empty', 'No campaigns match these filters.');
+    emptyNode.hidden = rows.length > 0;
+    panel.append(emptyNode);
+    holder.append(panel);
+
+    const count = el('p', 'note');
+    function apply() {
+      let shown = 0;
+      let sum = 0;
+      Array.from(tbody.children).forEach((row, i) => {
+        const c = rows[i];
+        let ok = true;
+        Object.entries(made).forEach(([key, ctrl]) => {
+          const val = ctrl.sel.value;
+          if (!val) return;
+          if (key === 'from') { if ((row.dataset.date || '') < val) ok = false; }
+          else if (key === 'to') { if ((row.dataset.date || '') > val) ok = false; }
+          else if (ctrl.getValue) { if (ctrl.getValue(c) !== val) ok = false; }
+          else if (c[key] !== val) ok = false;
+        });
+        row.hidden = !ok;
+        if (ok) { shown += 1; sum += Number(c.usd_total) || 0; }
+      });
+      emptyNode.hidden = shown > 0;
+      count.textContent = shown + ' of ' + rows.length + ' campaigns · ' + usd4(sum);
+    }
+    Object.values(made).forEach((ctrl) => ctrl.sel.addEventListener('change', apply));
+    apply();
+    return { node: holder, count: count };
+  }
+
+  function savedIcpsPanel(campaigns) {
+    const panel = el('div', 'panel');
+    if (!campaigns.length) {
+      panel.append(el('div', 'empty', 'No saved campaigns for this client yet.'));
+      return panel;
+    }
+    campaigns.forEach((c) => {
+      const card = el('a', 'icp-card');
+      card.href = '#/campaign/' + encodeURIComponent(c.campaign_id);
+      const head = el('div');
+      head.append(el('span', 'cid', c.campaign_id));
+      const ctype = campaignTypeOf(c);
+      head.append(document.createTextNode(' '));
+      head.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'), ctype.replace(/_/g, ' ')));
+      card.append(head);
+      const icp = c.icp || {};
+      const titles = (icp.job_titles || []).slice(0, 4).join(' · ') || '—';
+      const geo = (icp.contact_locations || []).join(', ') || icp.primary_location || icp.location || '—';
+      const size = (icp.company_size_min || icp.company_size_max)
+        ? ((icp.company_size_min || '?') + ' – ' + (icp.company_size_max || '?'))
+        : '—';
+      const bits = el('div', 'bits');
+      [['Titles', titles], ['Geo', geo], ['Size', size]].forEach(([lab, val]) => {
+        const span = el('span', null, lab + ': ');
+        bits.append(span);
+        bits.append(document.createTextNode(val + '  '));
+      });
+      card.append(bits);
+      panel.append(card);
+    });
+    return panel;
+  }
+
+  function appendFact(facts, label, value) {
+    if (value === undefined || value === null || value === '' ||
+        (Array.isArray(value) && !value.length)) return;
+    facts.append(el('dt', null, label));
+    if (Array.isArray(value)) {
+      const dd = el('dd');
+      const tags = el('div', 'tags');
+      value.forEach((v) => tags.append(el('span', 'tag', String(v))));
+      dd.append(tags);
+      facts.append(dd);
+    } else if (typeof value === 'object') {
+      const dd = el('dd');
+      const bits = Object.entries(value)
+        .filter(([, v]) => v !== undefined && v !== null && v !== '')
+        .map(([k, v]) => k.replace(/_/g, ' ') + ': ' + (Array.isArray(v) ? v.join(', ') : String(v)));
+      dd.textContent = bits.join(' · ') || '—';
+      facts.append(dd);
+    } else {
+      facts.append(el('dd', null, String(value)));
+    }
+  }
+
+  const MODULE_LABELS = [
+    ['icp_match', 'ICP match'],
+    ['dedupe', 'Deduplication'],
+    ['apollo_email', 'Email reveal'],
+    ['apify_dm_profile', 'LinkedIn DM profile'],
+    ['apify_dm_posts', 'LinkedIn DM posts'],
+    ['website_scrape', 'Website scrape'],
+    ['apify_company_profile', 'Company profile'],
+    ['apify_company_jobs', 'Company open jobs'],
+    ['apollo_phone', 'Phone reveal'],
+  ];
+
+  function enrichmentModulesNode(plan, fallbackType) {
+    const wrap = el('div', 'mod-chips');
+    const m = (plan && plan.modules) || {};
+    const ctype = (plan && plan.campaign_type) || fallbackType || 'company_outreach';
+    let chips = [];
+    if (ctype === 'talent_search') {
+      chips = [
+        ['Seed scrape', true],
+        ['DM profile', true],
+        ['Dedupe', true],
+        ['ICP match', true],
+        ['Email', !!m.apollo_email],
+        ['Phone', !!m.apollo_phone],
+      ].filter((x) => x[1]);
+    } else {
+      chips = MODULE_LABELS
+        .filter(([id]) => !!m[id])
+        .map(([, label]) => [label, true]);
+    }
+    if (!chips.length) {
+      wrap.append(el('span', 'mod-chip off', 'no enrichment plan saved'));
+      return wrap;
+    }
+    chips.forEach(([label]) => wrap.append(el('span', 'mod-chip', label)));
+    return wrap;
+  }
+
+  function associatedCampaignsList(campaigns) {
+    const box = el('div', 'assoc-campaigns');
+    box.append(el('h4', null, 'Associated campaigns'));
+    if (!campaigns.length) {
+      box.append(el('div', 'empty', 'No campaigns linked to this ICP.'));
+      return box;
+    }
+    const list = el('ul', 'assoc-list');
+    campaigns.forEach((c) => {
+      const li = document.createElement('li');
+      const row = el('a', 'assoc-link');
+      row.href = '#/campaign/' + encodeURIComponent(c.campaign_id);
+      row.append(el('span', 'assoc-id', c.campaign_id));
+      const ctype = campaignTypeOf(c);
+      row.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
+        TYPE_LABEL[ctype] || ctype.replace(/_/g, ' ')));
+      row.append(el('span', 'assoc-meta',
+        int(c.delivered_leads) + ' leads · ' + usd4(c.usd_total)));
+      li.append(row);
+      list.append(li);
+    });
+    box.append(list);
+    return box;
+  }
+
+  function targetingFacts(c, opts) {
+    opts = opts || {};
+    const icp = (opts.icp != null ? opts.icp : (c && c.icp)) || {};
+    const facts = el('dl', 'facts');
+    const ctype = opts.campaignType || campaignTypeOf(c);
+    appendFact(facts, 'Campaign type', String(ctype).replace(/_/g, ' '));
+    appendFact(facts, 'Titles', icp.job_titles);
+    appendFact(facts, 'Contact locations', icp.contact_locations);
+    appendFact(facts, 'Geo', icp.primary_location || icp.location);
+    if (icp.company_size_min || icp.company_size_max) {
+      appendFact(facts, 'Company size', (icp.company_size_min || '?') + ' – ' + (icp.company_size_max || '?'));
+    }
+    appendFact(facts, 'Industries', icp.industries);
+    appendFact(facts, 'Include keywords', icp.include_keywords);
+    appendFact(facts, 'Exclude keywords', icp.exclude_keywords);
+    if (icp.person_match && typeof icp.person_match === 'object') {
+      const pm = icp.person_match;
+      appendFact(facts, 'Skills', pm.skills);
+      appendFact(facts, 'Exclude titles', pm.exclude_titles);
+      appendFact(facts, 'Person exclude keywords', pm.exclude_keywords);
+      if (pm.min_years_experience != null || pm.max_years_experience != null) {
+        appendFact(facts, 'Experience years',
+          (pm.min_years_experience ?? '?') + ' – ' + (pm.max_years_experience ?? '?'));
+      }
+      appendFact(facts, 'Headline allow', pm.headline_allow);
+    }
+    appendFact(facts, 'Website mode', icp.website_analysis_mode);
+    return facts;
+  }
+
+  function targetingAndModulesPanel(c, opts) {
+    opts = opts || {};
+    const panel = el('div', 'panel');
+    panel.append(el('h3', null, 'ICP'));
+    const facts = targetingFacts(c, opts);
+    if (!facts.children.length) {
+      panel.append(el('div', 'empty', 'No ICP details saved for this campaign.'));
+    } else {
+      panel.append(facts);
+    }
+    panel.append(el('h3', null, 'Enrichment modules'));
+    panel.append(el('p', 'note', 'Modules planned for this campaign (from enrichment_plan.json).'));
+    panel.append(enrichmentModulesNode(c.plan || opts.plan, campaignTypeOf(c)));
+    if (c.note) panel.append(el('div', 'callout', c.note));
+    return panel;
+  }
+
+  function runCard(r, campaignId, linked) {
+    const card = el('div', 'run-card');
+    const head = el('div', 'run-head');
+    const left = el('div');
+    const titleText = r.label || r.run_key || runKeyOf(r) || 'Run';
+    if (linked && campaignId) {
+      const link = el('a', 'run-link title', titleText);
+      link.href = '#/campaign/' + encodeURIComponent(campaignId)
+        + '/run/' + encodeURIComponent(runKeyOf(r));
+      left.append(link);
+    } else {
+      left.append(el('div', 'title', titleText));
+    }
+    const when = [r.run_date, (r.workflow_step || '').replace(/_/g, ' '), r.pipeline_run_id]
+      .filter(Boolean).join('  ·  ');
+    left.append(el('div', 'when', when));
+    head.append(left);
+    head.append(el('div', 'amount', usd4(r.total_usd)));
+    card.append(head);
+    card.append(splitBar(r.sources, false, 'This run billed nothing.'));
+
+    const actors = (r.apify_breakdown || []).filter((a) => a && a.actor);
+    if (actors.length) {
+      const box = el('div', 'actors');
+      actors.forEach((a) => {
+        const flagged = String(a.actor).indexOf('afanasenko') !== -1;
+        const line = el('div', 'actor-line' + (flagged ? ' flagged' : ''));
+        line.append(el('span', null, a.actor + '  ×' + int(a.runs)));
+        line.append(el('span', null, usd4(a.usd)));
+        box.append(line);
+      });
+      card.append(box);
+    }
+
+    const outcome = r.outcome || {};
+    const bits = Object.entries(outcome)
+      .filter(([, v]) => v !== null && v !== undefined && v !== false && v !== '')
+      .map(([k, v]) => {
+        const label = k.replace(/_/g, ' ');
+        if (v === true) return label + ': yes';
+        return label + ': ' + (typeof v === 'number' ? int(v) : String(v));
+      });
+    if (bits.length) card.append(el('div', 'when', bits.join('  ·  ')));
+    return card;
+  }
+
+  function leadsTable(rows, columns) {
+    const cols = columns && columns.length ? columns : LEAD_COLS;
+    const table = document.createElement('table');
+    const thead = document.createElement('thead');
+    const hr = document.createElement('tr');
+    cols.forEach((h) => hr.append(el('th', null, h.replace(/_/g, ' '))));
+    thead.append(hr);
+    table.append(thead);
+    const tbody = document.createElement('tbody');
+    rows.forEach((row) => {
+      const tr = document.createElement('tr');
+      cols.forEach((col) => tr.append(el('td', null, row[col] || '')));
+      tbody.append(tr);
+    });
+    table.append(tbody);
+    return table;
+  }
+
+  function leadsActionBar(campaignId, opts) {
+    opts = opts || {};
+    const actions = el('div', 'leads-actions');
+    let csvHref = '/dashboard/api/campaigns/' + encodeURIComponent(campaignId) + '/leads.csv';
+    if (opts.runId) csvHref += '?run_id=' + encodeURIComponent(opts.runId);
+    const exportLink = el('a', null, 'Export CSV');
+    exportLink.href = csvHref;
+    actions.append(exportLink);
+    if (opts.showFull !== false) {
+      const full = el('a', null, opts.fullLabel || 'Full results');
+      full.href = opts.fullHref || ('#/campaign/' + encodeURIComponent(campaignId) + '/leads');
+      actions.append(full);
+    }
+    if (opts.backHref) {
+      const back = el('a', null, opts.backLabel || 'Back to campaign');
+      back.href = opts.backHref;
+      actions.append(back);
+    }
+    return actions;
+  }
+
+  async function loadLeadsPanel(campaignId, opts) {
+    opts = opts || {};
+    const panel = el('div', 'panel leads-preview');
+    const qs = new URLSearchParams();
+    qs.set('preview', String(opts.preview != null ? opts.preview : 15));
+    if (opts.runId) qs.set('run_id', opts.runId);
+    try {
+      const res = await fetch(
+        '/dashboard/api/campaigns/' + encodeURIComponent(campaignId) + '/leads?' + qs.toString()
+      );
+      if (!res.ok) throw new Error('Failed to load leads');
+      const data = await res.json();
+      const noteBits = [
+        int(data.total_rows) + ' row' + (data.total_rows === 1 ? '' : 's'),
+        data.stage_file ? ('stage ' + data.stage_file) : null,
+        data.run_id_filter ? ('run filter ' + data.run_id_filter) : null
+      ].filter(Boolean);
+      panel.append(el('p', 'note', noteBits.join(' · ')));
+      const rows = data.preview || [];
+      if (!rows.length) {
+        panel.append(el('div', 'empty', 'No leads on disk for this list yet.'));
+      } else {
+        const scroll = el('div', 'table-scroll');
+        scroll.append(leadsTable(rows, data.columns));
+        panel.append(scroll);
+        if (rows.length < (data.total_rows || 0)) {
+          panel.append(el('p', 'note', 'Showing ' + rows.length + ' of ' + int(data.total_rows) + ' rows.'));
+        }
+      }
+      panel.append(leadsActionBar(campaignId, opts));
+    } catch (err) {
+      panel.append(el('div', 'empty', 'No leads available to preview.'));
+    }
+    return panel;
+  }
+
+  function mountLeadsSection(view, title, note, campaignId, opts) {
+    const holder = el('div');
+    const loading = el('div', 'panel leads-preview');
+    loading.append(el('div', 'empty', 'Loading leads…'));
+    holder.append(loading);
+    view.append(section(title, note, holder));
+    loadLeadsPanel(campaignId, opts).then((panel) => {
+      clear(holder);
+      holder.append(panel);
+    });
+  }
+
+  /* ---------------- views ---------------- */
+
+  function viewOverview() {
+    const view = document.createDocumentFragment();
+    const t = DATA.totals || {};
+    const blended = t.delivered_leads ? t.usd_total / t.delivered_leads : null;
+
+    view.append(section(
+      'Total spend',
+      'Across all clients and generated lists on disk.',
+      tiles([
+        { label: 'Total spend', value: usd(t.usd_total), foot: int(t.campaign_count) + ' campaigns', lead: true },
+        { label: 'Delivered leads', value: int(t.delivered_leads), foot: 'contactable rows on disk' },
+        { label: 'Blended cost / lead', value: blended === null ? '--' : usd4(blended), foot: 'total spend / delivered' },
+        { label: 'Clients', value: int(t.client_count), foot: t.tracked_campaign_count + ' campaigns with cost data' }
+      ])
+    ));
+
+    view.append(section(
+      'Clients',
+      'Open a client for its campaigns, ICPs, and list builds.',
+      clientTable()
+    ));
+
+    const vendorBody = el('div');
+    vendorBody.append(el('p', 'note', 'LLM spend is modelled from token counts, never billed directly — shown hatched.'));
+    vendorBody.append(vendorTable(DATA.campaigns || []));
+    view.append(section('Where the money went', null, vendorBody));
+
+    const led = listLedger(generatedLists(DATA.campaigns || []));
+    const sec = section(
+      'Generated lists',
+      'Executed campaigns only (stage outputs or cost data on disk). ICP stubs stay under each client.',
+      led.node
+    );
+    sec.querySelector('.section-head').append(led.count);
+    view.append(sec);
+
+    return {
+      eyebrow: 'Lead generation · cost ledger',
+      title: 'Lead List Ledger',
+      sub: 'Spend overview by client. Open a client to build or edit campaigns — the builder is not a separate home page.',
+      crumbs: [],
+      showBrand: true,
+      headerActions: [
+        { href: '/builder?new=1', label: 'Build new campaign', primary: true }
+      ],
+      view: view
+    };
+  }
+
+  function viewClient(clientId) {
+    const bucket = clientById(clientId);
+    const mine = campaignsOfClient(clientId);
+    if (!bucket && !mine.length) return null;
+
+    const view = document.createDocumentFragment();
+    const usdTotal = bucket ? bucket.usd_total : mine.reduce((a, c) => a + (c.usd_total || 0), 0);
+    const leads = bucket ? bucket.contactable_leads : mine.reduce((a, c) => a + (c.delivered_leads || 0), 0);
+    const myRuns = runsOf((r) => r.client_id === clientId);
+    const tracked = mine.filter((c) => c.cost_basis !== 'none').length;
+
+    view.append(tiles([
+      { label: 'Client spend', value: usd(usdTotal), foot: myRuns.length + ' pipeline stages', lead: true },
+      { label: 'Delivered leads', value: int(leads), foot: 'across ' + mine.length + ' campaigns' },
+      { label: 'Cost / lead', value: leads && usdTotal ? usd4(usdTotal / leads) : '--', foot: 'client blended' },
+      { label: 'Campaigns', value: int(mine.length), foot: tracked + ' with cost data' }
+    ]));
+
+    let selectedType = 'company_outreach';
+    let selectedIcp = '';
+
+    const toolbar = el('div', 'toolbar-row');
+    const typeLabel = el('label', null, 'New type');
+    const typeSelect = document.createElement('select');
+    typeSelect.append(new Option('Company outreach', 'company_outreach'));
+    typeSelect.append(new Option('Talent search', 'talent_search'));
+    typeLabel.append(typeSelect);
+    toolbar.append(typeLabel);
+
+    const buildIcp = el('a', 'btn', 'Build new ICP');
+    buildIcp.href = '/builder?client=' + encodeURIComponent(clientId) + '&new=1&type=' + encodeURIComponent(selectedType);
+    toolbar.append(buildIcp);
+
+    const createList = el('a', 'btn primary', 'Build new campaign');
+    createList.href = '/builder?client=' + encodeURIComponent(clientId) + '&new=1';
+    toolbar.append(createList);
+
+    const editPlan = el('a', 'btn', 'Edit enrichment');
+    editPlan.hidden = true;
+    editPlan.href = '#';
+    toolbar.append(editPlan);
+
+    view.append(toolbar);
+
+    const executed = generatedLists(mine);
+    const campaignsPanel = listPanel(
+      executed.slice().sort((a, b) => (b.usd_total || 0) - (a.usd_total || 0)),
+      true
+    );
+    view.append(section(
+      'Campaigns (generated lists)',
+      'Executed lists only. New ICPs appear under Existing ICPs until you run the funnel.',
+      campaignsPanel
+    ));
+
+    const icpPanel = el('div', 'panel icp-accordion');
+    icpPanel.append(el('div', 'empty', 'Loading ICPs…'));
+
+    view.append(section(
+      'Existing ICPs',
+      'From data/clients/' + clientId + '/icps/ — one ICP can power multiple campaigns.',
+      icpPanel
+    ));
+
+    function syncBuilderLinks() {
+      selectedType = typeSelect.value || 'company_outreach';
+      buildIcp.href = '/builder?client=' + encodeURIComponent(clientId)
+        + '&new=1&type=' + encodeURIComponent(selectedType);
+      createList.href = '/builder?client=' + encodeURIComponent(clientId)
+        + '&new=1&type=' + encodeURIComponent(selectedType);
+      if (selectedIcp) {
+        const row = (window.__clientIcps || []).find((x) => x.icp_id === selectedIcp);
+        const campId = row && row.campaign_ids && row.campaign_ids[0];
+        if (campId) {
+          editPlan.href = '/builder?campaign=' + encodeURIComponent(campId);
+          editPlan.hidden = false;
+          editPlan.textContent = 'Edit enrichment';
+        } else {
+          editPlan.href = '/builder?client=' + encodeURIComponent(clientId)
+            + '&new=1&icp=' + encodeURIComponent(selectedIcp);
+          editPlan.hidden = false;
+          editPlan.textContent = 'New campaign from ICP';
+        }
+      } else {
+        editPlan.hidden = true;
+        editPlan.textContent = 'Edit enrichment';
+      }
+    }
+
+    function closeIcpItem(node) {
+      node.classList.remove('open');
+      const h = node.querySelector('.icp-acc-head');
+      if (h) h.setAttribute('aria-expanded', 'false');
+      const b = node.querySelector('.icp-acc-body');
+      if (b) b.remove();
+    }
+
+    function fillLibraryIcpBody(body, summary, fullIcp) {
+      clear(body);
+      const fakeCampaign = {
+        campaign_id: (summary.campaign_ids && summary.campaign_ids[0]) || summary.icp_id,
+        display_name: summary.display_name,
+        campaign_type: summary.campaign_type,
+        icp: fullIcp || summary.icp || {},
+      };
+      const facts = targetingFacts(fakeCampaign, {
+        icp: fullIcp || summary.icp || {},
+        campaignType: summary.campaign_type || 'company_outreach',
+      });
+      if (!facts.children.length) {
+        body.append(el('div', 'empty', 'No ICP details saved yet.'));
+      } else {
+        body.append(facts);
+      }
+
+      const linked = (summary.campaign_ids || [])
+        .map((id) => campaignById(id) || { campaign_id: id, display_name: id })
+        .filter(Boolean);
+      body.append(associatedCampaignsList(linked));
+
+      body.append(el('p', 'note', 'Library path: data/clients/'
+        + clientId + '/icps/' + summary.icp_id + '/'));
+
+      const renameRow = el('div', 'icp-rename');
+      renameRow.append(el('label', null, 'ICP name'));
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = summary.display_name || summary.icp_id || '';
+      input.placeholder = 'e.g. Headhunting US 1-50';
+      renameRow.append(input);
+      const actions = el('div', 'icp-rename-actions');
+      const saveBtn = el('button', 'btn', 'Rename ICP');
+      saveBtn.type = 'button';
+      const status = el('span', 'savehint', '');
+      saveBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const nameVal = (input.value || '').trim();
+        if (!nameVal) {
+          status.textContent = 'Name required';
+          return;
+        }
+        status.textContent = 'Saving…';
+        fetch('/builder/api/clients/' + encodeURIComponent(clientId)
+          + '/icps/' + encodeURIComponent(summary.icp_id) + '/meta', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ display_name: nameVal }),
+        })
+          .then((r) => r.json().then((data) => ({ ok: r.ok, data })))
+          .then(({ ok, data }) => {
+            if (!ok) throw new Error((data && data.detail) || 'Rename failed');
+            summary.display_name = nameVal;
+            const titleCid = body.parentElement
+              && body.parentElement.querySelector('.icp-acc-title .cid');
+            if (titleCid) titleCid.textContent = nameVal;
+            status.textContent = 'Saved';
+          })
+          .catch((err) => {
+            status.textContent = err.message || 'Rename failed';
+          });
+      });
+      actions.append(saveBtn, status);
+      renameRow.append(actions);
+      body.append(renameRow);
+    }
+
+    function toggleLibraryIcp(summary, item, head) {
+      const id = summary.icp_id;
+      const wasOpen = item.classList.contains('open');
+      icpPanel.querySelectorAll('.icp-acc-item').forEach(closeIcpItem);
+      if (wasOpen) {
+        selectedIcp = '';
+        syncBuilderLinks();
+        return;
+      }
+      item.classList.add('open');
+      head.setAttribute('aria-expanded', 'true');
+      selectedIcp = id;
+      syncBuilderLinks();
+      const body = el('div', 'icp-acc-body');
+      body.append(el('div', 'empty', 'Loading ICP…'));
+      item.append(body);
+      fetch('/builder/api/clients/' + encodeURIComponent(clientId)
+        + '/icps/' + encodeURIComponent(id))
+        .then((r) => {
+          if (!r.ok) throw new Error('ICP fetch failed');
+          return r.json();
+        })
+        .then((payload) => {
+          if (selectedIcp !== id || !item.classList.contains('open')) return;
+          fillLibraryIcpBody(body, summary, payload.data || {});
+        })
+        .catch(() => {
+          if (selectedIcp !== id || !item.classList.contains('open')) return;
+          fillLibraryIcpBody(body, summary, summary.icp || {});
+        });
+    }
+
+    function renderLibraryIcps(rows) {
+      clear(icpPanel);
+      window.__clientIcps = rows || [];
+      if (!rows.length) {
+        icpPanel.append(el('div', 'empty',
+          'No ICPs in data/clients/' + clientId + '/icps/ yet. Use Build new ICP.'));
+        return;
+      }
+      rows.forEach((summary) => {
+        const item = el('div', 'icp-acc-item');
+        item.dataset.id = summary.icp_id;
+
+        const head = el('button', 'icp-acc-head');
+        head.type = 'button';
+        head.setAttribute('aria-expanded', 'false');
+        const headMain = el('div', 'icp-acc-main');
+        const titleRow = el('div', 'icp-acc-title');
+        const label = summary.display_name || summary.icp_id;
+        titleRow.append(el('span', 'cid', label));
+        titleRow.append(el('span', 'mono', summary.icp_id));
+        const ctype = summary.campaign_type || 'company_outreach';
+        titleRow.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
+          ctype.replace(/_/g, ' ')));
+        const nCamp = (summary.campaign_ids || []).length;
+        if (nCamp) {
+          titleRow.append(el('span', 'note', nCamp === 1 ? '1 campaign' : (nCamp + ' campaigns')));
+        }
+        headMain.append(titleRow);
+        const icp = summary.icp || {};
+        const titles = (icp.job_titles || []).slice(0, 4).join(' · ') || '—';
+        const geo = (icp.contact_locations || []).join(', ') || '—';
+        const size = (icp.company_size_min || icp.company_size_max)
+          ? ((icp.company_size_min || '?') + ' – ' + (icp.company_size_max || '?'))
+          : '—';
+        const bits = el('div', 'bits');
+        bits.innerHTML = '<span>Titles:</span>' + titles
+          + '  <span>Geo:</span>' + geo
+          + '  <span>Size:</span>' + size;
+        headMain.append(bits);
+        head.append(headMain);
+        head.append(el('span', 'icp-acc-chevron', '▾'));
+        head.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          toggleLibraryIcp(summary, item, head);
+        });
+        item.append(head);
+        icpPanel.append(item);
+      });
+    }
+
+    fetch('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps')
+      .then((r) => {
+        if (!r.ok) throw new Error('Failed to load ICPs');
+        return r.json();
+      })
+      .then((payload) => renderLibraryIcps(payload.icps || []))
+      .catch(() => {
+        clear(icpPanel);
+        icpPanel.append(el('div', 'empty',
+          'Could not load ICP library. Is the portal server running with /builder routes?'));
+      });
+
+    typeSelect.addEventListener('change', syncBuilderLinks);
+    syncBuilderLinks();
+
+    const name = (bucket && bucket.client_name) || (mine[0] && mine[0].client_name) || clientId;
+    return {
+      eyebrow: 'Client',
+      title: name,
+      sub: mine.length + (mine.length === 1 ? ' campaign' : ' campaigns') + ' under this client.',
+      crumbs: [['Overview', '#/']],
+      titleSuffix: clientId,
+      clientId: clientId,
+      headerActions: [
+        {
+          href: '/builder?client=' + encodeURIComponent(clientId) + '&new=1',
+          label: 'Build new campaign',
+          primary: true
+        }
+      ],
+      view: view
+    };
+  }
+
+  function viewCampaign(campaignId) {
+    const c = campaignById(campaignId);
+    if (!c) return null;
+
+    const view = document.createDocumentFragment();
+    const counts = c.lead_counts || {};
+    const myRuns = runsOf((r) => r.campaign_id === campaignId);
+
+    view.append(tiles([
+      { label: 'Campaign spend', value: usd(c.usd_total), foot: myRuns.length + ' pipeline stages', lead: true },
+      { label: 'Delivered leads', value: int(c.delivered_leads), foot: 'contactable rows on disk' },
+      { label: 'Cost / lead', value: c.per_lead_usd ? usd4(c.per_lead_usd) : '--', foot: 'campaign spend / delivered' },
+      { label: 'Seeds in', value: int(counts.seeds), foot: pct(c.delivered_leads, counts.seeds) + ' reached contactable' }
+    ]));
+
+    if (c.error) {
+      const warn = el('div', 'panel');
+      warn.append(el('div', 'callout',
+        'Cost report failed to build for this list, so the totals above are incomplete: ' + c.error));
+      view.append(warn);
+    }
+
+    const funnelPanel = el('div', 'panel');
+    const top = Math.max.apply(null, STAGES.map(([k]) => counts[k] || 0).concat([1]));
+    STAGES.forEach(([key, label]) => {
+      const value = counts[key] || 0;
+      const row = el('div', 'stage-row');
+      row.append(el('div', 'stage-name', label));
+      const track = el('div', 'track');
+      const fill = el('div', 'fill');
+      fill.style.width = (value / top * 100) + '%';
+      track.append(fill);
+      row.append(track);
+      row.append(el('div', 'count', int(value)));
+      row.append(el('div', 'pct', pct(value, counts.seeds)));
+      funnelPanel.append(row);
+    });
+    view.append(section('Funnel', 'Share is measured against raw seeds in.', funnelPanel));
+
+    const cols = el('div', 'cols');
+    const vendorSec = el('div', 'section');
+    vendorSec.append(el('h3', null, 'By vendor'));
+    vendorSec.append(splitBar(c.by_source, true));
+    vendorSec.append(vendorTable([c]));
+    cols.append(vendorSec);
+
+    const stepSec = el('div', 'section');
+    stepSec.append(el('h3', null, 'By workflow step'));
+    const stepPanel = el('div', 'panel table-scroll');
+    const steps = c.by_workflow_step || {};
+    if (Object.keys(steps).length) {
+      const table = document.createElement('table');
+      const thead = document.createElement('thead');
+      const hr = document.createElement('tr');
+      ['Step', 'Runs', 'USD', 'Share'].forEach((h, i) => hr.append(el('th', i ? 'r' : null, h)));
+      thead.append(hr);
+      table.append(thead);
+      const tbody = document.createElement('tbody');
+      const stepTotal = Object.values(steps).reduce((a, s) => a + (Number(s.usd) || 0), 0);
+      Object.entries(steps).sort((a, b) => (b[1].usd || 0) - (a[1].usd || 0)).forEach(([name, s]) => {
+        const tr = document.createElement('tr');
+        tr.append(el('td', null, name.replace(/_/g, ' ')));
+        tr.append(el('td', 'r', int(s.runs)));
+        tr.append(el('td', 'r', usd4(s.usd)));
+        tr.append(el('td', 'r', stepTotal ? ((s.usd || 0) / stepTotal * 100).toFixed(1) + '%' : '--'));
+        tbody.append(tr);
+      });
+      table.append(tbody);
+      stepPanel.append(table);
+    } else {
+      stepPanel.append(el('div', 'empty', 'Workflow-step attribution is only recorded for v4 manifests.'));
+    }
+    stepSec.append(stepPanel);
+    cols.append(stepSec);
+    view.append(section('Cost breakdown', null, cols));
+
+    const targetHolder = el('div');
+    targetHolder.append(targetingAndModulesPanel(c));
+    view.append(section('Targeting and billing basis', 'ICP rules, then enrichment modules planned for this list.', targetHolder));
+    fetch('/builder/api/campaigns/' + encodeURIComponent(campaignId))
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data) => {
+        if (!data || !data.plan) return;
+        c.plan = data.plan;
+        clear(targetHolder);
+        targetHolder.append(targetingAndModulesPanel(c));
+      })
+      .catch(() => { /* keep index snapshot */ });
+
+    mountLeadsSection(
+      view,
+      'Generated leads',
+      'Preview from the richest stage CSV on disk (scored → enriched → contactable).',
+      campaignId,
+      { preview: 15, showFull: true }
+    );
+
+    const runPanel = el('div', 'panel');
+    if (!myRuns.length) {
+      runPanel.append(el('div', 'empty', 'No pipeline stages logged for this campaign.'));
+    }
+    myRuns.forEach((r) => runPanel.append(runCard(r, campaignId, true)));
+    view.append(section('Pipeline stages', 'Stage-level spend (seeding, Apollo, enrichment, repair). The campaign as a whole is one generated list on the ledger.', runPanel));
+
+    const crumbs = [['All clients', '#/']];
+    if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
+    return {
+      eyebrow: 'Campaign',
+      title: c.display_name || c.campaign_id,
+      sub: (c.client_name ? 'Built for ' + c.client_name + '. ' : '')
+         + (c.display_name && c.display_name !== c.campaign_id ? ('Folder ' + c.campaign_id + '. ') : '')
+         + int(counts.seeds) + ' seeds in, ' + int(c.delivered_leads) + ' contactable leads out.',
+      crumbs: crumbs,
+      campaignId: campaignId,
+      headerActions: [
+        {
+          href: '/builder?campaign=' + encodeURIComponent(campaignId),
+          label: 'Edit enrichment',
+          primary: true
+        }
+      ],
+      view: view
+    };
+  }
+
+  function viewRun(campaignId, runKey) {
+    const c = campaignById(campaignId);
+    const r = findRun(campaignId, runKey);
+    if (!c || !r) return null;
+
+    const view = document.createDocumentFragment();
+    view.append(tiles([
+      { label: 'Stage spend', value: usd4(r.total_usd), foot: (r.workflow_step || '').replace(/_/g, ' ') || 'pipeline stage', lead: true },
+      { label: 'Campaign delivered', value: int(c.delivered_leads), foot: 'contactable on campaign' },
+      { label: 'Campaign spend', value: usd(c.usd_total), foot: 'all stages for this campaign' },
+      { label: 'Cost / lead', value: c.per_lead_usd ? usd4(c.per_lead_usd) : '--', foot: 'campaign blended' }
+    ]));
+
+    const costPanel = el('div', 'panel');
+    costPanel.append(runCard(r, campaignId, false));
+    view.append(section('Cost breakdown', 'Sources, Apify actors, and outcome for this pipeline stage.', costPanel));
+
+    const facts = targetingFacts(c);
+    if (facts.children.length) {
+      const panel = el('div', 'panel');
+      panel.append(facts);
+      view.append(section('Targeting', null, panel));
+    }
+
+    const runFilter = r.pipeline_run_id || r.run_key || runKey;
+    mountLeadsSection(
+      view,
+      'Generated leads',
+      'Filtered to this pipeline stage when rows carry a matching run_id.',
+      campaignId,
+      {
+        preview: 15,
+        runId: runFilter,
+        showFull: true,
+        fullHref: '#/campaign/' + encodeURIComponent(campaignId) + '/leads'
+      }
+    );
+
+    const crumbs = [['All clients', '#/']];
+    if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
+    crumbs.push([c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
+    return {
+      eyebrow: 'Pipeline stage',
+      title: r.label || r.run_key || runKey,
+      sub: (r.run_date || '') + (r.pipeline_run_id ? (' · ' + r.pipeline_run_id) : ''),
+      crumbs: crumbs,
+      titleSuffix: runKeyOf(r) || runKey,
+      campaignId: campaignId,
+      headerActions: [
+        {
+          href: '/builder?campaign=' + encodeURIComponent(campaignId),
+          label: 'Re-run list build',
+          primary: true
+        }
+      ],
+      view: view
+    };
+  }
+
+  function viewLeads(campaignId) {
+    const c = campaignById(campaignId);
+    if (!c) return null;
+
+    const view = document.createDocumentFragment();
+    mountLeadsSection(
+      view,
+      'Full results',
+      'Up to 200 preview rows from the richest stage CSV. Use Export CSV for the full file.',
+      campaignId,
+      {
+        preview: 200,
+        showFull: false,
+        backHref: '#/campaign/' + encodeURIComponent(campaignId),
+        backLabel: 'Back to campaign'
+      }
+    );
+
+    const crumbs = [['All clients', '#/']];
+    if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
+    crumbs.push([c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
+    return {
+      eyebrow: 'Generated leads',
+      title: c.campaign_id + ' · leads',
+      sub: int(c.delivered_leads) + ' contactable leads on disk for this campaign.',
+      crumbs: crumbs,
+      titleSuffix: 'leads',
+      campaignId: campaignId,
+      headerActions: [
+        {
+          href: '/dashboard/api/campaigns/' + encodeURIComponent(campaignId) + '/leads.csv',
+          label: 'Export CSV',
+          primary: true
+        }
+      ],
+      view: view
+    };
+  }
+
+  /* ---------------- router ---------------- */
+
+  const viewNode = document.getElementById('view');
+  const crumbNode = document.getElementById('crumbs');
+
+  let route = { kind: 'all', id: null };
+
+  function parseHash(hash) {
+    const h = hash || '';
+    let m = h.match(/^#\/campaign\/([^/]+)\/run\/(.+)$/);
+    if (m) {
+      return {
+        kind: 'run',
+        id: decodeURIComponent(m[1]),
+        runKey: decodeURIComponent(m[2])
+      };
+    }
+    m = h.match(/^#\/campaign\/([^/]+)\/leads\/?$/);
+    if (m) return { kind: 'leads', id: decodeURIComponent(m[1]) };
+    m = h.match(/^#\/(client|campaign)\/(.+)$/);
+    if (!m) return { kind: 'all', id: null };
+    return { kind: m[1], id: decodeURIComponent(m[2]) };
+  }
+
+  function routeResolves(r) {
+    if (r.kind === 'client') return !!(clientById(r.id) || campaignsOfClient(r.id).length);
+    if (r.kind === 'campaign' || r.kind === 'leads') return !!campaignById(r.id);
+    if (r.kind === 'run') return !!(campaignById(r.id) && findRun(r.id, r.runKey));
+    return true;
+  }
+
+  function resolve() {
+    if (route.kind === 'client') {
+      const page = viewClient(route.id);
+      if (page) return page;
+    } else if (route.kind === 'campaign') {
+      const page = viewCampaign(route.id);
+      if (page) return page;
+    } else if (route.kind === 'run') {
+      const page = viewRun(route.id, route.runKey);
+      if (page) return page;
+    } else if (route.kind === 'leads') {
+      const page = viewLeads(route.id);
+      if (page) return page;
+    }
+    return viewOverview();
+  }
+
+  function navigate(next, fromHash) {
+    route = next;
+    if (!fromHash) {
+      let target = '#/';
+      if (next.kind === 'client') {
+        target = '#/client/' + encodeURIComponent(next.id);
+      } else if (next.kind === 'campaign') {
+        target = '#/campaign/' + encodeURIComponent(next.id);
+      } else if (next.kind === 'run') {
+        target = '#/campaign/' + encodeURIComponent(next.id)
+          + '/run/' + encodeURIComponent(next.runKey);
+      } else if (next.kind === 'leads') {
+        target = '#/campaign/' + encodeURIComponent(next.id) + '/leads';
+      }
+      try {
+        if (location.hash !== target) history.pushState(null, '', target);
+      } catch (e) { /* ignore */ }
+    }
+    render();
+  }
+
+  document.addEventListener('click', function (e) {
+    const link = e.target.closest ? e.target.closest('a[href^="#/"]') : null;
+    if (!link) return;
+    e.preventDefault();
+    const next = parseHash(link.getAttribute('href'));
+    if (routeResolves(next)) navigate(next, false);
+  });
+
+  function render() {
+    const page = resolve();
+    clear(viewNode);
+    clear(crumbNode);
+
+    const crumbs = (page.crumbs || []).filter((crumb) => routeResolves(parseHash(crumb[1])));
+    crumbs.forEach((crumb, i) => {
+      if (i) crumbNode.append(el('span', 'sep', '/'));
+      const link = el('a', null, crumb[0]);
+      link.href = crumb[1];
+      crumbNode.append(link);
+    });
+    if (crumbs.length) {
+      crumbNode.append(el('span', 'sep', '/'));
+      crumbNode.append(el('span', 'here', page.titleSuffix || page.title));
+    }
+
+    document.getElementById('eyebrow').textContent = page.eyebrow;
+    document.getElementById('page-title').textContent = page.title;
+    document.getElementById('page-sub').textContent = page.sub;
+    document.title = page.title === 'Lead List Ledger' ? 'Lead List Ledger' : page.title + ' — Lead List Ledger';
+
+    const actions = document.getElementById('header-actions');
+    clear(actions);
+    (page.headerActions || []).forEach((a) => {
+      const link = el('a', a.primary ? 'primary' : null, a.label);
+      link.href = a.href;
+      actions.append(link);
+    });
+    const brand = document.getElementById('brand-mark');
+    if (brand) brand.hidden = !page.showBrand;
+
+    viewNode.append(page.view);
+    window.scrollTo(0, 0);
+  }
+
+  function parseEmbedded() {
+    const raw = (document.getElementById('ledger-data') || {}).textContent || '';
+    const trimmed = raw.trim();
+    if (!trimmed || trimmed === '__DATA__' || trimmed === '{}') return null;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (!parsed || typeof parsed !== 'object') return null;
+      if (!Object.keys(parsed).length) return null;
+      return parsed;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function boot(index) {
+    DATA = index || DATA;
+    if (!DATA.scope) DATA.scope = { kind: 'all', id: null };
+    route = parseHash(location.hash);
+    render();
+    document.getElementById('stamp').textContent =
+      'Generated ' + (DATA.logged_at || '') + ' · schema v' + (DATA.schema_version || '');
+  }
+
+  window.addEventListener('hashchange', function () {
+    const next = parseHash(location.hash);
+    if (routeResolves(next)) navigate(next, true);
+  });
+
+  const embedded = parseEmbedded();
+  if (embedded) {
+    boot(embedded);
+  } else {
+    fetch('/dashboard/api')
+      .then((r) => {
+        if (!r.ok) throw new Error('Failed to load /dashboard/api');
+        return r.json();
+      })
+      .then(boot)
+      .catch((err) => {
+        document.getElementById('page-title').textContent = 'Lead List Ledger';
+        document.getElementById('page-sub').textContent = err.message
+          + ' — run python scripts/build_cost_dashboard.py then retry.';
+        document.getElementById('stamp').textContent = '';
+      });
+  }
+})();
+</script>
+</body>
+</html>

@@ -5,24 +5,81 @@ Deep-crawls company websites and extracts structured analysis.
 from __future__ import annotations
 
 import logging
-from typing import Optional, Protocol
+from pathlib import Path
+from typing import Any, Optional, Protocol
 
-from agent.integrations.careers import find_careers_page
+from agent.integrations.careers import (
+    careers_index_needs_portal_hop,
+    find_careers_page,
+    pick_careers_portal_hop,
+)
 from agent.integrations.firecrawl import (
     crawl_website_with_fallback,
     map_website_urls,
     scrape_page,
+    scrape_urls,
+    website_crawler,
 )
-from agent.integrations.llm import WEBSITE_PROVIDERS, call_llm
+from agent.integrations.llm import call_llm, website_providers
 from agent.models import Lead, WebsiteAnalysis
 from agent.utils.concurrency import env_int, map_ordered
 from agent.utils.cost_tracker import get_cost_tracker
 from agent.utils.logger import get_run_logger
+from agent.utils.website_markdown_cache import load_markdown, save_markdown
+from agent.utils.website_outreach import (
+    DEFAULT_OUTREACH_MAX_PAGES,
+    extract_decision_maker_mentions,
+    extract_social_links,
+    merge_mentions,
+    parse_blog_posts_from_llm,
+    select_outreach_urls,
+)
 
 
 class _HasWebsite(Protocol):
     company_name: str
     website: Optional[str]
+
+
+def _decision_maker_name(company: _HasWebsite) -> Optional[str]:
+    dm = getattr(company, "decision_maker", None)
+    name = getattr(dm, "name", None) if dm else None
+    return str(name).strip() if name else None
+
+
+def _apply_outreach_signals(
+    analysis: WebsiteAnalysis,
+    *,
+    markdown: str,
+    plan,
+    careers_url: Optional[str],
+    hiring: Optional[dict],
+    dm_name: Optional[str],
+) -> WebsiteAnalysis:
+    social = extract_social_links(markdown)
+    analysis.social_facebook = social.get("facebook") or analysis.social_facebook
+    analysis.social_instagram = social.get("instagram") or analysis.social_instagram
+    analysis.social_tiktok = social.get("tiktok") or analysis.social_tiktok
+    analysis.social_x = social.get("x") or analysis.social_x
+    if plan:
+        analysis.blog_url = analysis.blog_url or plan.blog_url
+        analysis.news_url = analysis.news_url or plan.news_url
+    if analysis.has_blog is None:
+        analysis.has_blog = bool(analysis.blog_url or analysis.news_url or analysis.blog_posts)
+    mentions = extract_decision_maker_mentions(markdown, dm_name)
+    analysis.decision_maker_mentions = merge_mentions(
+        mentions, analysis.decision_maker_mentions
+    )
+    if careers_url:
+        analysis.website_careers_url = careers_url
+    if hiring:
+        analysis.website_is_hiring = hiring.get("is_hiring")
+        analysis.website_open_roles = hiring.get("open_roles") or []
+        analysis.website_careers_url = (
+            careers_url or hiring.get("careers_url") or analysis.website_careers_url
+        )
+    analysis.raw_markdown_length = len(markdown or "")
+    return analysis
 
 
 def _website_analysis_mode(client_profile) -> str:
@@ -36,6 +93,9 @@ def run(
     client_profile,
     run_id: str,
     logger: Optional[logging.Logger] = None,
+    *,
+    campaign_dir: Optional[Path] = None,
+    firecrawl: bool = True,
 ) -> dict[str, Optional[WebsiteAnalysis]]:
     """
     Returns a dict mapping company_name → WebsiteAnalysis (or None if failed).
@@ -46,10 +106,13 @@ def run(
     mode = _website_analysis_mode(client_profile)
     hiring_first = mode == "hiring_first"
     log.info(
-        "Stage 4 — Website enrichment (%d companies, concurrency=%d, mode=%s)",
+        "Stage 4 — Website enrichment (%d companies, concurrency=%d, mode=%s, "
+        "crawl=%s, firecrawl_flag=%s)",
         len(companies),
         concurrency,
         mode,
+        website_crawler() if firecrawl else "cache-only",
+        firecrawl,
     )
 
     def _process(company: _HasWebsite) -> tuple[str, Optional[WebsiteAnalysis]]:
@@ -62,41 +125,147 @@ def run(
             return company.company_name, None
 
         if not company.website:
-            log.info("No website for '%s' — skipping Firecrawl", company.company_name)
+            log.info("No website for '%s' — skipping website crawl", company.company_name)
             return company.company_name, None
 
         def _enrich() -> Optional[WebsiteAnalysis]:
-            log.info("Mapping site URLs: %s", company.website)
-            sitemap_urls = map_website_urls(company.website, limit=80)
+            plan = None
+            careers_url: Optional[str] = None
+            careers_markdown: Optional[str] = None
+            combined = ""
 
-            log.info("Crawling: %s", company.website)
-            markdown, crawl_source = crawl_website_with_fallback(company.website)
-            if not markdown:
-                log.warning(
-                    "No website content for %s (firecrawl+apify failed) — careers probe only",
-                    company.website,
+            if not firecrawl and campaign_dir:
+                cached = load_markdown(campaign_dir, company.website or "")
+                if not cached:
+                    log.warning(
+                        "LLM-only repair: no markdown cache for '%s' (%s)",
+                        company.company_name,
+                        company.website,
+                    )
+                    return None
+                combined = cached.markdown
+                careers_url = cached.careers_url
+                log.info(
+                    "LLM-only repair: using cached markdown for %s (%d chars)",
+                    company.company_name,
+                    len(combined),
                 )
             else:
-                log.info(
-                    "Website crawl source for %s: %s (%d chars)",
-                    company.company_name,
-                    crawl_source,
-                    len(markdown),
+                max_pages = env_int(
+                    "FIRECRAWL_MAX_PAGES",
+                    default=DEFAULT_OUTREACH_MAX_PAGES,
+                    maximum=12,
+                )
+                log.info("Mapping site URLs: %s", company.website)
+                sitemap_urls = map_website_urls(company.website, limit=100)
+                plan = select_outreach_urls(
+                    sitemap_urls, company.website, max_pages=max_pages
                 )
 
-            careers_url = find_careers_page(
-                company.website,
-                markdown,
-                sitemap_urls=sitemap_urls,
-            )
-            careers_markdown = scrape_page(careers_url) if careers_url else None
-            if not careers_markdown and careers_url:
-                from agent.integrations.apify import scrape_website_apify
+                markdown = scrape_urls(plan.urls) if plan.urls else None
+                crawl_source = f"{website_crawler()}_selected"
+                if not markdown or len(markdown.strip()) < 200:
+                    log.info(
+                        "Selected scrape thin/empty for %s — fallback crawl",
+                        company.website,
+                    )
+                    markdown, crawl_source = crawl_website_with_fallback(
+                        company.website, max_pages=max_pages
+                    )
+                if not markdown:
+                    log.warning(
+                        "No website content for %s (apify/firecrawl failed) — careers probe only",
+                        company.website,
+                    )
+                else:
+                    log.info(
+                        "Website crawl source for %s: %s (%d chars, %d urls)",
+                        company.company_name,
+                        crawl_source,
+                        len(markdown),
+                        len(plan.urls),
+                    )
 
-                careers_markdown = scrape_website_apify(careers_url, max_pages=1)
+                careers_url = find_careers_page(
+                    company.website,
+                    markdown,
+                    sitemap_urls=sitemap_urls,
+                )
+                already_scraped = bool(
+                    careers_url and markdown and careers_url.rstrip("/") in markdown
+                )
+                if careers_url and not already_scraped:
+                    careers_markdown = scrape_page(careers_url)
+                    if not careers_markdown:
+                        from agent.integrations.apify import scrape_website_apify
+
+                        careers_markdown = scrape_website_apify(
+                            careers_url, max_pages=1, max_depth=0
+                        )
+
+                # +1 hop: marketing /careers → real ATS / "see open roles" portal
+                careers_body = careers_markdown or ""
+                if (
+                    not careers_body
+                    and careers_url
+                    and markdown
+                    and careers_url.rstrip("/") in markdown
+                ):
+                    for section in markdown.split("\n\n---\n\n"):
+                        if careers_url.rstrip("/") in section:
+                            careers_body = section
+                            break
+                hop_source = careers_body or markdown or ""
+                if careers_url and careers_index_needs_portal_hop(
+                    hop_source, careers_url=careers_url
+                ):
+                    hop_url = pick_careers_portal_hop(
+                        hop_source,
+                        company.website or "",
+                        current_url=careers_url,
+                    )
+                    if hop_url and hop_url.rstrip("/") != careers_url.rstrip("/"):
+                        log.info(
+                            "Careers portal hop for %s: %s → %s",
+                            company.company_name,
+                            careers_url,
+                            hop_url,
+                        )
+                        hop_md = scrape_page(hop_url)
+                        if not hop_md:
+                            from agent.integrations.apify import scrape_website_apify
+
+                            hop_md = scrape_website_apify(
+                                hop_url, max_pages=1, max_depth=0
+                            )
+                        if hop_md:
+                            careers_url = hop_url
+                            careers_markdown = hop_md
+
+                combined = markdown or ""
+                if careers_markdown and careers_url:
+                    already = careers_url.rstrip("/") in combined
+                    if not already:
+                        combined = (
+                            f"{combined}\n\n---\n\n### [{careers_url}]\n{careers_markdown}"
+                        ).strip()
+                if campaign_dir and combined:
+                    try:
+                        save_markdown(
+                            campaign_dir,
+                            company.website or "",
+                            combined,
+                            careers_url=careers_url,
+                        )
+                    except Exception as e:
+                        log.warning(
+                            "Failed to cache markdown for %s: %s",
+                            company.company_name,
+                            e,
+                        )
 
             hiring = _detect_website_hiring(
-                markdown or "",
+                combined,
                 company.company_name,
                 company.website,
                 log,
@@ -105,32 +274,28 @@ def run(
                 hiring_first=hiring_first,
             )
 
+            dm_name = _decision_maker_name(company)
             analysis = None
-            if markdown and not hiring_first:
-                analysis = _analyse_website(markdown, company.company_name, log)
-            elif markdown and hiring_first:
-                analysis = _analyse_website_pitch(markdown, company.company_name, log)
-
-            if analysis:
-                analysis.website_careers_url = careers_url
-                if hiring:
-                    analysis.website_is_hiring = hiring.get("is_hiring")
-                    analysis.website_hiring_signals = hiring.get("hiring_signals") or []
-                    analysis.website_open_roles = hiring.get("open_roles") or []
-                    analysis.website_careers_url = careers_url or hiring.get("careers_url")
-                return analysis
-            if hiring or careers_markdown:
-                return WebsiteAnalysis(
-                    website_is_hiring=hiring.get("is_hiring") if hiring else None,
-                    website_hiring_signals=(hiring.get("hiring_signals") or []) if hiring else [],
-                    website_open_roles=(hiring.get("open_roles") or []) if hiring else [],
-                    website_careers_url=careers_url or (hiring.get("careers_url") if hiring else None),
-                    website_summary=(
-                        "Thin site — hiring signals from careers page only"
-                    ),
-                    raw_markdown_length=len(markdown or ""),
+            if combined:
+                analysis = _analyse_outreach(
+                    combined, company.company_name, log, dm_name=dm_name
                 )
-            return None
+            if not analysis:
+                if not (hiring or careers_markdown or combined):
+                    return None
+                analysis = WebsiteAnalysis(
+                    website_summary="Thin site — hiring or page signals only"
+                    if not combined
+                    else None,
+                )
+            return _apply_outreach_signals(
+                analysis,
+                markdown=combined,
+                plan=plan,
+                careers_url=careers_url,
+                hiring=hiring,
+                dm_name=dm_name,
+            )
 
         if isinstance(company, Lead) and tracker:
             with tracker.lead_context(company.lead_id, company.company_name):
@@ -177,106 +342,127 @@ def _select_content(markdown: str, per_page_chars: int = 4500, total_chars: int 
     return "\n\n---\n\n".join(sections)
 
 
-def _analyse_website_pitch(
+def _analyse_outreach(
     markdown: str,
     company_name: str,
     log: logging.Logger,
+    *,
+    dm_name: Optional[str] = None,
 ) -> Optional[WebsiteAnalysis]:
-    """Short pitch-oriented website summary (hiring_first mode — no SEO/blog/chatbot)."""
-    content = _select_content(markdown, per_page_chars=3500, total_chars=14000)
+    """Extract outreach fields: services, about, recent blog/news, DM mentions."""
+    content = _select_content(markdown, per_page_chars=4000, total_chars=26000)
+    dm_block = ""
+    if dm_name:
+        dm_block = f"""
+DECISION MAKER: {dm_name}
+If this person is named on about/team/leadership pages, copy the verbatim bio or mention into decision_maker_mentions (max 5). If they are not named, return an empty list.
+"""
 
-    prompt = f"""Analyse this company website for sales pitch intelligence.
+    prompt = f"""Extract outreach intelligence from this company website. Only use what is visible in the content.
 
 COMPANY: {company_name}
-
-WEBSITE CONTENT (Markdown, pages separated by ---):
+{dm_block}
+WEBSITE CONTENT (Markdown, pages separated by ---, each page headed by its source URL):
 {content}
 
-Extract and return JSON only:
+Return JSON only:
 {{
-  "services_offered": ["main products/services — be specific, max 12 items"],
-  "website_summary": "<3-4 sentences: what they build/sell, who they serve, stage/size signals if visible>"
+  "services_offered": ["specific products/services, max 12"],
+  "about_summary": "<2-4 sentences from About / Our story / Team: who they are, what they stand for, leadership if named>",
+  "has_blog": <true if a blog, news, insights, or press section exists, else false>,
+  "blog_url": "<blog index URL if visible, else null>",
+  "news_url": "<news/press index URL if visible, else null>",
+  "blog_posts": [
+    {{
+      "title": "<latest post title>",
+      "published_at": "<date as written, preferably YYYY-MM-DD, else null>",
+      "description": "<1-2 sentence summary or excerpt>",
+      "url": "<post URL if visible, else null>"
+    }}
+  ],
+  "website_summary": "<3-5 sentences for a salesperson: what they do, who they serve, notable hiring or news>",
+  "decision_maker_mentions": ["verbatim quotes or bio lines about the decision maker if present"]
 }}
 
-Focus on what they do and who they sell to. Do not analyse SEO, blog, or chatbot.
+Rules:
+- blog_posts: up to 5 most recent posts or news items. Omit the array if none are visible.
+- Do not invent dates, titles, or URLs.
+- Do not extract tech stack, SEO, chatbot, or testimonials.
+- about_summary should come from About / Team pages, not the homepage nav.
 """
 
     try:
-        data = call_llm(
-            prompt,
-            max_tokens=700,
-            expect_json=True,
-            providers=WEBSITE_PROVIDERS,
+        data = _normalize_llm_object(
+            call_llm(
+                prompt,
+                max_tokens=1800,
+                expect_json=True,
+                providers=website_providers(),
+            )
         )
+        if not data:
+            raise ValueError("LLM returned non-object JSON")
+        mentions = data.get("decision_maker_mentions") or []
+        if not isinstance(mentions, list):
+            mentions = [str(mentions)]
+        has_blog = data.get("has_blog")
+        if isinstance(has_blog, str):
+            has_blog = has_blog.strip().lower() in ("true", "yes", "1")
+        def _opt_url(val) -> Optional[str]:
+            if not val:
+                return None
+            text = str(val).strip()
+            if text.lower() in ("null", "none", "n/a"):
+                return None
+            return text
         return WebsiteAnalysis(
             services_offered=data.get("services_offered") or [],
-            website_summary=data.get("website_summary"),
+            about_summary=_opt_url(data.get("about_summary")),
+            has_blog=has_blog if isinstance(has_blog, bool) else None,
+            blog_url=_opt_url(data.get("blog_url")),
+            news_url=_opt_url(data.get("news_url")),
+            blog_posts=parse_blog_posts_from_llm(data.get("blog_posts")),
+            decision_maker_mentions=[str(m).strip() for m in mentions if str(m).strip()],
+            website_summary=_opt_url(data.get("website_summary")),
             raw_markdown_length=len(markdown),
         )
     except Exception as e:
-        log.warning("Pitch website analysis failed for '%s': %s", company_name, e)
+        log.warning("Outreach website analysis failed for '%s': %s — plain-text fallback", company_name, e)
+        try:
+            summary = call_llm(
+                f"Summarize in 3 sentences what {company_name} does based on this website content:\n\n{_select_content(markdown, per_page_chars=2000, total_chars=8000)}",
+                system="You are a concise B2B analyst. Plain prose only, no JSON.",
+                max_tokens=400,
+                expect_json=False,
+                providers=website_providers(),
+            )
+            if isinstance(summary, str) and summary.strip():
+                return WebsiteAnalysis(
+                    website_summary=summary.strip()[:1200],
+                    raw_markdown_length=len(markdown),
+                )
+        except Exception as e2:
+            log.warning("Plain-text fallback failed for '%s': %s", company_name, e2)
+        excerpt = _select_content(markdown, per_page_chars=800, total_chars=800).strip()
         return WebsiteAnalysis(
-            website_summary=f"Pitch analysis failed: {str(e)[:100]}",
+            website_summary=excerpt[:500] if excerpt else f"Analysis failed: {str(e)[:80]}",
             raw_markdown_length=len(markdown),
         )
 
 
-def _analyse_website(
-    markdown: str,
-    company_name: str,
-    log: logging.Logger,
-) -> Optional[WebsiteAnalysis]:
-    """Extract structured website fields from Firecrawl markdown (Gemini → OpenAI)."""
-    content = _select_content(markdown)
+def _normalize_llm_object(data: Any) -> Optional[dict]:
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        for item in data:
+            if isinstance(item, dict):
+                return item
+    return None
 
-    prompt = f"""Analyse this company website content and extract structured information.
 
-COMPANY: {company_name}
-
-WEBSITE CONTENT (Markdown, multiple pages separated by ---, each page headed by its source URL):
-{content}
-
-Extract and return a JSON object with these exact fields:
-{{
-  "tech_stack_detected": ["list of technologies/platforms detected, e.g. WordPress, Shopify, HubSpot, etc."],
-  "services_offered": ["list of main services/products this company offers — be exhaustive, include service lines, industries served, languages, and locations/hubs when stated"],
-  "content_quality_score": <integer 1-10, where 10 is excellent>,
-  "seo_health": ["list of SEO issues detected, e.g. 'missing meta description', 'no blog', 'thin content'"],
-  "has_chatbot": <true/false/null>,
-  "has_blog": <true/false>,
-  "last_blog_post_date": "<date string if found, else null>",
-  "social_proof": <true if testimonials/case studies/reviews are present, false otherwise>,
-  "website_summary": "<4-6 sentence summary: what this company does, who its clients are, office/delivery locations, languages or markets served, any growth/expansion/news signals, and their online presence>"
-}}
-
-Be specific and evidence-based. Only include what you can actually see in the content.
-"""
-
-    try:
-        data = call_llm(
-            prompt,
-            max_tokens=1500,
-            expect_json=True,
-            providers=WEBSITE_PROVIDERS,
-        )
-        return WebsiteAnalysis(
-            tech_stack_detected=data.get("tech_stack_detected") or [],
-            services_offered=data.get("services_offered") or [],
-            content_quality_score=data.get("content_quality_score"),
-            seo_health=data.get("seo_health") or [],
-            has_chatbot=data.get("has_chatbot"),
-            has_blog=data.get("has_blog"),
-            last_blog_post_date=str(data.get("last_blog_post_date")) if data.get("last_blog_post_date") else None,
-            social_proof=data.get("social_proof"),
-            website_summary=data.get("website_summary"),
-            raw_markdown_length=len(markdown),
-        )
-    except Exception as e:
-        log.warning("Website analysis failed for '%s': %s", company_name, e)
-        return WebsiteAnalysis(
-            website_summary=f"Analysis failed: {str(e)[:100]}",
-            raw_markdown_length=len(markdown),
-        )
+def _normalize_hiring_payload(data: Any) -> Optional[dict]:
+    """LLM JSON may be a dict or a one-element list — normalize to dict."""
+    return _normalize_llm_object(data)
 
 
 def _detect_website_hiring(
@@ -326,7 +512,6 @@ WEBSITE CONTENT (Markdown):
 Return JSON only:
 {{
   "is_hiring": "yes" | "no" | "unknown",
-  "hiring_signals": ["short evidence-based phrases, max 5"],
   "open_roles": ["job titles if visible, max 12"],
   "careers_url": "<URL if a careers/jobs page URL appears in content, else null>"
 }}
@@ -338,12 +523,13 @@ Use "unknown" only if content is too thin to tell.
 """
 
     try:
-        return call_llm(
+        raw = call_llm(
             prompt,
             max_tokens=800 if hiring_first else 600,
             expect_json=True,
-            providers=WEBSITE_PROVIDERS,
+            providers=website_providers(),
         )
+        return _normalize_hiring_payload(raw)
     except Exception as e:
         log.warning("Website hiring check failed for '%s': %s", company_name, e)
         return None

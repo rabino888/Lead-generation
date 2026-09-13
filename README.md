@@ -1,35 +1,51 @@
 # Lead Generation Agent
 
-B2B **lead intelligence pipeline**: curated company seeds → deterministic ICP match → Apollo contact reveal → website + LinkedIn enrichment → keyword scoring → Google Sheets / CSV delivery.
+B2B **lead intelligence pipeline** for operators: turn a client brief into
+contactable decision-maker lists, with clear cost tracking per list.
 
-Built for operators running **geo- and industry-specific campaigns** where every client’s ICP, offer, and seed sources live in campaign config — not in shared code defaults.
+**What it does:** curated company seeds → deterministic ICP match → Apollo email +
+LinkedIn reveal → website/LinkedIn enrichment → keyword scoring → Sheets/CSV delivery.
 
-**Not included:** outreach copy, email sequences, or CRM sync. The agent gathers pitch intelligence (hiring signals, open roles, website content, LinkedIn activity).
+**What it is not:** outreach copy, email sequences, or CRM sync. It gathers pitch
+intelligence (roles, hiring signals, site content, LinkedIn activity).
 
-## Workflow (deterministic only)
+All client/geo/industry specifics live in **local** `data/` (gitignored) — never in
+shared code defaults.
 
-| Step | Tool |
-|------|------|
-| Seeds → ICP → dedup | `scripts/stage_*.py` or `run_deterministic_campaign.py` |
-| Company gate | `icp.json` rules — no LLM prefilter |
-| Contact gate | Apollo email + DM `linkedin_url` |
-| Score | Keyword overlap — no LLM qualify |
-| API | `POST /run` (curated seeds or Apollo CSV) uses the same pipeline |
+## Concepts
 
-Contactable leads require Apollo **personal email** and **decision-maker LinkedIn URL**. No Google-search LinkedIn fallback.
+| Concept | Meaning |
+|---------|---------|
+| **Client** | The company you work for (`tbomedia`, `automata`, …) |
+| **ICP** | Reusable targeting rules (titles, geo, size, industries). One ICP can power many campaigns |
+| **Campaign / generated list** | One funnel run: seeds → stages → delivered leads + cost |
 
-## Local-only (not published)
+Canonical disk layout (see [DATA-LAYOUT.md](DATA-LAYOUT.md)):
 
-These stay on your machine via `.gitignore` — **the pipeline does not read them at runtime**:
+```
+data/clients/{client_id}/
+  icps/{icp_id}/          # library ICP
+  campaigns/{campaign_id}/  # list run (campaign.json → icp_id)
+```
 
-- `data/` — campaigns, stage CSVs, cost logs, run outputs
-- `outputs/`
-- `docs/` — operator playbooks, intake templates, client ICP notes (optional locally)
-- `server*` — local dev server logs/scripts
-- `.env` and Google credentials
+`data/campaigns/{id}/` remains a junction for older scripts.
 
-Use `examples/campaign_template/` as the scaffold; copy to `data/campaigns/{id}/` locally.
-For architecture detail, see root `PROJECT.md`, `REQUIREMENTS.md`, and `ROADMAP.md`.
+## Operator surfaces
+
+| URL | Purpose |
+|-----|---------|
+| `/dashboard` | Cost ledger — clients, executed lists, spend |
+| `/dashboard#/client/{id}` | Client page — generated lists + **Existing ICPs** (from `icps/`) |
+| `/builder?new=1` | Create client / ICP / campaign |
+| `/builder?campaign={id}` | Edit ICP, seeds, enrichment modules |
+
+Serve both locally:
+
+```powershell
+python scripts/serve_cost_dashboard.py --rebuild
+```
+
+Open **http://127.0.0.1:8765/dashboard**.
 
 ## Quick start
 
@@ -39,19 +55,22 @@ For architecture detail, see root `PROJECT.md`, `REQUIREMENTS.md`, and `ROADMAP.
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-pip install -r requirements-dev.txt   # pytest
-cp .env.example .env                  # fill API keys
+pip install -r requirements-dev.txt
+copy .env.example .env   # fill API keys — never commit .env
 ```
 
-### 2. Scaffold a campaign
+### 2. Create a campaign (portal)
 
-Copy `examples/campaign_template/` to `data/campaigns/{your_campaign_id}/` and fill:
+1. Open `/builder?new=1` (or **Build new campaign** on the ledger).
+2. Choose **existing or new client**.
+3. Choose **new ICP** or **use existing ICP** (library under that client).
+4. Name the campaign/list (e.g. `Headhunting US 1-50`).
+5. Optional brief — local heuristics prefill ICP fields (no paid LLM for ICP).
+6. Draft full Automata-depth `icp.json` in Cursor / Claude Code against the campaign
+   folder (skill: `icp-draft`, SOP: [SOP-ICP-PLANNING.md](SOP-ICP-PLANNING.md)).
+7. **Reload ICP from disk** → configure enrichment modules → save plan.
 
-- `icp.json` — industries, geo, size, job titles, `contact_locations`, `website_analysis_mode`
-- `run_payload.json` — `sender` (offer, services, pain points) for scoring
-- `seed_sources.json` — how seeds enter the funnel (CSV ingest, LinkedIn jobs, etc.)
-
-Fill `icp.json` fields per `examples/campaign_template/` and your campaign brief.
+Gold shape: `automata_us_rnd` ICP under `data/clients/automata/`.
 
 ### 3. Run the deterministic funnel
 
@@ -59,79 +78,91 @@ Fill `icp.json` fields per `examples/campaign_template/` and your campaign brief
 python scripts/run_seed_source.py --campaign {campaign_id}
 python scripts/match_campaign_icp.py --campaign {campaign_id}
 python scripts/stage_dedupe.py --campaign {campaign_id}
-python scripts/stage_pre_apollo.py --campaign {campaign_id}
 python scripts/stage_apollo.py --campaign {campaign_id}
 python scripts/stage_enrich.py --campaign {campaign_id}
 python scripts/stage_score.py --campaign {campaign_id}
 python scripts/stage_qa_flags.py --campaign {campaign_id}
 ```
 
-Or orchestrate stages via `scripts/run_deterministic_campaign.py`.
+Or orchestrate with `scripts/run_deterministic_campaign.py` / `POST /run` (curated seeds).
 
-### 4. Run tests
+After a run:
+
+```powershell
+python scripts/build_cost_dashboard.py
+python scripts/serve_cost_dashboard.py
+```
+
+**Generated lists** on the ledger only show campaigns that have been executed
+(stage CSVs and/or cost data). New ICPs appear under the client’s **Existing ICPs**.
+
+### 4. Tests
 
 ```powershell
 python -m pytest tests/ -q
 ```
 
-### 5. Start the API (optional)
+### 5. Main API (optional)
 
 ```powershell
 uvicorn main:app --reload
 ```
 
-`POST /run` accepts a full `RunRequest` body. Production auth is not enabled yet — run locally or behind your own gateway.
+Same `/dashboard` and `/builder` routes are mounted. Production auth on `/run` is
+not enabled yet — local or behind your own gateway only.
 
-## Contactability rules
+## Contactability
 
 A lead is **contactable** only when Apollo returns:
 
-1. A revealed **personal email** (not generic inbox only)
-2. A **decision-maker LinkedIn URL** on the same person (`linkedin_url` from Apollo)
+1. Revealed **personal email**
+2. Decision-maker **LinkedIn URL** (`linkedin_url`)
 
-If Apollo reveals email but no LinkedIn URL, the company is **rejected** at the contacts stage. Set `APOLLO_ALLOW_MISSING_DM_LINKEDIN=1` only for legacy/debug runs.
+Missing LinkedIn → reject (unless `APOLLO_ALLOW_MISSING_DM_LINKEDIN=1` for legacy).
 
-Stage CSV `04_apollo_contactable.csv` is guarded: merges preserve person fields and refuse email-only or missing-LinkedIn rows.
+Company discovery is web/CSV seeded — **do not** use Apollo `mixed_companies/search`
+for seeding (far more expensive than enrichment).
 
 ## Required API keys
 
 | Service | Purpose |
 |---------|---------|
 | Apollo | People search, email reveal, org enrich |
-| Firecrawl | Website map/crawl + careers pages |
-| Apify | LinkedIn company/person/posts (optional jobs) |
-| Anthropic / OpenAI / Gemini | Website LLM analysis (careers/site JSON) |
-| Google (service account) | Sheets output + dedup tabs |
-
-Copy `.env.example` and set keys in `.env` (local) or your host environment (Railway, etc.). **Never commit `.env` or service account JSON.**
+| Firecrawl / Apify | Website crawl (Apify default) |
+| Apify | LinkedIn company / person / posts |
+| Gemini / OpenAI | Website LLM analysis only (`WEBSITE_PROVIDERS`) |
+| Google service account | Sheets + contact dedup tabs |
 
 ## Project layout
 
 ```
 agent/
+  dashboard/        # Ledger + builder UI (FastAPI routes + static)
   integrations/     # Apollo, Firecrawl, Apify, LLM, Sheets
-  stages/           # Pipeline stage implementations
-  utils/            # ICP rules, scoring, cost tracking, gates
-scripts/            # Operator CLIs (stage_*, run_*, diagnostics)
-examples/           # Campaign template (published)
-data/campaigns/     # Per-campaign config + stage CSVs (local, gitignored)
-tests/              # pytest unit tests
+  stages/           # Pipeline stages
+  utils/            # ICP rules, client_store, cost dashboard, scoring
+scripts/            # Stage CLIs, serve/build dashboard, migrate_client_layout
+examples/           # Published campaign template + cost schema samples
+data/               # Local only (gitignored) — clients / ICPs / campaigns
+tests/
 ```
 
-## Documentation (in repo)
+## Documentation
 
 | File | Contents |
 |------|----------|
+| [DATA-LAYOUT.md](DATA-LAYOUT.md) | Client / ICP / campaign folders |
+| [SOP-ICP-PLANNING.md](SOP-ICP-PLANNING.md) | Cursor-first ICP drafting |
 | [PROJECT.md](PROJECT.md) | Architecture, endpoints, env vars |
 | [REQUIREMENTS.md](REQUIREMENTS.md) | Functional requirements |
 | [ROADMAP.md](ROADMAP.md) | Built vs planned |
 | [SECURITY.md](SECURITY.md) | Secrets and reporting |
 
-Optional local `docs/` folder (gitignored) can hold operator playbooks and client ICP notes.
+Optional local `docs/` (gitignored) may hold operator playbooks — not read by the pipeline.
 
 ## Security
 
-See [SECURITY.md](SECURITY.md). Report vulnerabilities privately — do not open public issues for secrets or live client data.
+See [SECURITY.md](SECURITY.md). Never commit `.env`, credentials, or live client `data/`.
 
 ## License
 

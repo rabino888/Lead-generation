@@ -93,12 +93,13 @@ seed_sources.json  →  scrape  →  match_campaign_icp.py  →  dedup + pre_apo
                                                       ▼
                                             06_scored → QA → 07_qa_flags
                                                       │
-                                    optional: phones / cost_dashboard.html
+                                    optional: phones / cost dashboard
 ```
 
 Entry points: `scripts/run_seed_source.py`, `scripts/match_campaign_icp.py`,
 independent `scripts/stage_*.py`, `scripts/run_deterministic_campaign.py`.
-Post-run: `scripts/open_campaign_cost_dashboard.py`.
+Post-run cost: `scripts/build_cost_dashboard.py` → `scripts/serve_cost_dashboard.py`
+(or `GET /dashboard` on `uvicorn main:app`).
 
 ---
 
@@ -106,9 +107,11 @@ Post-run: `scripts/open_campaign_cost_dashboard.py`.
 
 ```
 Lead generation/
-├── main.py                          FastAPI app, all endpoints, admin routes
+├── main.py                          FastAPI app, endpoints, /dashboard routes
 ├── agent/
 │   ├── pipeline.py                  Deterministic orchestrator (curated seeds / Apollo CSV)
+│   ├── dashboard/
+│   │   └── routes.py                HTTP cost dashboard (`/dashboard`, rebuild)
 │   ├── models.py                    All Pydantic models (Lead, RunState, ICP, etc.)
 │   ├── stages/
 │   │   ├── discovery.py             Curated seed import
@@ -118,11 +121,12 @@ Lead generation/
 │   │   └── report.py                CSV + Google Sheets writer
 │   ├── integrations/
 │   │   ├── apollo.py                Apollo REST API (companies + people)
-│   │   ├── firecrawl.py             Firecrawl targeted crawl + scrape
+│   │   ├── firecrawl.py             Website crawl facade (Apify default; Firecrawl optional)
 │   │   ├── apify.py                 Apify Google Maps + LinkedIn post scraping
 │   │   ├── sheets.py                Google Sheets reader/writer + Dedup tab
 │   │   ├── drive.py                 Google Drive folder management
-│   │   └── llm.py                   Gemini/OpenAI for website JSON
+│   │   ├── llm.py                   Website JSON extraction (Gemini → OpenAI)
+│   │   └── llm_models.py            Mid-tier model discovery from provider APIs
 │   ├── webhooks/
 │   │   └── apollo_phone.py          Apollo phone callback storage (optional co-deploy)
 │   └── utils/
@@ -130,8 +134,15 @@ Lead generation/
 │       ├── deduplication.py         Domain-based dedup via Sheets Dedup tab
 │       ├── run_tracker.py           In-memory run state tracker
 │       ├── campaign_config.py       Campaign profile loader (multi-client/geo)
+│       ├── campaign_handoff.py      ICP + sender context for outputs / outreach
+│       ├── cost_dashboard.py        Lead-list dashboard index (all campaigns)
+│       ├── cost_dashboard_html.py   Dashboard HTML renderer
+│       ├── cost_report.py           Schema v4 campaign cost reports
+│       ├── cost_manifest.py         Auto-append cost_runs.json from stage CLIs
 │       └── logger.py                Per-run structured logger
 ├── data/
+│   ├── cost_dashboard.html          Offline single-file export (optional)
+│   ├── cost_dashboard_index.json    Live API payload for GET /dashboard/api
 │   ├── campaigns/{campaign_id}/     Per-campaign config (see below)
 │   └── clients/{client_id}/
 │       ├── runs/                    Run logs (.log), CSVs, summary JSONs
@@ -141,10 +152,18 @@ Lead generation/
 │   ├── build_seed_list.py           Build seeds — requires --campaign
 │   ├── publish_campaign_sheet.py
 │   ├── run_deterministic_campaign.py
+│   ├── build_cost_dashboard.py      Rebuild cost_dashboard_index.json (+ offline HTML)
+│   ├── serve_cost_dashboard.py      Local HTTP server for /dashboard (port 8765)
+│   ├── build_campaign_cost_report.py Per-campaign v4 report or --ledger SPA index
+│   ├── open_campaign_cost_dashboard.py  Build + open campaign report or --ledger
 │   ├── stage_*.py                   Independent stage CLIs
 │   ├── upload_campaign_enriched.py
 │   ├── request_apollo_phone_reveals.py   Async Apollo phone reveal requests
 │   └── import_apollo_phone_webhooks.py   Merge webhook payloads into CSV/sheets
+├── agent/dashboard/
+│   ├── routes.py                    GET /dashboard SPA + API
+│   ├── builder_routes.py            GET /builder create/edit questionnaire
+│   └── static/                      dashboard.html, builder.html, portal.css
 ├── .env                             Local secrets (never committed)
 ├── requirements.txt
 ├── railway.toml
@@ -161,12 +180,12 @@ Lead generation/
 |-------|--------|
 | Framework | FastAPI + uvicorn |
 | Hosting | Railway |
-| Primary LLM | Claude `claude-sonnet-4-5` (Anthropic SDK) |
-| LLM fallbacks | OpenAI `gpt-4o-mini` → Gemini |
+| Primary LLM (website) | Gemini Flash → OpenAI mini (`WEBSITE_PROVIDERS`; auto via `llm_models.py`) |
+| LLM fallbacks (generic `call_llm`) | Claude Sonnet → OpenAI mini → Gemini |
 | Company discovery | Apollo.io REST API v1 |
 | Local/niche discovery | Apify — `compass/crawler-google-places` |
 | Decision-maker post context | Apify LinkedIn posts actor, default `data-slayer/linkedin-profile-posts-scraper` |
-| Website crawling | Firecrawl `/crawl` (targeted) + `/scrape` fallback |
+| Website crawling | Apify `website-content-crawler` (default); Firecrawl optional via `WEBSITE_CRAWLER=firecrawl` |
 | Run client context | Request body `sender` + `icp` |
 | Output storage | Google Drive + local CSV |
 | Run auth | Temporarily disabled for `/run`, `/runs/{id}`, `/feedback` |
@@ -180,6 +199,11 @@ Lead generation/
 | Method | Path | Auth | Description |
 |--------|------|------|-------------|
 | `GET` | `/health` | None | Railway health check |
+| `GET` | `/dashboard` | Optional `DASHBOARD_SECRET` | Lead-list cost dashboard HTML |
+| `GET` | `/dashboard/api` | Optional `DASHBOARD_SECRET` | Dashboard JSON index |
+| `GET` | `/dashboard/campaigns/{id}` | Optional `DASHBOARD_SECRET` | Single lead-list page |
+| `GET` | `/dashboard/clients/{id}` | Optional `DASHBOARD_SECRET` | Single client rollup |
+| `POST` | `/dashboard/rebuild` | Admin secret | Rebuild dashboard HTML from `data/campaigns/` |
 | `POST` | `/run` | None (temporary) | Start a request-driven pipeline run (async) |
 | `GET` | `/runs/{run_id}` | None (temporary) | Poll run status + get results |
 | `POST` | `/feedback` | None (temporary) | Submit lead outcome for feedback loop |
@@ -217,37 +241,35 @@ but it is no longer used to authenticate or load client context for `/run`.
 
 ## Campaign Profiles
 
-Multi-client, multi-geography campaigns are configured per folder — not hard-coded in scripts.
-Intake template: `docs/ICP-INTAKE-TEMPLATE.md`.
+Multi-client campaigns are configured under **clients** — not hard-coded in scripts.
+Canonical layout: [DATA-LAYOUT.md](DATA-LAYOUT.md). Intake: `docs/ICP-INTAKE-TEMPLATE.md`.
 
 ```
-data/campaigns/{campaign_id}/
-├── icp.json                 Deterministic company + person rules (Phase 5, Apollo)
-├── seed_sources.json        Registered scrapers + source URLs (Phase 2–4)
-├── run_payload.json         sender + icp for Apollo/enrichment compatibility
-├── campaign.json            Optional: segments, display names, legacy discovery fields
-├── seeds.csv                Optional working copy; canonical flow uses stages/
-├── stages/                  Funnel artifacts — row counts = run metrics
-│   ├── 01_raw_seeds.csv
-│   ├── 02_icp_matched.csv
-│   ├── 03_deduped.csv
-│   ├── 04_apollo_contactable.csv
-│   ├── 05_enriched.csv
-│   ├── 06_scored.csv
-│   └── 07_qa_delivered.csv
-├── curated_supplement.json  Optional manual additions
-├── campaign_sheet.json      Generated — master Google Sheet metadata
-├── batch_state.json         Generated — per-segment progress
-└── run_report.md            Post-campaign report (from docs/RUN-REPORT-TEMPLATE.md)
+data/clients/{client_id}/
+├── icps/{icp_id}/
+│   ├── meta.json            display_name, brief, campaign_type
+│   └── icp.json             Deterministic targeting (1 ICP → many campaigns)
+└── campaigns/{campaign_id}/
+    ├── campaign.json        client_id, icp_id, display_name, brief
+    ├── icp.json             Snapshot of linked ICP for pipeline tools
+    ├── seed_sources.json    How seeds enter the funnel
+    ├── enrichment_plan.json Module toggles + estimate inputs
+    ├── run_payload.json     Optional sender + icp for Apollo/enrichment
+    ├── stages/              Funnel artifacts — row counts = run metrics
+    │   ├── 01_raw_seeds.csv … 07_qa_flags.csv
+    └── …
 ```
 
-**`icp.json`** — deterministic company gate + person ICP:
+`data/campaigns/{campaign_id}/` may be a **junction** into the client campaign folder
+so stage CLIs keep working. Prefer `/builder` for create/edit.
 
-- `company` — include/exclude keywords, locations, employee range, domain/name exclusions
-- `person` — job titles, secondary titles, `contact_locations`, seniorities
+**`icp.json`** — deterministic company gate + person ICP (library under `icps/`):
 
-**`seed_sources.json`** — ordered list of scrape sources (`curated_csv`, `clutch_directory`,
-`linkedin_jobs`, etc.). **No Apollo company search** on new campaigns.
+- industries / excluded industries, geo, size, keywords, name/domain exclusions
+- `job_titles`, `contact_locations`, `website_analysis_mode`
+
+**`seed_sources.json`** — ordered list of scrape sources (`csv_ingest`, `linkedin_jobs`,
+etc.). **No Apollo company search** on new campaigns.
 
 **`run_payload.json`** — offer context for enrichment and legacy runners:
 
@@ -329,6 +351,8 @@ DRIVE_ROOT_FOLDER_ID=1bTO79a7Co5O7THFji4xPj5LcSXQL2dOF
 
 # Agent
 ADMIN_SECRET=
+DASHBOARD_SECRET=          # Optional: protect GET /dashboard routes
+DASHBOARD_PORT=8765        # serve_cost_dashboard.py default port
 AGENT_ENV=development
 
 # Firecrawl uses max 5 pages per company by default; no run-wide page cap is used.
@@ -346,10 +370,17 @@ attempted in prior Apollo runs before `stage_apollo.py`. Default on in `stage_de
 `icp.json` → `website_analysis_mode: hiring_first` prioritizes careers probe, open roles,
 and keyword-score boost for pitch-driven campaigns (e.g. R&D). Agency campaigns use `full`.
 
-**Cost manifest + Apify truth (2026-08)**
+**Cost manifest + Apify truth (2026-08–09)**
 Paid stage CLIs append `cost_runs.json` via `finalize_stage_cost()`. Prefer `apify_truth_usd`
-from Apify API reconcile over CostTracker alone for PPE actors. Dashboard:
-`open_campaign_cost_dashboard.py`.
+from Apify API reconcile over CostTracker alone for PPE actors. Lead-list dashboard:
+`scripts/build_cost_dashboard.py` writes `data/cost_dashboard_index.json` (+ optional
+`data/cost_dashboard.html` offline export). Live UI is the SPA at
+`agent/dashboard/static/dashboard.html` (overview / client / campaign hash routes) plus
+`/builder` for create/edit. Serve locally: `scripts/serve_cost_dashboard.py`
+(default http://127.0.0.1:8765/dashboard).
+Schema v4 reports: `agent/utils/cost_report.py` — Apollo `credits_consumed`, Firecrawl plan
+credits, Apify per-actor breakdown, `LLM (est)` with provider tag. See
+`examples/campaign_cost_dashboard/SCHEMA.md`.
 
 **DM LinkedIn integrity (2026-08)**
 `write_apollo_contactable_csv` merges by email; Apollo must supply DM LinkedIn URL (no Google backup).

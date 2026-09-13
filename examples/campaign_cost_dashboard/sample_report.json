@@ -1,0 +1,147 @@
+{
+  "schema_version": "4",
+  "campaign_id": "example_campaign",
+  "client_id": "example_client",
+  "client_name": "Example Client",
+  "logged_at": "2026-08-28T12:00:00+00:00",
+  "unit_rates_usd": {
+    "apollo_per_credit": 0.02,
+    "firecrawl_per_page": 0.01,
+    "llm_per_1k_tokens": 0.003
+  },
+  "firecrawl_plan": {
+    "plan_name": "free",
+    "plan_credits": 1000,
+    "usd_per_credit": 0
+  },
+  "campaign_context": {
+    "campaign_id": "example_campaign",
+    "summary": {
+      "client_name": "Example Client",
+      "core_offer": "One-sentence value proposition for the outreach pitch.",
+      "primary_geo": "United States",
+      "industries": ["computer software", "information technology"],
+      "excluded_industries": ["staffing and recruiting"],
+      "company_size_band": "5–200 employees",
+      "job_titles": ["CEO", "Founder", "CTO", "VP Engineering"],
+      "contact_locations": ["United States"],
+      "include_keywords": ["SaaS", "B2B"],
+      "exclude_keywords": ["staffing agency"],
+      "website_analysis_mode": "full",
+      "services": ["Primary service line", "Secondary capability"],
+      "target_pain_points": ["Operational pain the offer solves"]
+    },
+    "paths": {
+      "run_payload_json": "data/campaigns/example_campaign/run_payload.json"
+    }
+  },
+  "funnel_steps": [
+    { "key": "intake", "label": "ICP + seed plan" },
+    { "key": "seeding", "label": "Initial seed scrape (Apify LinkedIn jobs)" },
+    { "key": "apollo_contact", "label": "Apollo email + DM LinkedIn" },
+    { "key": "enrichment", "label": "Firecrawl + Apify LinkedIn + LLM" }
+  ],
+  "by_workflow_step": {
+    "seeding": { "usd": 0.15, "runs": 2 },
+    "apollo_contact": { "usd": 3.2, "runs": 2 },
+    "enrichment": { "usd": 5.35, "runs": 1 }
+  },
+  "by_source": {
+    "apify": {
+      "usd": 3.0,
+      "basis": "apify_api",
+      "is_est": false,
+      "display_label": "Apify"
+    },
+    "apollo": {
+      "usd": 3.2,
+      "basis": "apollo_credits",
+      "credits": 160,
+      "is_est": false,
+      "display_label": "Apollo"
+    },
+    "firecrawl": {
+      "usd": 0.0,
+      "basis": "firecrawl_plan_credits",
+      "credits": 80,
+      "plan_credits": 1000,
+      "is_est": false,
+      "display_label": "Firecrawl"
+    },
+    "llm": {
+      "usd": 0.65,
+      "basis": "llm_flat_rate_est",
+      "tokens": 216000,
+      "providers": { "gemini": 216000 },
+      "is_est": true,
+      "display_label": "LLM (est) — gemini"
+    }
+  },
+  "by_run": [
+    {
+      "run_key": "seed_batch_1",
+      "label": "LinkedIn jobs scrape (batch 1)",
+      "workflow_step": "seeding",
+      "run_date": "2026-08-20",
+      "total_usd": 0.1,
+      "outcome": { "raw_seeds": 50 },
+      "sources": {
+        "apify_linkedin_jobs_seed": {
+          "usd": 0.1,
+          "basis": "apify_api",
+          "display_label": "Apify"
+        }
+      },
+      "apify_breakdown": [
+        { "actor": "curious_coder/linkedin-jobs-scraper", "runs": 1, "usd": 0.1, "statuses": ["SUCCEEDED"] }
+      ]
+    },
+    {
+      "run_key": "apollo_batch_1",
+      "label": "Apollo contact (batch 1)",
+      "workflow_step": "apollo_contact",
+      "run_date": "2026-08-20",
+      "total_usd": 1.6,
+      "outcome": { "contactable": 25, "rejected": 8 },
+      "sources": {
+        "apollo": {
+          "usd": 1.6,
+          "credits": 80,
+          "basis": "apollo_credits",
+          "display_label": "Apollo"
+        }
+      }
+    },
+    {
+      "run_key": "enrich_batch_1",
+      "label": "Firecrawl + Apify enrich (25 leads)",
+      "workflow_step": "enrichment",
+      "run_date": "2026-08-21",
+      "total_usd": 5.35,
+      "outcome": { "leads": 25 },
+      "sources": {
+        "apify_linkedin_company_person": { "usd": 2.9, "basis": "apify_api" },
+        "firecrawl": {
+          "usd": 0.0,
+          "credits": 80,
+          "plan_credits": 1000,
+          "basis": "firecrawl_plan_credits"
+        },
+        "llm": {
+          "usd": 0.65,
+          "tokens": 216000,
+          "providers": { "gemini": 216000 },
+          "primary_provider": "gemini",
+          "basis": "llm_flat_rate_est",
+          "display_label": "LLM (est) — gemini"
+        }
+      }
+    }
+  ],
+  "totals": {
+    "usd_total": 8.65,
+    "per_contactable_usd": 0.346,
+    "contactable_leads": 25
+  },
+  "note": "Template data — replace by running open_campaign_cost_dashboard.py --campaign {id}"
+}

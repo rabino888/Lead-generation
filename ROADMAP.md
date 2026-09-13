@@ -4,10 +4,13 @@
 
 Locked decisions and rationale: **`docs/DECISIONS.md`**. Operator playbook:
 `docs/OPERATOR-WORKFLOW.md`. Automata pass improvements: **`docs/Improvements 24-08.md`**.
+Pre-run list-building control: **`SPEC-dashboard.md`**; MVP at **`GET /builder`**
+(plan save → `enrichment_plan.json`, live $/lead estimate). Post-run cost ledger: `/dashboard`.
+Talent search pipeline: **`SPEC-talent-search.md`** (board live; stages TBD).
 
 | Campaign snapshot | Status |
 |-------------------|--------|
-| **Automata US R&D** (`automata_us_rnd`, 2026-08) | 53 contactable; hiring-first; cost dashboard; pre-Apollo gate |
+| **Automata US R&D** (`automata_us_rnd`, 2026-08) | 53 contactable; hiring-first; HTTP cost dashboard; pre-Apollo gate |
 | **Automata batch2** (2026-07-19) | 50 contactable, full LinkedIn+website enrich, ~$0.13/lead est. |
 | **Allyjob Spain** (2026-07-06) | 52 contactable, 45 phones |
 | Phone webhook | Railway standalone (`apollo-phone-webhook` repo) |
@@ -17,9 +20,13 @@ The funnel uses `icp.json` rules + keyword-overlap scoring only — no LLM compa
 `scripts/run_seed_source.py`, `scripts/match_campaign_icp.py`, independent `stage_*.py` CLIs,
 `scripts/run_deterministic_campaign.py`, and `POST /run` (curated seeds). Stage CSVs under `data/campaigns/{id}/stages/`.
 
+**2026-09 dashboard + billing:** lead-list dashboard (`build_cost_dashboard.py`) over all campaigns;
+cost schema v4 (`agent/utils/cost_report.py`); HTTP via `serve_cost_dashboard.py` or `/dashboard` on
+`main.py`; LLM mid-tier auto-discovery (`llm_models.py`, website = Gemini → OpenAI only).
+
 **2026-08 hardening (`automata_us_rnd`):** pre-Apollo gate; `website_analysis_mode`
 (`hiring_first`); Apollo-only DM LinkedIn gate; `write_apollo_contactable_csv`;
-auto-append `cost_runs.json` + `open_campaign_cost_dashboard.py`; optional LinkedIn jobs
+auto-append `cost_runs.json`; optional LinkedIn jobs
 gated by `smoke_company_jobs_batch.py`; pytest coverage for gates/scoring/cost manifest.
 See `docs/Improvements 24-08.md`.
 
@@ -70,7 +77,7 @@ Used by `POST /run`, `scripts/run_curated_csv.py`, `scripts/run_enrichment_batch
 | Enrich | `stages/05_enriched.csv` | Firecrawl + Apify; `hiring_first` website mode; repair/LinkedIn-only scripts |
 | Keyword score | `stages/06_scored.csv` | `keyword_score.py` (+ hiring boost when configured) |
 | QA flags | `stages/07_qa_flags.csv` | Borderline / location / empty-match flags |
-| Cost dashboard | `cost_dashboard.html` | `open_campaign_cost_dashboard.py` |
+| Cost dashboard | SPA `/dashboard` + `data/cost_dashboard_index.json` | `build_cost_dashboard.py`; serve: `serve_cost_dashboard.py` or FastAPI; create/edit: `/builder` |
 
 Campaign contract: `icp.json` + `seed_sources.json` + `stages/` + `run_payload.json`.
 Intake template: `docs/ICP-INTAKE-TEMPLATE.md`. Example: `data/campaigns/allyjob_spain/`.

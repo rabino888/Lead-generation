@@ -44,21 +44,6 @@ UNSTRUCTURED = Path(r"C:\Users\ravi_\TBO-agents\Leads generation unstructured")
 ENRICH_DIR = UNSTRUCTURED / "Results" / "enrichment"
 PROSPECTS_CSV = UNSTRUCTURED / "Datasets" / "Automata" / "prospects_tbo_automata.csv"
 
-_CHAT_MARKERS = (
-    "intercom",
-    "drift.com",
-    "driftt",
-    "crisp.chat",
-    "tidio",
-    "hubspot conversations",
-    "hs-messages",
-    "zendesk",
-    "livechat",
-    "tawk.to",
-    "chatbot",
-    "chat-widget",
-    "olark",
-)
 _BLOG_RE = re.compile(r"/blog|/insights|/news|/resources|/articles|/press", re.I)
 
 
@@ -113,20 +98,15 @@ def _load_prospects() -> dict[str, dict]:
 
 def _website_from_markdown(md: str | None) -> WebsiteAnalysis:
     text = md or ""
-    low = text.lower()
     has_blog = bool(_BLOG_RE.search(text)) if text else None
-    has_chat = any(m in low for m in _CHAT_MARKERS) if text else None
-    # Prefer first page body as a short stand-in summary
     summary = ""
     if text:
         first = text.split("\n\n---\n\n")[0]
-        # Drop huge nav blocks — keep a readable prefix
         summary = re.sub(r"\s+", " ", first).strip()[:900]
         if len(first) > 900:
             summary += "…"
     return WebsiteAnalysis(
         has_blog=has_blog,
-        has_chatbot=has_chat,
         website_summary=summary or None,
         raw_markdown_length=len(text) if text else None,
     )

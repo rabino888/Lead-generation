@@ -35,6 +35,8 @@ from agent.models import (
     SenderProfile,
 )
 from agent.pipeline import run_pipeline
+from agent.dashboard.routes import router as dashboard_router
+from agent.dashboard.builder_routes import router as builder_router
 from agent.utils.auth import invalidate_cache
 from agent.utils.deduplication import clear_registry, get_seen_count
 from agent.utils.logger import log
@@ -45,6 +47,13 @@ app = FastAPI(
     description="Fully qualified B2B lead generation — Apollo + Firecrawl + Claude",
     version="1.0.0",
 )
+
+app.include_router(dashboard_router)
+app.include_router(builder_router)
+
+from agent.dashboard.static_mount import mount_portal_static
+
+mount_portal_static(app)
 
 
 # ── Health ─────────────────────────────────────────────────────────────────────
@@ -119,6 +128,7 @@ async def start_run(
         input_mode=request.mode,
         max_leads=request.max_leads,
         keyword=request.apollo_csv_path or "curated_seeds",
+        campaign_id=request.campaign_id,
     )
 
     log.info(

@@ -722,44 +722,113 @@ def get_linkedin_company_jobs_batch(
     return results
 
 
-def scrape_website_apify(url: str, max_pages: int = 3) -> Optional[str]:
+def _website_crawler_type() -> str:
+    """cheerio is cheaper; playwright renders JS CTAs better for careers pages."""
+    raw = (os.environ.get("APIFY_WEBSITE_CRAWLER_TYPE") or "cheerio").strip().lower()
+    if raw in ("cheerio", "playwright", "playwright:firefox", "playwright:chrome"):
+        return raw
+    return "cheerio"
+
+
+def scrape_website_apify(
+    url: str,
+    max_pages: int = 3,
+    *,
+    max_depth: Optional[int] = None,
+    crawler_type: Optional[str] = None,
+) -> Optional[str]:
     """
-    Fallback website scrape when Firecrawl returns thin/empty content.
-    Uses Apify website-content-crawler (configurable via APIFY_WEBSITE_SCRAPER_ACTOR).
-  Future: replace with in-house scraper when volume justifies maintenance.
+    Crawl/scrape a website via Apify website-content-crawler
+    (APIFY_WEBSITE_SCRAPER_ACTOR). Primary website path when Firecrawl credits
+    are exhausted; also used as fallback.
     """
-    if not url or not os.environ.get("APIFY_TOKEN"):
+    if not url:
         return None
-    if "://" not in url:
-        url = f"https://{url}"
+    return scrape_website_urls_apify(
+        [url],
+        max_pages=max_pages,
+        max_depth=1 if max_depth is None else max_depth,
+        crawler_type=crawler_type,
+    )
+
+
+def scrape_website_urls_apify(
+    urls: list[str],
+    *,
+    max_pages: int = 8,
+    max_depth: int = 0,
+    crawler_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Scrape one or more start URLs in a single Apify actor run.
+    max_depth=0 keeps the crawl on the start URLs only (map-selected pages).
+    """
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for raw in urls:
+        u = (raw or "").strip()
+        if not u:
+            continue
+        if "://" not in u:
+            u = f"https://{u}"
+        key = u.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        cleaned.append(u)
+    if not cleaned or not os.environ.get("APIFY_TOKEN"):
+        return None
+
     actor_id = os.environ.get(
         "APIFY_WEBSITE_SCRAPER_ACTOR",
         "apify/website-content-crawler",
     )
+    limit = max(1, min(int(max_pages), 12))
+    depth = max(0, min(int(max_depth), 3))
+    ctype = crawler_type or _website_crawler_type()
     client = _get_client()
     try:
         run_input = {
-            "startUrls": [{"url": url}],
-            "maxCrawlPages": max(1, min(max_pages, 10)),
-            "maxCrawlDepth": 1,
-            "crawlerType": "cheerio",
+            "startUrls": [{"url": u} for u in cleaned],
+            "maxCrawlPages": limit,
+            "maxCrawlDepth": depth,
+            "crawlerType": ctype,
         }
-        log.info("Apify website fallback (%s): %s", actor_id, url)
+        log.info(
+            "Apify website crawl (%s, depth=%d, type=%s): %d start URL(s)",
+            actor_id,
+            depth,
+            ctype,
+            len(cleaned),
+        )
         run = client.actor(actor_id).call(run_input=run_input)
         _record_apify_run(run)
         items = _actor_dataset_items(client, run)
         sections: list[str] = []
-        for item in items[:max_pages]:
-            md = (item.get("markdown") or item.get("text") or item.get("content") or "").strip()
-            page_url = item.get("url") or item.get("metadata", {}).get("url") or url
+        for item in items[:limit]:
+            md = (
+                item.get("markdown")
+                or item.get("text")
+                or item.get("content")
+                or ""
+            ).strip()
+            page_url = (
+                item.get("url")
+                or (item.get("metadata") or {}).get("url")
+                or cleaned[0]
+            )
             if md:
                 sections.append(f"### [{page_url}]\n{md}")
         combined = "\n\n---\n\n".join(sections)
         if combined:
-            log.info("Apify website fallback: %d sections from %s", len(sections), url)
+            log.info(
+                "Apify website crawl: %d sections (from %d starts)",
+                len(sections),
+                len(cleaned),
+            )
             return combined
     except Exception as e:
-        log.warning("Apify website fallback failed for %s: %s", url, e)
+        log.warning("Apify website crawl failed for %s: %s", cleaned[0], e)
     return None
 
 

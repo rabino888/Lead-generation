@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <title>Cost — example_campaign</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 2rem; color: #111; }
+    table { border-collapse: collapse; width: 100%; margin: 1rem 0 2rem; }
+    th, td { border: 1px solid #ddd; padding: 0.5rem 0.75rem; text-align: left; }
+    th { background: #f4f4f5; }
+    .num { text-align: right; font-variant-numeric: tabular-nums; }
+    h1 { margin-bottom: 0.25rem; }
+    .meta { color: #555; margin-bottom: 1.5rem; }
+    code { font-size: 0.85em; }
+  </style>
+</head>
+<body>
+  <h1>Cost log — example_campaign</h1>
+  <p class="meta">Logged 2026-08-28T12:00:00+00:00 ·
+    25 contactable ·
+    total ~$8.65
+    ($5.65 billed + $3.00 est)</p>
+
+  
+  <h2>Campaign ICP (Step 1 intake)</h2>
+  <table>
+    <tbody>
+        <tr>
+          <th>Campaign</th>
+          <td>example_campaign</td>
+        </tr>
+        <tr>
+          <th>Client</th>
+          <td>Example Client</td>
+        </tr>
+        <tr>
+          <th>Core offer</th>
+          <td>One-sentence value proposition for the outreach pitch.</td>
+        </tr>
+        <tr>
+          <th>Primary geo</th>
+          <td>United States</td>
+        </tr>
+        <tr>
+          <th>Company size</th>
+          <td>5–200 employees</td>
+        </tr>
+        <tr>
+          <th>Industries</th>
+          <td>computer software, information technology</td>
+        </tr>
+        <tr>
+          <th>Excluded industries</th>
+          <td>staffing and recruiting</td>
+        </tr>
+        <tr>
+          <th>Job titles</th>
+          <td>CEO, Founder, CTO, VP Engineering</td>
+        </tr>
+        <tr>
+          <th>Contact locations (DM)</th>
+          <td>United States</td>
+        </tr>
+        <tr>
+          <th>Include keywords</th>
+          <td>SaaS, B2B</td>
+        </tr>
+        <tr>
+          <th>Exclude keywords</th>
+          <td>staffing agency</td>
+        </tr>
+        <tr>
+          <th>Website mode</th>
+          <td>full</td>
+        </tr>
+        <tr>
+          <th>Services</th>
+          <td>Primary service line, Secondary capability</td>
+        </tr>
+        <tr>
+          <th>Target pain points</th>
+          <td>Operational pain the offer solves</td>
+        </tr></tbody>
+  </table>
+  <p class="meta">Outreach handoff: pass <code>--csv</code> + <code>--payload data/campaigns/example_campaign/run_payload.json</code></p>
+
+
+  <h2>By workflow step</h2>
+  <table>
+    <thead><tr><th>Step</th><th>Billed</th><th>Estimated</th><th>Total</th></tr></thead>
+    <tbody>
+        <tr>
+          <td>Seeding</td>
+          <td class="num">$0.1500</td>
+          <td class="num">$0.0000</td>
+          <td class="num"><strong>$0.1500</strong></td>
+        </tr>
+        <tr>
+          <td>Apollo contact</td>
+          <td class="num">$1.2000</td>
+          <td class="num">$2.0000</td>
+          <td class="num"><strong>$3.2000</strong></td>
+        </tr>
+        <tr>
+          <td>Enrichment</td>
+          <td class="num">$4.5000</td>
+          <td class="num">$1.0000</td>
+          <td class="num"><strong>$5.5000</strong></td>
+        </tr></tbody>
+  </table>
+
+  <h2>By source</h2>
+  <table>
+    <thead><tr><th>Source</th><th>Billed</th><th>Estimated</th><th>Total</th></tr></thead>
+    <tbody>
+        <tr>
+          <td>apify</td>
+          <td class="num">$3.0000</td>
+          <td class="num">$0.0000</td>
+          <td class="num"><strong>$3.0000</strong></td>
+        </tr>
+        <tr>
+          <td>apollo</td>
+          <td class="num">$1.2000</td>
+          <td class="num">$2.0000</td>
+          <td class="num"><strong>$3.2000</strong></td>
+        </tr>
+        <tr>
+          <td>firecrawl</td>
+          <td class="num">$0.0000</td>
+          <td class="num">$0.8000</td>
+          <td class="num"><strong>$0.8000</strong></td>
+        </tr>
+        <tr>
+          <td>llm</td>
+          <td class="num">$0.0000</td>
+          <td class="num">$0.6500</td>
+          <td class="num"><strong>$0.6500</strong></td>
+        </tr></tbody>
+  </table>
+
+  <h2>By run</h2>
+  <table>
+    <thead><tr><th>Run</th><th>Step</th><th>USD</th><th>Sources</th><th>Outcome</th></tr></thead>
+    <tbody>
+        <tr>
+          <td>LinkedIn jobs scrape (batch 1)<br><code>seed_batch_1</code></td>
+          <td>seeding</td>
+          <td class="num">$0.1000</td>
+          <td>apify_linkedin_jobs_seed=$0.100</td>
+          <td>raw_seeds=50</td>
+        </tr>
+        <tr>
+          <td>Apollo contact (batch 1)<br><code>apollo_batch_1</code></td>
+          <td>apollo_contact</td>
+          <td class="num">$1.6000</td>
+          <td>apollo_org_enrich=$0.900, apollo_email_reveal=$0.700</td>
+          <td>contactable=25, rejected=8</td>
+        </tr>
+        <tr>
+          <td>Firecrawl + Apify enrich (25 leads)<br><code>enrich_batch_1</code></td>
+          <td>enrichment</td>
+          <td class="num">$5.5000</td>
+          <td>apify_linkedin_company_person=$2.900, firecrawl=$0.800, llm=$0.650</td>
+          <td>leads=25</td>
+        </tr></tbody>
+  </table>
+  <p class="meta">Template data — replace by running open_campaign_cost_dashboard.py --campaign {id}</p>
+  
+  <h2>Deterministic funnel (operator workflow)</h2>
+  <ol><li><code>intake</code> — ICP + seed plan</li><li><code>seeding</code> — Initial seed scrape</li><li><code>icp_match</code> — ICP match (rules)</li><li><code>dedupe</code> — De-duplication</li><li><code>pre_apollo</code> — Pre-Apollo gate</li><li><code>apollo_contact</code> — Apollo email + DM LinkedIn</li><li><code>enrichment</code> — Firecrawl + Apify LinkedIn + LLM</li><li><code>keyword_score</code> — Keyword score</li><li><code>qa</code> — Human QA gate</li><li><code>phone_reveal</code> — Apollo phone reveal (optional)</li></ol>
+  <p class="meta">Company LinkedIn open jobs are <strong>optional</strong> (APIFY_SKIP_LINKEDIN_JOBS=1 default).</p>
+  <h2>Spend by workflow step (this campaign)</h2>
+  <table>
+    <thead><tr><th>Step</th><th>USD</th></tr></thead>
+    <tbody><tr><td>seeding</td><td class='num'>$0.1500</td></tr><tr><td>apollo_contact</td><td class='num'>$3.2000</td></tr><tr><td>enrichment</td><td class='num'>$5.5000</td></tr></tbody>
+  </table>
+
+</body>
+</html>

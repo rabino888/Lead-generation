@@ -77,7 +77,9 @@ def main() -> int:
     leads = [lead_from_row(r, run_id=run_id, client_id=client.client_id) for r in rows]
 
     leads = contacts.enrich_linkedin_for_leads(leads, client, run_id, log)
-    analyses = website.run(leads, client, run_id, log)
+    analyses = website.run(
+        leads, client, run_id, log, campaign_dir=campaign.campaign_dir
+    )
     for lead in leads:
         lead.website_analysis = analyses.get(lead.company_name) or lead.website_analysis
 

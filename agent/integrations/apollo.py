@@ -325,6 +325,7 @@ def _search_contact_candidates(
         log.error("Apollo contact search failed for %s: %s", company_name, e)
         return []
 
+    _record_apollo_credits(data)
     people = data.get("people", []) or []
     log.info(
         "Apollo: %d contact candidates for %s (total_entries=%s)",

@@ -22,6 +22,8 @@ We will acknowledge within a few business days and coordinate a fix before publi
 - `data/` contains campaign seeds, enriched leads, and cost logs. It is **gitignored** by design.
 - Google service account JSON must not be committed. Use `GOOGLE_SERVICE_ACCOUNT` as a single-line env var (see `.env.example`).
 - The FastAPI `/run` endpoint is **not authenticated** in the current codebase. Do not expose it publicly without adding auth and network controls.
+- **`/dashboard`** routes are open unless `DASHBOARD_SECRET` is set (then use query `?key=` or header `X-Dashboard-Secret`). Dashboard HTML may contain client ICP and spend — treat like operator data.
+- **`POST /dashboard/rebuild`** requires `X-Admin-Secret` (same as other admin routes).
 
 ## Third-party services
 

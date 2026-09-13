@@ -17,6 +17,7 @@ from google.oauth2.service_account import Credentials
 
 from agent.models import ClientProfile, ICPProfile, Lead, EnrichmentStatus
 from agent.utils.logger import log
+from agent.utils.website_outreach import WEBSITE_CSV_FIELDS, website_csv_row
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -295,10 +296,7 @@ def write_leads_to_sheet(
         "company_phone", "company_generic_email",
         "intent_topics", "intent_strength", "technologies_used",
         "funding_round", "hiring_signals",
-        "website_is_hiring", "website_hiring_signals", "website_open_roles", "website_careers_url",
-        "tech_stack", "services_offered", "content_quality_score",
-        "seo_health", "has_chatbot", "has_blog", "last_blog_post",
-        "social_proof", "website_summary",
+        *WEBSITE_CSV_FIELDS,
         "icp_match_score", "lead_score", "pain_points", "pain_point_evidence",
         "opportunities", "qualification_notes",
         "enrichment_cost_usd",
@@ -370,10 +368,7 @@ def replace_leads_on_sheet(
         "company_phone", "company_generic_email",
         "intent_topics", "intent_strength", "technologies_used",
         "funding_round", "hiring_signals",
-        "website_is_hiring", "website_hiring_signals", "website_open_roles", "website_careers_url",
-        "tech_stack", "services_offered", "content_quality_score",
-        "seo_health", "has_chatbot", "has_blog", "last_blog_post",
-        "social_proof", "website_summary",
+        *WEBSITE_CSV_FIELDS,
         "icp_match_score", "lead_score", "pain_points", "pain_point_evidence",
         "opportunities", "qualification_notes",
         "enrichment_cost_usd",
@@ -441,19 +436,7 @@ def _lead_to_row(lead: Lead) -> list:
         ", ".join(sig.technologies_used),
         sig.funding_round or "",
         ", ".join(sig.hiring_signals),
-        _attr(wa, "website_is_hiring"),
-        ", ".join(_attr(wa, "website_hiring_signals", [])),
-        ", ".join(_attr(wa, "website_open_roles", [])),
-        _attr(wa, "website_careers_url"),
-        ", ".join(_attr(wa, "tech_stack_detected", [])),
-        ", ".join(_attr(wa, "services_offered", [])),
-        _attr(wa, "content_quality_score"),
-        ", ".join(_attr(wa, "seo_health", [])),
-        _attr(wa, "has_chatbot"),
-        _attr(wa, "has_blog"),
-        _attr(wa, "last_blog_post_date"),
-        _attr(wa, "social_proof"),
-        _attr(wa, "website_summary"),
+        *website_csv_row(wa),
         lead.icp_match_score or "",
         lead.lead_score or "",
         ", ".join(lead.pain_points),

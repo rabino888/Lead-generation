@@ -21,12 +21,14 @@ def create_run(
     input_mode: InputMode,
     max_leads: int,
     keyword: Optional[str] = None,
+    campaign_id: Optional[str] = None,
 ) -> RunState:
     """Create a new run, register it, and return the RunState."""
     run_id = f"run_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}"
     state = RunState(
         run_id=run_id,
         client_id=client_id,
+        campaign_id=campaign_id,
         status=RunStatus.PENDING,
         input_mode=input_mode,
         keyword=keyword,

@@ -157,7 +157,7 @@ Shared loader: `agent/utils/campaign_config.py`.
 - LLM calls must use batch processing where possible to reduce total API calls
 
 ### TR-2: Reliability
-- Every LLM call must have a fallback chain: Claude → OpenAI → Gemini
+- Website-stage LLM: Gemini Flash → OpenAI mini with API-driven model discovery (`llm_models.py`). Generic `call_llm()` fallback chain: Claude → OpenAI → Gemini (legacy stages only).
 - Every integration failure must be caught, logged, and treated as partial enrichment (not a crash)
 - Pipeline failures must be recorded in run state with a clear error message
 
@@ -176,6 +176,7 @@ Shared loader: `agent/utils/campaign_config.py`.
 ### TR-5: Security
 - All secrets via environment variables, never hardcoded
 - Admin endpoints protected by a separate `X-Admin-Secret` header
+- `/dashboard` optionally protected by `DASHBOARD_SECRET` (`?key=` or `X-Dashboard-Secret`)
 - `/run`, `/runs/{run_id}`, and `/feedback` are temporarily unauthenticated for request-driven local operation
 - Before external production use, reintroduce auth around request-driven client identity
 

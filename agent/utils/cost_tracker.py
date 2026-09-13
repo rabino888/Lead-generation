@@ -202,13 +202,23 @@ class CostTracker:
         "Per-lead costs are now attributed to the lead that incurred them (thread-local).",
         "If Apify dominates, set APIFY_SKIP_PERSON_PROFILE=1 (profile scraper is ~$0.25/lead).",
         "Verify APIFY_LINKEDIN_POSTS_ACTOR=harvestapi/linkedin-profile-posts (data-slayer ignores maxItems).",
-        "Check FIRECRAWL page cap (default 5 pages per company).",
+        "Check FIRECRAWL page cap (FIRECRAWL_MAX_PAGES, default 8 outreach pages per company).",
         "Raise LEAD_COST_CAP_USD if the enrichment depth is intentional.",
       ],
     }
 
   def run_summary(self) -> dict[str, Any]:
     totals = dict(self._run_breakdown)
+    try:
+        from agent.integrations.llm import get_llm_usage_summary
+
+        llm = get_llm_usage_summary()
+        totals["llm_tokens"] = llm.get("tokens") or totals.get("llm_tokens")
+        totals["llm_providers"] = llm.get("providers") or {}
+        totals["llm_primary_provider"] = llm.get("primary_provider")
+    except Exception:
+        pass
+    totals["firecrawl_credits"] = totals.get("firecrawl_pages")
     totals["total_usd"] = _breakdown_total(totals)
     return {
       "cap_usd": self.lead_cap_usd,

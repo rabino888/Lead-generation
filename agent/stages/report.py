@@ -13,7 +13,9 @@ from typing import Optional
 
 from agent.integrations.sheets import write_leads_to_sheet
 from agent.models import ClientProfile, Lead, RunState
+from agent.utils.campaign_handoff import build_outreach_handoff, write_outreach_handoff
 from agent.utils.logger import get_run_logger
+from agent.utils.website_outreach import WEBSITE_CSV_FIELDS, website_analysis_to_csv
 
 
 def run(
@@ -40,8 +42,9 @@ def run(
         sheet_name = f"{date_str} — {keyword}"
 
     csv_path = _write_csv(
-        qualified_leads, partial_leads, client_profile, run_state.run_id, log
+        qualified_leads, partial_leads, client_profile, run_state, log
     )
+    _write_outreach_handoff(csv_path, client_profile, run_state, log)
 
     sheet_url = None
     folder_url = None
@@ -75,15 +78,17 @@ def _write_csv(
     qualified: list[Lead],
     partial: list[Lead],
     client_profile: ClientProfile,
-    run_id: str,
+    run_state: RunState,
     log: logging.Logger,
 ) -> str:
     """Write leads to CSV. Only contactable leads are delivered by default."""
+    run_id = run_state.run_id
     output_dir = Path("data") / "clients" / client_profile.client_id / "runs"
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = str(output_dir / f"{run_id}.csv")
 
     fieldnames = [
+        "campaign_id", "run_id",
         "lead_id", "company_name", "website", "industry", "location",
         "company_size", "founded_year", "company_linkedin",
         "decision_maker_apollo_person_id",
@@ -97,10 +102,7 @@ def _write_csv(
         "company_phone", "company_generic_email",
         "intent_topics", "intent_strength", "technologies_used",
         "funding_round", "hiring_signals",
-        "website_is_hiring", "website_hiring_signals", "website_open_roles", "website_careers_url",
-        "tech_stack", "services_offered", "content_quality_score",
-        "seo_health", "has_chatbot", "has_blog", "last_blog_post",
-        "social_proof", "website_summary",
+        *WEBSITE_CSV_FIELDS,
         "icp_match_score", "lead_score", "score_method", "matched_terms", "score_evidence",
         "pain_points", "pain_point_evidence",
         "opportunities", "qualification_notes",
@@ -113,6 +115,8 @@ def _write_csv(
         wa = lead.website_analysis
         sig = lead.apollo_signals
         return {
+            "campaign_id": run_state.campaign_id or "",
+            "run_id": run_id,
             "lead_id": lead.lead_id,
             "company_name": lead.company_name,
             "website": lead.website or "",
@@ -146,19 +150,7 @@ def _write_csv(
             "technologies_used": "; ".join(sig.technologies_used),
             "funding_round": sig.funding_round or "",
             "hiring_signals": "; ".join(sig.hiring_signals),
-            "website_is_hiring": wa.website_is_hiring if wa else "",
-            "website_hiring_signals": "; ".join(wa.website_hiring_signals if wa else []),
-            "website_open_roles": "; ".join(wa.website_open_roles if wa else []),
-            "website_careers_url": wa.website_careers_url if wa else "",
-            "tech_stack": "; ".join(wa.tech_stack_detected if wa else []),
-            "services_offered": "; ".join(wa.services_offered if wa else []),
-            "content_quality_score": wa.content_quality_score if wa else "",
-            "seo_health": "; ".join(wa.seo_health if wa else []),
-            "has_chatbot": wa.has_chatbot if wa else "",
-            "has_blog": wa.has_blog if wa else "",
-            "last_blog_post": wa.last_blog_post_date if wa else "",
-            "social_proof": wa.social_proof if wa else "",
-            "website_summary": wa.website_summary if wa else "",
+            **website_analysis_to_csv(wa),
             "icp_match_score": lead.icp_match_score or "",
             "lead_score": lead.lead_score or "",
             "score_method": lead.score_method or "",
@@ -187,3 +179,24 @@ def _write_csv(
 
     log.info("CSV written: %s (%d rows)", csv_path, len(qualified) + len(partial))
     return csv_path
+
+
+def _write_outreach_handoff(
+    csv_path: str,
+    client_profile: ClientProfile,
+    run_state: RunState,
+    log: logging.Logger,
+) -> None:
+    """Write JSON handoff for outreach-content-agent (ICP + sender + CSV path)."""
+    sender = client_profile.sender.model_dump(mode="json")
+    icp_runtime = client_profile.icp.model_dump(mode="json")
+    handoff = build_outreach_handoff(
+        campaign_id=run_state.campaign_id,
+        run_id=run_state.run_id,
+        csv_path=csv_path,
+        sender=sender,
+        icp_runtime=icp_runtime,
+    )
+    handoff_path = Path(csv_path).with_name(f"{run_state.run_id}_handoff.json")
+    write_outreach_handoff(handoff_path, handoff)
+    log.info("Outreach handoff written: %s", handoff_path)

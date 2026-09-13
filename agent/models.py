@@ -63,7 +63,7 @@ class ICPProfile(BaseModel):
     keywords: list[str] = Field(default_factory=list)
     excluded_keywords: list[str] = Field(default_factory=list)
     prefilter_threshold: int = Field(default=40, ge=0, le=100)
-    # Website enrich: "full" = tech/SEO/blog + hiring; "hiring_first" = careers + open roles primary.
+    # Website enrich: "full" = outreach fields; "hiring_first" = same crawl, hiring-weighted score.
     website_analysis_mode: str = "full"
 
 
@@ -121,6 +121,8 @@ class RunRequest(BaseModel):
 
     max_leads: int = Field(default=50, ge=1, le=500)
     output_sheet_name: Optional[str] = None
+    # Links run to data/campaigns/{campaign_id}/ for ICP handoff + cost dashboard
+    campaign_id: Optional[str] = None
 
 
 # ── Raw Company (post-discovery, pre-enrichment) ──────────────────────────────
@@ -154,20 +156,30 @@ class RawCompany(BaseModel):
 
 # ── Website Analysis ──────────────────────────────────────────────────────────
 
+class BlogPost(BaseModel):
+    """One recent blog/news item extracted from the company site."""
+    title: str
+    published_at: Optional[str] = None
+    description: Optional[str] = None
+    url: Optional[str] = None
+
+
 class WebsiteAnalysis(BaseModel):
-    """Output of website enrichment — Firecrawl crawl + LLM JSON mapped to these fields."""
-    tech_stack_detected: list[str] = Field(default_factory=list)
+    """Outreach-oriented website enrichment (Firecrawl + LLM)."""
     services_offered: list[str] = Field(default_factory=list)
-    content_quality_score: Optional[int] = Field(default=None, ge=1, le=10)
-    seo_health: list[str] = Field(default_factory=list)
-    has_chatbot: Optional[bool] = None
+    about_summary: Optional[str] = None
     has_blog: Optional[bool] = None
-    last_blog_post_date: Optional[str] = None
-    social_proof: Optional[bool] = None
+    blog_url: Optional[str] = None
+    news_url: Optional[str] = None
+    blog_posts: list[BlogPost] = Field(default_factory=list)
+    social_facebook: Optional[str] = None
+    social_instagram: Optional[str] = None
+    social_tiktok: Optional[str] = None
+    social_x: Optional[str] = None
+    decision_maker_mentions: list[str] = Field(default_factory=list)
     website_summary: Optional[str] = None
     raw_markdown_length: Optional[int] = None
-    website_is_hiring: Optional[str] = None  # yes | no | None
-    website_hiring_signals: list[str] = Field(default_factory=list)
+    website_is_hiring: Optional[str] = None  # yes | no | unknown | None
     website_open_roles: list[str] = Field(default_factory=list)
     website_careers_url: Optional[str] = None
 
@@ -258,6 +270,7 @@ class RunState(BaseModel):
     """Tracked in memory + persisted to JSON on completion."""
     run_id: str
     client_id: str
+    campaign_id: Optional[str] = None
     status: RunStatus = RunStatus.PENDING
     input_mode: InputMode
     keyword: Optional[str] = None

@@ -177,6 +177,7 @@ def main() -> int:
         sender=sender,
         icp=icp,
         company_seeds=seeds,
+        campaign_id=campaign.campaign_id,
         output_sheet_name=args.sheet_name
         or f"{sender.name} — {datetime.now(UTC).strftime('%Y-%m-%d %H:%M')}",
     )
@@ -186,6 +187,7 @@ def main() -> int:
         input_mode=InputMode.CURATED_SEEDS,
         max_leads=max_leads,
         keyword=f"deterministic:{campaign.campaign_id}",
+        campaign_id=campaign.campaign_id,
     )
     print(
         f"Starting deterministic run {run_state.run_id} — {len(seeds)} seeds, "

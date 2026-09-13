@@ -45,7 +45,7 @@ def _sample_lead(**overrides) -> Lead:
                 "We operate Spain hubs with seasonal hiring spikes and focus on "
                 "talent acquisition for relocation-ready multilingual teams."
             ),
-            website_hiring_signals=["Hiring Nordic speakers in Málaga"],
+            website_open_roles=["Hiring Nordic speakers in Málaga"],
         ),
         decision_maker=Contact(
             name="Jane Doe",
@@ -106,7 +106,6 @@ def test_compute_keyword_score_hiring_first_boosts_open_roles():
                 "Multilingual customer support agent",
                 "Nordic language contact center lead",
             ],
-            website_hiring_signals=["Hiring Nordic speakers in Málaga"],
         ),
     )
     baseline = compute_keyword_score(lead, _sample_sender(), hiring_first=False)

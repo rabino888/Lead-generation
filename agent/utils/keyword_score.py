@@ -69,7 +69,6 @@ def extract_hiring_corpus(lead: Lead | Mapping[str, Any]) -> str:
     parts: list[str] = []
     if isinstance(lead, Mapping):
         for key in (
-            "website_hiring_signals",
             "website_open_roles",
             "company_open_jobs_summary",
             "company_is_hiring",
@@ -82,7 +81,6 @@ def extract_hiring_corpus(lead: Lead | Mapping[str, Any]) -> str:
 
     wa = lead.website_analysis
     if wa:
-        parts.extend(wa.website_hiring_signals or [])
         parts.extend(wa.website_open_roles or [])
         if wa.website_is_hiring:
             parts.append(str(wa.website_is_hiring))
@@ -119,11 +117,11 @@ def extract_lead_corpus(lead: Lead | Mapping[str, Any]) -> str:
         for key in (
             "company_description",
             "website_summary",
+            "about_summary",
             "linkedin_about",
             "linkedin_headline",
             "linkedin_post_summary",
             "company_linkedin_description",
-            "website_hiring_signals",
             "website_open_roles",
             "company_open_jobs_summary",
         ):
@@ -140,9 +138,15 @@ def extract_lead_corpus(lead: Lead | Mapping[str, Any]) -> str:
         wa = lead.website_analysis
         if wa.website_summary:
             parts.append(wa.website_summary)
+        if wa.about_summary:
+            parts.append(wa.about_summary)
         parts.extend(wa.services_offered or [])
-        parts.extend(wa.website_hiring_signals or [])
         parts.extend(wa.website_open_roles or [])
+        parts.extend(wa.decision_maker_mentions or [])
+        for post in wa.blog_posts or []:
+            parts.append(post.title or "")
+            if post.description:
+                parts.append(post.description)
     if lead.company_linkedin_description:
         parts.append(lead.company_linkedin_description)
     if lead.company_open_jobs_summary:

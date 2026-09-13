@@ -10,27 +10,14 @@ from agent.models import (
     EnrichmentStatus,
     InputMode,
     Lead,
-    WebsiteAnalysis,
 )
+from agent.utils.website_outreach import website_analysis_from_csv
 
 
 def _split(value: Any) -> list[str]:
     if not value:
         return []
     return [p.strip() for p in str(value).split(";") if p.strip()]
-
-
-def _parse_bool(value: Any) -> Optional[bool]:
-    if value is None or value == "":
-        return None
-    if isinstance(value, bool):
-        return value
-    s = str(value).strip().lower()
-    if s in ("true", "1", "yes"):
-        return True
-    if s in ("false", "0", "no"):
-        return False
-    return None
 
 
 def _parse_int(value: Any) -> Optional[int]:
@@ -64,35 +51,7 @@ def lead_from_row(row: dict[str, Any], *, run_id: str, client_id: str) -> Lead:
             is_hiring=(row.get("decision_maker_is_hiring") or "").strip() or None,
         )
 
-    has_wa = any(
-        (row.get(k) or "").strip()
-        for k in (
-            "website_summary",
-            "has_blog",
-            "has_chatbot",
-            "tech_stack",
-            "services_offered",
-            "seo_health",
-            "website_careers_url",
-        )
-    )
-    wa = None
-    if has_wa:
-        wa = WebsiteAnalysis(
-            tech_stack_detected=_split(row.get("tech_stack")),
-            services_offered=_split(row.get("services_offered")),
-            content_quality_score=_parse_int(row.get("content_quality_score")),
-            seo_health=_split(row.get("seo_health")),
-            has_chatbot=_parse_bool(row.get("has_chatbot")),
-            has_blog=_parse_bool(row.get("has_blog")),
-            last_blog_post_date=(row.get("last_blog_post") or "").strip() or None,
-            social_proof=_parse_bool(row.get("social_proof")),
-            website_summary=(row.get("website_summary") or "").strip() or None,
-            website_is_hiring=(row.get("website_is_hiring") or "").strip() or None,
-            website_hiring_signals=_split(row.get("website_hiring_signals")),
-            website_open_roles=_split(row.get("website_open_roles")),
-            website_careers_url=(row.get("website_careers_url") or "").strip() or None,
-        )
+    wa = website_analysis_from_csv(row)
 
     lead_id = (row.get("lead_id") or "").strip() or f"lead_rebuild_{(row.get('company_name') or 'x')[:20]}"
     company_linkedin = (

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from agent.models import Lead
 from agent.utils.campaign_config import CampaignConfig
 from agent.utils.icp_rules import ensure_stages_dir, stage_path
+from agent.utils.website_outreach import website_analysis_to_csv
 
 
 def _root_domain(url: str) -> str:
@@ -110,21 +111,7 @@ def lead_to_stage_row(lead: Lead) -> dict[str, Any]:
         "decision_maker_linkedin_about": (dm.linkedin_about if dm else "") or "",
         "decision_maker_linkedin_headline": (dm.linkedin_headline if dm else "") or "",
         "decision_maker_is_hiring": (dm.is_hiring if dm else "") or "",
-        "website_is_hiring": (wa.website_is_hiring if wa else "") or "",
-        "website_hiring_signals": _join(wa.website_hiring_signals if wa else None),
-        "website_open_roles": _join(wa.website_open_roles if wa else None),
-        "website_careers_url": (wa.website_careers_url if wa else "") or "",
-        "tech_stack": _join(wa.tech_stack_detected if wa else None),
-        "services_offered": _join(wa.services_offered if wa else None),
-        "content_quality_score": (
-            wa.content_quality_score if wa and wa.content_quality_score is not None else ""
-        ),
-        "seo_health": _join(wa.seo_health if wa else None),
-        "has_chatbot": "" if not wa or wa.has_chatbot is None else wa.has_chatbot,
-        "has_blog": "" if not wa or wa.has_blog is None else wa.has_blog,
-        "last_blog_post": (wa.last_blog_post_date if wa else "") or "",
-        "social_proof": "" if not wa or wa.social_proof is None else wa.social_proof,
-        "website_summary": (wa.website_summary if wa else "") or "",
+        **website_analysis_to_csv(wa),
         "icp_match_score": lead.icp_match_score if lead.icp_match_score is not None else "",
         "lead_score": lead.lead_score if lead.lead_score is not None else "",
         "score_method": lead.score_method or "",
