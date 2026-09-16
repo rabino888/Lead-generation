@@ -102,8 +102,15 @@ async def dashboard_home(_: None = Depends(_check_dashboard_access)):
 
 
 @router.get("/api")
-async def dashboard_api(_: None = Depends(_check_dashboard_access)):
+async def dashboard_api(
+    refresh: int = Query(0),
+    _: None = Depends(_check_dashboard_access),
+):
     path = _dashboard_index()
+    # Rebuild only when missing or explicitly requested (?refresh=1).
+    # Do not rebuild on every page load — that leaves the SPA blank for many seconds.
+    if (not path.is_file()) or refresh:
+        rebuild_dashboard_files(_data_root())
     if not path.is_file():
         raise HTTPException(
             status_code=404,
@@ -121,13 +128,23 @@ async def dashboard_campaign(
 
 
 def _campaign_dir(campaign_id: str) -> Path:
-    root = _data_root() / "campaigns"
-    path = (root / campaign_id).resolve()
-    if not str(path).startswith(str(root.resolve())):
-        raise HTTPException(status_code=400, detail="Invalid campaign id")
-    if not path.is_dir():
+    from agent.utils.client_store import resolve_campaign_dir
+
+    root = _data_root()
+    path = resolve_campaign_dir(root, campaign_id)
+    if path is None or not path.is_dir():
+        # Compat: legacy data/campaigns/{id} only
+        legacy = (root / "campaigns" / campaign_id).resolve()
+        campaigns_root = (root / "campaigns").resolve()
+        if str(legacy).startswith(str(campaigns_root)) and legacy.is_dir():
+            return legacy
         raise HTTPException(status_code=404, detail=f"Campaign not found: {campaign_id}")
-    return path
+    # Allow client-canonical paths and legacy junctions under data/campaigns/
+    data_root = root.resolve()
+    resolved = path.resolve()
+    if not str(resolved).startswith(str(data_root)):
+        raise HTTPException(status_code=400, detail="Invalid campaign id")
+    return resolved
 
 
 @router.get("/api/campaigns/{campaign_id}/leads")
@@ -136,6 +153,7 @@ async def dashboard_leads_summary(
     stage: str = Query("auto"),
     preview: int = Query(25, ge=0, le=200),
     run_id: Optional[str] = Query(None),
+    view: str = Query("summary"),
     _: None = Depends(_check_dashboard_access),
 ):
     from agent.utils.lead_export import lead_summary
@@ -146,6 +164,7 @@ async def dashboard_leads_summary(
             stage=stage,
             preview=preview,
             run_id=run_id,
+            view=view,
         )
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc

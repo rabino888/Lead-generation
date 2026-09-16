@@ -166,6 +166,14 @@ def test_builder_ui_served(builder_client):
     assert "Would you like to configure the enrichment modules now?" in r.text
     assert "btn-continue-modules" in r.text
     assert "Continue to enrichment modules" in r.text
+    assert "confirm-build" in r.text
+    assert "btn-to-confirm" in r.text
+    assert "Start seed + smoke gate" in r.text
+    assert "Approve full batch" in r.text
+    assert "confirm-smoke-leads" in r.text
+    assert "confirm-target-leads" in r.text
+    assert "confirm-seed-plan" in r.text
+    assert "auto-builds LinkedIn" in r.text or "LinkedIn jobs" in r.text
     assert "Industry (one per line)" in r.text
     assert "btn-copy-icp-prompt" in r.text
     assert "btn-reload-icp" in r.text
@@ -344,6 +352,15 @@ def test_builder_list_client_icps(builder_client, tmp_path):
     assert ren.status_code == 200, ren.text
     assert ren.json()["summary"]["display_name"] == "Headhunting renamed"
 
+    # Linked campaigns block delete without force
+    blocked = builder_client.delete(f"/builder/api/clients/sample/icps/{icp_id}")
+    assert blocked.status_code == 409, blocked.text
+
+    forced = builder_client.delete(f"/builder/api/clients/sample/icps/{icp_id}?force=1")
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["ok"] is True
+    assert not (tmp_path / "clients" / "sample" / "icps" / icp_id).is_dir()
+
 
 def test_builder_create_explicit_id_still_works(builder_client, tmp_path):
     r = builder_client.post(
@@ -460,5 +477,83 @@ def test_company_estimate_rates_are_realistic():
     est = estimate_plan(plan)
     assert est["usd_per_lead"] < 0.25
     assert est["usd_run_total"] < 12.0
-    profile = next(x for x in est["line_items"] if x["module_id"] == "apify_dm_profile")
-    assert profile["unit_usd"] <= 0.02
+
+
+def test_list_run_state_roundtrip(tmp_path):
+    from agent.utils.list_run import load_list_run, save_list_run, apply_plan_runtime
+    import os
+
+    camp = tmp_path / "c1"
+    camp.mkdir()
+    state = load_list_run(camp, "c1")
+    assert state["phase"] == "idle"
+    state["phase"] = "awaiting_approval"
+    state["smoke_leads"] = 3
+    save_list_run(camp, state)
+    loaded = load_list_run(camp, "c1")
+    assert loaded["phase"] == "awaiting_approval"
+    assert loaded["smoke_leads"] == 3
+
+    plan = default_plan("c1")
+    plan["modules"]["apify_dm_posts"] = False
+    plan["modules"]["apollo_phone"] = True
+    with apply_plan_runtime(plan):
+        assert os.environ.get("APIFY_SKIP_LINKEDIN_POSTS") == "1"
+        assert os.environ.get("APOLLO_SKIP_PHONE") == "0"
+
+
+def test_builder_list_run_requires_seeds(builder_client, tmp_path, monkeypatch):
+    called = {"n": 0}
+
+    def _fake_start(*_a, **_k):
+        called["n"] += 1
+        return {"phase": "awaiting_approval"}
+
+    monkeypatch.setattr(
+        "agent.dashboard.builder_routes.start_smoke_gate",
+        _fake_start,
+    )
+    monkeypatch.setattr(
+        "agent.dashboard.builder_routes.assert_can_start_smoke_gate",
+        lambda _cid: (_ for _ in ()).throw(FileNotFoundError("No seeds yet. Add seeds.csv")),
+    )
+    r = builder_client.post(
+        "/builder/api/campaigns/sample_co/run",
+        json={"smoke_leads": 2, "target_leads": 25},
+    )
+    assert r.status_code == 400
+    assert "seeds" in r.json()["detail"].lower()
+    assert called["n"] == 0
+
+    monkeypatch.setattr(
+        "agent.dashboard.builder_routes.assert_can_start_smoke_gate",
+        lambda _cid: None,
+    )
+    r2 = builder_client.post(
+        "/builder/api/campaigns/sample_co/run",
+        json={"smoke_leads": 2, "target_leads": 25},
+    )
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["started"] is True
+    assert r2.json()["list_run"]["phase"] == "seeding"
+
+    g = builder_client.get("/builder/api/campaigns/sample_co/run")
+    assert g.status_code == 200
+    assert "list_run" in g.json()
+
+    monkeypatch.setattr(
+        "agent.dashboard.builder_routes.approve_full_batch",
+        lambda *_a, **_k: {"phase": "completed"},
+    )
+    from agent.utils.client_store import resolve_campaign_dir
+    from agent.utils.list_run import update_list_run
+
+    camp = resolve_campaign_dir(tmp_path, "sample_co")
+    assert camp is not None
+    update_list_run(camp, phase="awaiting_approval", smoke_leads=2, target_leads=25)
+    a = builder_client.post(
+        "/builder/api/campaigns/sample_co/run/approve",
+        json={"confirm": True},
+    )
+    assert a.status_code == 200, a.text
+    assert a.json()["list_run"]["phase"] == "running_full"

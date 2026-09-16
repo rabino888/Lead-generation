@@ -29,9 +29,8 @@ def test_dashboard_serves_static_portal(client):
     assert "Campaigns & ICPs" not in r.text
     assert "Total spend" in r.text
     assert "Where the money went" in r.text
-    assert "Generated lists" in r.text
-    assert "isGeneratedList" in r.text
-    assert "generatedLists" in r.text
+    assert "/dashboard/api" in r.text
+    assert "Loading ledger" in r.text
     assert "Build new campaign" in r.text
     assert "Associated campaigns" in r.text
     assert "icp-accordion" in r.text

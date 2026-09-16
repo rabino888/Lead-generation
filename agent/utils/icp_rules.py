@@ -126,6 +126,45 @@ def ensure_stages_dir(campaign: CampaignConfig) -> Path:
     return path
 
 
+def icp_is_location_bound(icp: CampaignIcpConfig | dict[str, Any]) -> bool:
+    """True when the ICP targets a geography (country / city / hints / contacts)."""
+    if isinstance(icp, CampaignIcpConfig):
+        geo = icp.geo
+        if (geo.primary_location or "").strip():
+            return True
+        if any(str(h).strip() for h in (geo.location_hints or [])):
+            return True
+        if any(str(s).strip() for s in (geo.segments or [])):
+            return True
+        if any(str(c).strip() for c in (icp.contact_locations or [])):
+            return True
+        return False
+    geo = icp.get("geo") if isinstance(icp.get("geo"), dict) else {}
+    if (geo.get("primary_location") or icp.get("location") or "").strip():
+        return True
+    if any(str(h).strip() for h in (geo.get("location_hints") or [])):
+        return True
+    if any(str(s).strip() for s in (geo.get("segments") or [])):
+        return True
+    if any(str(c).strip() for c in (icp.get("contact_locations") or [])):
+        return True
+    return False
+
+
+def resolve_require_location_match(icp: CampaignIcpConfig | dict[str, Any]) -> bool:
+    """
+    Explicit require_location_match true/false wins.
+    Otherwise auto-on whenever the ICP is location-bound.
+    """
+    if isinstance(icp, CampaignIcpConfig):
+        explicit = icp.require_location_match
+    else:
+        explicit = icp.get("require_location_match") if isinstance(icp, dict) else None
+    if explicit is True or explicit is False:
+        return bool(explicit)
+    return icp_is_location_bound(icp)
+
+
 def icp_config_to_rules(icp: CampaignIcpConfig) -> IcpRules:
     return IcpRules(
         industry=icp.industries[0] if icp.industries else None,
@@ -150,7 +189,7 @@ def icp_config_to_rules(icp: CampaignIcpConfig) -> IcpRules:
         weak_seed_extra_patterns=list(getattr(icp, "weak_seed_extra_patterns", None) or []),
         require_include_keywords=False,
         require_industry_match=False,
-        require_location_match=False,
+        require_location_match=resolve_require_location_match(icp),
     )
 
 
@@ -194,6 +233,7 @@ def derive_icp_rules(campaign: CampaignConfig) -> IcpRules:
         job_titles=list(icp.get("job_titles") or []),
         contact_locations=list(icp.get("contact_locations") or []),
         apply_weak_seed_checks=False,
+        require_location_match=resolve_require_location_match(icp if isinstance(icp, dict) else {}),
     )
 
 

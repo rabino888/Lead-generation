@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
-from agent.utils.icp_match import _parse_employee_count, _root_domain
+from agent.utils.icp_match import RECRUITER_NAME_RE, _parse_employee_count, _root_domain
 from agent.utils.icp_rules import IcpRules
 from agent.utils.icp_seed_quality import weak_seed_reason
 
@@ -127,6 +127,9 @@ def pre_apollo_reject_reason(
     if not name or not website:
         return "missing_name_or_website"
 
+    if RECRUITER_NAME_RE.search(name):
+        return "recruiter_or_staffing_name"
+
     domain = _root_domain(website)
     if domain in rules.merged_excluded_domains():
         return f"excluded_domain:{domain}"
@@ -135,7 +138,8 @@ def pre_apollo_reject_reason(
     if pattern_str:
         pattern = re.compile(pattern_str, re.I)
         industry = (row.get("industry") or "").strip()
-        if pattern.search(name) or (industry and pattern.search(industry)):
+        notes = (row.get("notes") or "").strip()
+        if pattern.search(name) or (industry and pattern.search(industry)) or (notes and pattern.search(notes)):
             return "excluded_name_pattern"
 
     blob = " ".join(

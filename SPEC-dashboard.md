@@ -76,11 +76,27 @@ No layouts — only behavior a designer and implementer must support.
 2. Operator sets expected **seed volume** (and optionally override pass-rate defaults).
 3. Estimate updates; save plan with `campaign_type: talent_search`.
 
-### 3.4 After save (later phases — documented for connections)
+### 3.4 Gated list run (locked)
 
-- Link to post-run cost portal for actuals (`/dashboard`, `/dashboard/campaigns/{id}`).
-- Export / apply plan to CLI env (mapping in §6) — not required for design session.
-- “Start run” is **out of v1 UI**; plan file is the contract for the runner.
+After modules are saved, **Confirm list build** starts a gated run — not a silent full paid batch.
+
+| Phase | What runs | Paid? | Gate |
+|-------|-----------|-------|------|
+| **1. Seeds** | `seeds.csv` / stage CSV, or **auto LinkedIn jobs URLs from ICP** → Apify scrape → `01_raw_seeds.csv` | Apify if auto / linkedin_jobs | Fail only if ICP cannot build URLs and no CSV |
+| **2. ICP + dedupe** | Match → in-batch dedupe → pre-Apollo gate → `03_deduped.csv` | $0 | Operator reviews funnel counts |
+| **3. Paid smoke** | First **N** deduped companies through Apollo + enrichment modules from the plan (default N=2) | Yes (small) | **Stop** |
+| **4. Approval** | Operator reviews smoke leads / cost | — | UI: Approve full batch / Not yet |
+| **5. Full batch** | Remaining deduped companies up to `target_leads` with the same plan | Yes | — |
+
+Auto seed (dashboard): when Confirm finds no company rows, `linkedin_seed_urls.py` builds `/jobs/search/` URLs from ICP `include_keywords` / `industries` + geo, writes `seed_sources.json`, and the background gated run scrapes via Apify.
+
+State file: `list_run.json` under the campaign folder (`phase`, `smoke_leads`, `target_leads`, run ids, message).
+
+APIs: `GET/POST /builder/api/campaigns/{id}/run` (status / start smoke gate), `POST …/run/approve` (full batch).
+
+CLI still works: `run_deterministic_campaign.py --skip-enrichment` then `run_smoke_test.py` / full run. Portal is the preferred operator path.
+
+Plan → runtime flags (§6.4) are applied for smoke and full batch (process-local env for the duration of the run).
 
 ### 3.5 Email toggle gate (`company_outreach`)
 
@@ -244,6 +260,9 @@ Serve alongside the cost portal (same optional `DASHBOARD_SECRET`).
 | `PUT` | `/builder/api/campaigns/{id}/plan` | Persist `enrichment_plan.json` |
 | `GET`/`PUT` | `/builder/api/campaigns/{id}/icp` | Read/write `icp.json` (deterministic; **no product LLM**) |
 | `GET`/`PUT` | `/builder/api/campaigns/{id}/seed_sources` | Read/write `seed_sources.json` |
+| `GET` | `/builder/api/campaigns/{id}/run` | Gated list-run status (`list_run.json`) |
+| `POST` | `/builder/api/campaigns/{id}/run` | Start seeds → ICP/dedupe → paid smoke |
+| `POST` | `/builder/api/campaigns/{id}/run/approve` | After smoke: run full batch to `target_leads` |
 | `GET` | `/builder/api/rates` | Effective unit rates (no secrets) |
 
 ICP drafting help is **local** (IDE agent / Cursor chat + `docs/ICP-INTAKE-TEMPLATE.md`), not an in-app LLM API. Website-stage LLM cost may still appear in estimates when website scrape is on — that is enrichment spend, not ICP construction.

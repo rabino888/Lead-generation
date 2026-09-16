@@ -83,7 +83,12 @@ def _write_csv(
 ) -> str:
     """Write leads to CSV. Only contactable leads are delivered by default."""
     run_id = run_state.run_id
-    output_dir = Path("data") / "clients" / client_profile.client_id / "runs"
+    from agent.utils.client_paths import client_runs_dir
+
+    output_dir = client_runs_dir(
+        client_profile.client_id,
+        keyword=getattr(run_state, "keyword", None),
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     csv_path = str(output_dir / f"{run_id}.csv")
 

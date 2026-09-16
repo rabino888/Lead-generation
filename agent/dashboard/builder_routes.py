@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,14 @@ from agent.utils.enrichment_plan import (
     save_plan,
     unit_rates,
     validate_plan,
+)
+from agent.utils.list_run import (
+    ACTIVE_PHASES,
+    approve_full_batch,
+    assert_can_start_smoke_gate,
+    load_list_run,
+    start_smoke_gate,
+    update_list_run,
 )
 from agent.utils.client_store import (
     client_campaign_dir,
@@ -119,6 +127,17 @@ class CampaignMetaPut(BaseModel):
     client_name: str = ""
     # None = leave unchanged; empty string clears the brief
     brief: Optional[str] = None
+    # pending | approved | deferred — confirm step after enrichment modules
+    list_build_status: Optional[str] = None
+
+
+class ListRunStartRequest(BaseModel):
+    smoke_leads: int = Field(2, ge=1, le=10)
+    target_leads: int = Field(50, ge=1, le=500)
+
+
+class ListRunApproveRequest(BaseModel):
+    confirm: bool = True
 
 
 @router.get("", response_class=HTMLResponse)
@@ -171,11 +190,17 @@ def _slug_part(value: str, *, fallback: str = "list") -> str:
 
 
 @router.get("/api/clients/{client_id}/icps")
-async def builder_list_client_icps(client_id: str, _: None = Depends(_check_access)):
+async def builder_list_client_icps(
+    client_id: str,
+    ready_only: int = Query(0),
+    _: None = Depends(_check_access),
+):
     cid = (client_id or "").strip()
     if not _CLIENT_ID_RE.match(cid):
         raise HTTPException(status_code=400, detail="Invalid client id")
     items = list_client_icps(_data_root(), cid)
+    if ready_only:
+        items = [x for x in items if x.get("ready")]
     return {"client_id": cid, "icps": items, "count": len(items)}
 
 
@@ -232,6 +257,28 @@ async def builder_put_client_icp_meta(
         meta["brief"] = body.brief
     _write_json(path / "meta.json", meta)
     return {"ok": True, "summary": icp_summary(_data_root(), cid, iid)}
+
+
+@router.delete("/api/clients/{client_id}/icps/{icp_id}")
+async def builder_delete_client_icp(
+    client_id: str,
+    icp_id: str,
+    force: int = Query(0),
+    _: None = Depends(_check_access),
+):
+    """Delete a library ICP. Blocked when campaigns still reference it (unless force=1)."""
+    from agent.utils.client_store import delete_client_icp
+
+    cid = (client_id or "").strip()
+    iid = (icp_id or "").strip()
+    if not _CLIENT_ID_RE.match(cid) or not _CAMPAIGN_ID_RE.match(iid):
+        raise HTTPException(status_code=400, detail="Invalid client or icp id")
+    try:
+        return delete_client_icp(_data_root(), cid, iid, force=bool(force))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.get("/api/campaigns")
@@ -294,8 +341,22 @@ async def builder_create_campaign(
     if existing_icp:
         if not icp_dir(data_root, client_id, existing_icp).is_dir():
             raise HTTPException(status_code=404, detail=f"ICP not found: {existing_icp}")
+        from agent.utils.icp_readiness import assess_icp_depth
+
+        lib = load_icp_doc(data_root, client_id, existing_icp)
+        meta_icp = load_icp_meta(data_root, client_id, existing_icp)
+        depth = assess_icp_depth(
+            lib,
+            campaign_type=(meta_icp.get("campaign_type") or ctype),
+        )
+        if not depth["ready"]:
+            raise HTTPException(
+                status_code=400,
+                detail=depth["remedy"]
+                or "ICP is incomplete — finish Automata-depth icp.json before creating a list.",
+            )
         icp_id = existing_icp
-        icp_stub = load_icp_doc(data_root, client_id, icp_id)
+        icp_stub = lib
     else:
         icp_stub = parse_brief_to_icp(
             brief,
@@ -324,6 +385,7 @@ async def builder_create_campaign(
         )
 
     campaign_meta = {
+        "campaign_id": campaign_id,
         "name": display,
         "display_name": display,
         "client_id": client_id,
@@ -331,6 +393,10 @@ async def builder_create_campaign(
         "campaign_type": ctype,
         "brief": brief,
         "icp_id": icp_id,
+        "seed_target": 50,
+        "seed_id_prefix": _slug_part(campaign_id, fallback="seed")[:12] or "seed",
+        "segment_order": ["default"],
+        "segments": {"default": {"target_count": 50}},
     }
     _write_json_file(path / "campaign.json", campaign_meta)
     snapshot_icp_into_campaign(data_root, client_id, icp_id, path)
@@ -342,6 +408,13 @@ async def builder_create_campaign(
     legacy = _campaigns_root() / campaign_id
     if not legacy.exists():
         _try_junction(legacy, path)
+
+    try:
+        from agent.dashboard.routes import rebuild_dashboard_files
+
+        rebuild_dashboard_files(data_root)
+    except Exception:
+        pass
 
     return {"ok": True, "campaign": campaign_summary(path), "icp_id": icp_id}
 
@@ -438,25 +511,44 @@ async def builder_put_campaign_meta(
     body: CampaignMetaPut,
     _: None = Depends(_check_access),
 ):
-    """Rename campaign / ICP display label and/or update brief (folder id unchanged)."""
+    """Rename campaign / update brief / list-build confirmation (folder id unchanged)."""
     path = _campaign_dir(campaign_id)
     name = (body.display_name or "").strip()
-    if not name:
+    meta = _read_json_file(path / "campaign.json", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    if name:
+        try:
+            meta = set_campaign_display_name(path, name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    elif not meta.get("display_name") and not meta.get("name"):
         raise HTTPException(status_code=400, detail="display_name is required")
-    try:
-        meta = set_campaign_display_name(path, name)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    dirty = False
+    dirty = bool(name)
     if (body.client_name or "").strip():
         meta["client_name"] = body.client_name.strip()
         dirty = True
     if body.brief is not None:
         meta["brief"] = body.brief
         dirty = True
+    if body.list_build_status is not None:
+        status = (body.list_build_status or "").strip().lower()
+        if status and status not in ("pending", "approved", "deferred"):
+            raise HTTPException(
+                status_code=400,
+                detail="list_build_status must be pending, approved, or deferred",
+            )
+        meta["list_build_status"] = status or "pending"
+        dirty = True
     if dirty:
         _write_json_file(path / "campaign.json", meta)
         sync_campaign_config_to_client(path)
+        try:
+            from agent.dashboard.routes import rebuild_dashboard_files
+
+            rebuild_dashboard_files(_data_root())
+        except Exception:
+            pass
     return {"ok": True, "campaign": campaign_summary(path)}
 
 
@@ -517,10 +609,18 @@ async def builder_get_seeds(campaign_id: str, _: None = Depends(_check_access)):
         "data": _read_json_file(path / "seed_sources.json", {"sources": []}),
         "help": {
             "no_llm": True,
-            "registered_types": ["csv_ingest", "linkedin_jobs", "linkedin_people (talent, planned)"],
+            "registered_types": [
+                "csv_ingest",
+                "linkedin_companies",
+                "google_maps",
+                "linkedin_people (talent, planned)",
+            ],
             "operator_note": (
                 "Choose how seeds enter the funnel. csv_ingest is free and precise; "
-                "linkedin_jobs spends Apify. Identify sources with the IDE agent from "
+                "linkedin_companies builds company-search URLs from the ICP and scrapes "
+                "via Apify (preferred auto path — never LinkedIn jobs); "
+                "google_maps is an alternate company discovery path. "
+                "Identify sources with the IDE agent from "
                 "directories / notes — no in-app LLM."
             ),
         },
@@ -540,3 +640,186 @@ async def builder_put_seeds(
     _write_json_file(path, body.data)
     sync_campaign_config_to_client(camp)
     return {"ok": True, "path": "seed_sources.json", "data": body.data}
+
+
+@router.get("/api/campaigns/{campaign_id}/run")
+async def builder_get_list_run(campaign_id: str, _: None = Depends(_check_access)):
+    path = _campaign_dir(campaign_id)
+    state = load_list_run(path, campaign_id)
+    # Backfill seed/smoke previews so dashboard shows list + smoke together
+    if not state.get("seed_preview"):
+        try:
+            from agent.utils.list_run import _seed_preview_rows
+
+            preview = _seed_preview_rows(campaign_id)
+            if preview:
+                state["seed_preview"] = preview
+                counts = dict(state.get("counts") or {})
+                if "seeds" not in counts:
+                    # Full seed count from stage file when available
+                    stages = path / "stages" / "01_raw_seeds.csv"
+                    if stages.is_file():
+                        import csv as _csv
+
+                        with stages.open(encoding="utf-8-sig", newline="") as f:
+                            counts["seeds"] = sum(
+                                1 for r in _csv.DictReader(f)
+                                if (r.get("company_name") or "").strip()
+                            )
+                    else:
+                        counts["seeds"] = len(preview)
+                state["counts"] = counts
+        except Exception:
+            pass
+    if not state.get("smoke_preview") and state.get("smoke_run_id"):
+        try:
+            from agent.utils.list_run import _smoke_leads_preview
+
+            meta = _read_json_file(path / "campaign.json", {})
+            cid = (meta.get("client_id") if isinstance(meta, dict) else None) or ""
+            rid = state["smoke_run_id"]
+            candidates = [path / "stages" / "04_smoke_contactable.csv"]
+            if cid:
+                candidates.extend(
+                    [
+                        Path("data") / "clients" / cid / "smoke" / "runs" / f"{rid}.csv",
+                        Path("data") / "clients" / cid / "runs" / f"{rid}.csv",
+                        # Legacy mis-routed smoke client (…-smoketest)
+                        Path("data") / "clients" / f"{cid}-smoketest" / "runs" / f"{rid}.csv",
+                    ]
+                )
+            for cand in candidates:
+                if cand.is_file():
+                    state["smoke_preview"] = _smoke_leads_preview(cand)
+                    state["smoke_csv_path"] = str(cand)
+                    break
+            # Zero-contactable smoke: still surface smoked companies from deduped stage
+            if not state.get("smoke_preview"):
+                deduped = path / "stages" / "03_deduped.csv"
+                smoke_n = int(state.get("smoke_leads") or 0) or 2
+                if deduped.is_file():
+                    import csv as _csv
+
+                    rows: list[dict[str, str]] = []
+                    with deduped.open(encoding="utf-8-sig", newline="") as f:
+                        for r in _csv.DictReader(f):
+                            rows.append(
+                                {
+                                    "company_name": (r.get("company_name") or "").strip(),
+                                    "website": (r.get("website") or "").strip(),
+                                    "decision_maker_name": "",
+                                    "decision_maker_email": "(no email)",
+                                    "decision_maker_title": "",
+                                }
+                            )
+                            if len(rows) >= smoke_n:
+                                break
+                    if rows:
+                        state["smoke_preview"] = rows
+                        # Persist so dashboard/builder do not need backfill next time
+                        try:
+                            update_list_run(path, smoke_preview=rows)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    return {"ok": True, "list_run": state}
+
+
+@router.post("/api/campaigns/{campaign_id}/run")
+async def builder_start_list_run(
+    campaign_id: str,
+    body: ListRunStartRequest,
+    background_tasks: BackgroundTasks,
+    _: None = Depends(_check_access),
+):
+    """Start gated run: seeds → ICP/dedupe → paid smoke → awaiting_approval."""
+    path = _campaign_dir(campaign_id)
+    state = load_list_run(path, campaign_id)
+    if state.get("phase") in ACTIVE_PHASES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Run already in progress (phase={state.get('phase')})",
+        )
+
+    try:
+        assert_can_start_smoke_gate(campaign_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Persist intent on campaign.json
+    meta = _read_json_file(path / "campaign.json", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["list_build_status"] = "approved"
+    _write_json_file(path / "campaign.json", meta)
+    sync_campaign_config_to_client(path)
+
+    smoke = int(body.smoke_leads)
+    target = int(body.target_leads)
+    update_list_run(
+        path,
+        campaign_id=campaign_id,
+        phase="seeding",
+        smoke_leads=smoke,
+        target_leads=target,
+        message="Queued — starting seed list…",
+        error="",
+        smoke_run_id="",
+        full_run_id="",
+    )
+
+    background_tasks.add_task(
+        start_smoke_gate,
+        path,
+        campaign_id,
+        smoke_leads=smoke,
+        target_leads=target,
+    )
+    return {
+        "ok": True,
+        "started": True,
+        "list_run": load_list_run(path, campaign_id),
+        "campaign": campaign_summary(path),
+    }
+
+
+@router.post("/api/campaigns/{campaign_id}/run/approve")
+async def builder_approve_full_batch(
+    campaign_id: str,
+    background_tasks: BackgroundTasks,
+    body: ListRunApproveRequest = ListRunApproveRequest(),
+    _: None = Depends(_check_access),
+):
+    """After smoke review — run the full batch up to target_leads."""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    path = _campaign_dir(campaign_id)
+    state = load_list_run(path, campaign_id)
+    phase = state.get("phase")
+    if phase not in ("awaiting_approval",):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Full batch only after smoke approval (phase={phase}). "
+                "Start the gated run first and wait for awaiting_approval."
+            ),
+        )
+    if state.get("phase") in ACTIVE_PHASES:
+        raise HTTPException(status_code=409, detail="Run already in progress")
+
+    update_list_run(
+        path,
+        phase="running_full",
+        message="Queued — starting full batch…",
+        error="",
+    )
+    background_tasks.add_task(approve_full_batch, path, campaign_id)
+    return {
+        "ok": True,
+        "started": True,
+        "list_run": load_list_run(path, campaign_id),
+        "campaign": campaign_summary(path),
+    }

@@ -97,8 +97,10 @@ def fail_run(run_id: str, error: str, **kwargs) -> RunState:
 
 
 def _persist(state: RunState) -> None:
-    """Save run summary JSON to data/clients/{client_id}/runs/{run_id}_summary.json"""
-    summary_dir = Path("data") / "clients" / state.client_id / "runs"
+    """Save run summary JSON under clients/{id}/[smoke/]runs/."""
+    from agent.utils.client_paths import client_runs_dir
+
+    summary_dir = client_runs_dir(state.client_id, keyword=state.keyword)
     summary_dir.mkdir(parents=True, exist_ok=True)
     path = summary_dir / f"{state.run_id}_summary.json"
     with open(path, "w", encoding="utf-8") as f:

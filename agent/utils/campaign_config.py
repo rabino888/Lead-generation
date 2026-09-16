@@ -13,6 +13,7 @@ Each campaign lives under data/campaigns/{campaign_id}/:
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -38,7 +39,7 @@ DEFAULT_EXCLUDED_AGENCY_PATTERN = (
 
 SEED_HEADERS = [
     "seed_id", "company_name", "website", "location", "geo_segment",
-    "source_url", "status", "notes",
+    "industry", "company_size", "source_url", "status", "notes",
 ]
 
 ENRICHED_HEADERS = [
@@ -209,6 +210,8 @@ class CampaignIcpConfig(BaseModel):
     weak_seed_extra_patterns: list[str] = Field(default_factory=list)
     # Pitch-intelligence campaigns: careers probe + open roles over SEO/blog/chatbot LLM.
     website_analysis_mode: str = "full"
+    # None = auto (on when ICP is location-bound). Explicit true/false overrides.
+    require_location_match: bool | None = None
 
     def merged_excluded_name_pattern(self) -> str:
         parts = [self.excluded_name_patterns]
@@ -276,14 +279,25 @@ class SeedSourcesConfig(BaseModel):
 
 
 class CampaignConfig(BaseModel):
+    """
+    Campaign folder contract.
+
+    Portal-created campaigns may only set display/client/ICP fields; seed/segment
+    defaults keep ``load_campaign`` working for the curated-seed gated run.
+    """
+
+    model_config = {"extra": "ignore"}
+
     campaign_id: str
-    client_id: str
-    client_name: str
-    display_name: str
+    client_id: str = ""
+    client_name: str = ""
+    display_name: str = ""
     seed_target: int = 50
-    seed_id_prefix: str
-    segment_order: list[str]
-    segments: dict[str, GeoSegment]
+    seed_id_prefix: str = "seed"
+    segment_order: list[str] = Field(default_factory=lambda: ["default"])
+    segments: dict[str, GeoSegment] = Field(
+        default_factory=lambda: {"default": GeoSegment(target_count=50)}
+    )
     discovery: DiscoveryConfig = Field(default_factory=DiscoveryConfig)
 
     @property
@@ -361,6 +375,32 @@ class CampaignConfig(BaseModel):
         return ""
 
 
+def normalize_campaign_config_data(data: dict[str, Any], campaign_id: str) -> dict[str, Any]:
+    """Fill defaults so portal-thin campaign.json validates as CampaignConfig."""
+    out = dict(data or {})
+    out["campaign_id"] = out.get("campaign_id") or campaign_id
+    if not (out.get("display_name") or "").strip():
+        out["display_name"] = (out.get("name") or campaign_id).strip() or campaign_id
+    if not (out.get("client_id") or "").strip():
+        out["client_id"] = "local"
+    if not (out.get("client_name") or "").strip():
+        out["client_name"] = out["client_id"]
+    if not (out.get("seed_id_prefix") or "").strip():
+        slug = re.sub(r"[^a-z0-9]+", "", campaign_id.lower())[:12]
+        out["seed_id_prefix"] = slug or "seed"
+    if not out.get("segment_order"):
+        out["segment_order"] = ["default"]
+    if not out.get("segments"):
+        target = int(out.get("seed_target") or 50)
+        out["segments"] = {"default": {"target_count": target}}
+    elif "default" not in out["segments"] and out["segment_order"] == ["default"]:
+        # Keep operator-defined segments as-is
+        pass
+    if "seed_target" not in out:
+        out["seed_target"] = 50
+    return out
+
+
 def campaigns_root() -> Path:
     return CAMPAIGNS_ROOT
 
@@ -368,13 +408,25 @@ def campaigns_root() -> Path:
 def load_campaign(campaign_id: str) -> CampaignConfig:
     config_path = CAMPAIGNS_ROOT / campaign_id / "campaign.json"
     if not config_path.exists():
-        raise FileNotFoundError(
-            f"Campaign config not found: {config_path}\n"
-            f"Create data/campaigns/{campaign_id}/campaign.json first."
-        )
+        # Client-first layout without a junction yet
+        try:
+            from agent.utils.client_store import resolve_campaign_dir
+
+            data_root = Path(os.environ.get("DATA_ROOT", str(ROOT / "data")))
+            if not data_root.is_absolute():
+                data_root = ROOT / data_root
+            resolved = resolve_campaign_dir(data_root, campaign_id)
+            if resolved is not None:
+                config_path = resolved / "campaign.json"
+        except Exception:
+            resolved = None
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"Campaign config not found: {CAMPAIGNS_ROOT / campaign_id / 'campaign.json'}\n"
+                f"Create data/campaigns/{campaign_id}/campaign.json first."
+            )
     data = json.loads(config_path.read_text(encoding="utf-8"))
-    if "campaign_id" not in data:
-        data["campaign_id"] = campaign_id
+    data = normalize_campaign_config_data(data if isinstance(data, dict) else {}, campaign_id)
     return CampaignConfig(**data)
 
 

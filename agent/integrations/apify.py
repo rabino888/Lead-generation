@@ -3,7 +3,9 @@ Apify integration — fallback discovery and company list enrichment.
 
 Actors used:
   - Google Maps Scraper:       compass/crawler-google-places
+                               (preferred company discovery seed source)
   - Google Search Scraper:     apify/google-search-scraper
+  - Firmographics:             foxlabs/company-enrichment (~$0.001/company)
   - LinkedIn Company Scraper:  harvestapi/linkedin-company (default; works under
                                  Apify restricted-run permissions)
                                  automation-lab/linkedin-company-scraper (legacy — LinkedIn 999)
@@ -13,12 +15,14 @@ Actors used:
                                  (site:linkedin.com/in — when Apollo omits linkedin_url)
   - LinkedIn Posts Scraper:    harvestapi/linkedin-profile-posts (default; honors maxPosts)
                                  data-slayer/linkedin-profile-posts-scraper (legacy — no post cap in API)
-  - LinkedIn Jobs Scraper:     DISABLED by default (APIFY_SKIP_LINKEDIN_JOBS=1).
+  - LinkedIn Jobs Scraper:     DISABLED by default for *company open jobs*
+                                 (APIFY_SKIP_LINKEDIN_JOBS=1).
+                                 Seed discovery via jobs search is secondary —
+                                 prefer google_maps for company_outreach ICPs.
                                  Do NOT use afanasenko/linkedin-jobs-scraper — burned
                                  $6.27/53 empty SUCCEEDED runs on 2026-08-25.
-                                 Candidate: gtgyani206/linkedin-company-scraper
-                                 (company page → open jobs; smoke OK on Confido).
-                                 Seed discovery stays on curious_coder/linkedin-jobs-scraper
+                                 Candidate open-jobs: gtgyani206/linkedin-company-scraper
+                                 Seed jobs actor (optional): curious_coder/linkedin-jobs-scraper
                                  with jobs *search* URLs (not /jobs/view/ or company /jobs/).
 """
 from __future__ import annotations
@@ -1026,3 +1030,74 @@ def _summarize_posts(posts: list[dict], interests: list[str]) -> Optional[str]:
     if snippets:
         return "Recent LinkedIn post examples: " + " | ".join(snippets)
     return None
+
+
+def company_enrichment_foxlabs(
+    *,
+    company_names: Optional[list[str]] = None,
+    company_domains: Optional[list[str]] = None,
+    max_results: int = 100,
+) -> list[dict]:
+    """
+    Cheap firmographics via foxlabs/company-enrichment (Owler, ~$0.001/company).
+
+    Returns website, industry, HQ, employees, revenue band, description.
+    Prefer domains when available for exact match.
+    """
+    names = [n.strip() for n in (company_names or []) if n and str(n).strip()]
+    domains = [d.strip().lower().removeprefix("www.") for d in (company_domains or []) if d]
+    if not names and not domains:
+        return []
+    if not os.environ.get("APIFY_TOKEN"):
+        log.warning("APIFY_TOKEN missing — skip foxlabs firmographics")
+        return []
+
+    actor_id = os.environ.get(
+        "APIFY_FIRMOGRAPHICS_ACTOR",
+        "foxlabs/company-enrichment",
+    )
+    run_input: dict[str, Any] = {
+        "maxResults": max(1, int(max_results or 100)),
+        "includeUnmatched": False,
+    }
+    if names:
+        run_input["companyNames"] = names
+    if domains:
+        run_input["companyDomains"] = domains
+
+    log.info(
+        "Apify firmographics (%s): %d name(s), %d domain(s)",
+        actor_id,
+        len(names),
+        len(domains),
+    )
+    client = _get_client()
+    try:
+        run = client.actor(actor_id).call(run_input=run_input)
+        _record_apify_run(run)
+        return _actor_dataset_items(client, run)
+    except Exception as e:
+        log.warning("foxlabs company enrichment failed: %s", e)
+        return []
+
+
+def resolve_websites_from_linkedin_company_urls(
+    url_by_key: dict[str, str],
+) -> dict[str, str]:
+    """
+    key → LinkedIn company URL → official website from company About page.
+
+    LinkedIn *jobs* ``companyWebsite`` is often a global/legacy domain; the
+    company profile website is usually the local one (e.g. .es).
+    """
+    out: dict[str, str] = {}
+    for key, li_url in url_by_key.items():
+        if not li_url:
+            continue
+        profile = get_linkedin_company_profile(li_url)
+        site = (profile.get("website") or "").strip()
+        if site:
+            if not site.startswith("http"):
+                site = f"https://{site}"
+            out[key] = site.rstrip("/")
+    return out

@@ -20,9 +20,9 @@ The funnel uses `icp.json` rules + keyword-overlap scoring only — no LLM compa
 `scripts/run_seed_source.py`, `scripts/match_campaign_icp.py`, independent `stage_*.py` CLIs,
 `scripts/run_deterministic_campaign.py`, and `POST /run` (curated seeds). Stage CSVs under `data/campaigns/{id}/stages/`.
 
-**2026-09 dashboard + billing:** lead-list dashboard (`build_cost_dashboard.py`) over all campaigns;
-cost schema v4 (`agent/utils/cost_report.py`); HTTP via `serve_cost_dashboard.py` or `/dashboard` on
-`main.py`; LLM mid-tier auto-discovery (`llm_models.py`, website = Gemini → OpenAI only).
+**2026-09 gated list run:** Confirm in `/builder` starts seeds → ICP/dedupe → paid smoke
+→ `awaiting_approval` → Approve full batch (`list_run.json`, `POST /builder/api/campaigns/{id}/run`).
+See SPEC-dashboard.md §3.4.
 
 **2026-08 hardening (`automata_us_rnd`):** pre-Apollo gate; `website_analysis_mode`
 (`hiring_first`); Apollo-only DM LinkedIn gate; `write_apollo_contactable_csv`;

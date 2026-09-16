@@ -119,6 +119,32 @@ def list_client_icps(root: Path, client_id: str) -> list[dict[str, Any]]:
     return out
 
 
+def delete_client_icp(root: Path, client_id: str, icp_id: str, *, force: bool = False) -> dict[str, Any]:
+    """Delete a library ICP folder. Blocks if campaigns still reference it unless force=True."""
+    path = icp_dir(root, client_id, icp_id)
+    if not path.is_dir():
+        raise FileNotFoundError(f"ICP not found: {icp_id}")
+    summary = icp_summary(root, client_id, icp_id) or {}
+    linked = list(summary.get("campaign_ids") or [])
+    if linked and not force:
+        raise ValueError(
+            f"ICP {icp_id!r} is linked to {len(linked)} campaign(s): "
+            + ", ".join(linked[:8])
+            + ("" if len(linked) <= 8 else "…")
+            + ". Re-point or delete those campaigns first, or pass force=1."
+        )
+    import shutil
+
+    shutil.rmtree(path)
+    return {
+        "ok": True,
+        "icp_id": icp_id,
+        "client_id": client_id,
+        "deleted_path": str(path),
+        "unlinked_campaigns": linked,
+    }
+
+
 def icp_summary(root: Path, client_id: str, icp_id: str) -> Optional[dict[str, Any]]:
     path = icp_dir(root, client_id, icp_id)
     if not path.is_dir():
@@ -148,15 +174,24 @@ def icp_summary(root: Path, client_id: str, icp_id: str) -> Optional[dict[str, A
         if meta_c.get("client_id") == client_id and meta_c.get("icp_id") == icp_id:
             if cdir.name not in campaign_ids:
                 campaign_ids.append(cdir.name)
+
+    from agent.utils.icp_readiness import assess_icp_depth
+
+    ctype = meta.get("campaign_type") or "company_outreach"
+    depth = assess_icp_depth(icp, campaign_type=ctype)
+
     return {
         "icp_id": icp_id,
         "client_id": client_id,
         "client_name": meta.get("client_name") or client_id,
         "display_name": meta.get("display_name") or meta.get("name") or icp_id,
         "brief": meta.get("brief") or "",
-        "campaign_type": meta.get("campaign_type") or "company_outreach",
+        "campaign_type": ctype,
         "campaign_ids": campaign_ids,
         "disk_path": str(path.resolve()),
+        "ready": depth["ready"],
+        "missing": depth["missing"],
+        "remedy": depth["remedy"],
         "icp": {
             "job_titles": titles[:12],
             "contact_locations": locations,

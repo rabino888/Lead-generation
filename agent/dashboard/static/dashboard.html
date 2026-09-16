@@ -90,15 +90,37 @@
   function clientById(id) { return (DATA.by_client || {})[id]; }
   function campaignsOfClient(id) { return (DATA.campaigns || []).filter((c) => c.client_id === id); }
 
-  /** Executed lists only — cost runs and/or stage lead CSVs on disk (not ICP stubs). */
+  /** Executed lists + gated runs in progress / awaiting approval. */
   function isGeneratedList(c) {
     if (!c) return false;
     if (c.cost_basis && c.cost_basis !== 'none') return true;
     if (Number(c.usd_total) > 0) return true;
     if (Number(c.delivered_leads) > 0) return true;
     const counts = c.lead_counts || {};
-    return ['seeds', 'icp_matched', 'deduped', 'contactable', 'enriched', 'scored']
-      .some((k) => Number(counts[k]) > 0);
+    if (['seeds', 'icp_matched', 'deduped', 'contactable', 'enriched', 'scored']
+      .some((k) => Number(counts[k]) > 0)) return true;
+    const phase = c.list_run_phase || '';
+    if (['seeding', 'matching', 'smoking', 'awaiting_approval', 'running_full', 'completed', 'error']
+      .indexOf(phase) >= 0) return true;
+    return false;
+  }
+
+  function listRunBadge(c) {
+    const phase = (c && c.list_run_phase) || '';
+    const build = (c && c.list_build_status) || '';
+    if (['seeding', 'matching', 'smoking', 'running_full'].indexOf(phase) >= 0) {
+      return { cls: 'ctype ts', text: 'in progress' };
+    }
+    if (phase === 'awaiting_approval') {
+      return { cls: 'ctype ts', text: 'awaiting approval' };
+    }
+    if (phase === 'error') {
+      return { cls: 'ctype ts', text: 'run error' };
+    }
+    if (build === 'deferred') {
+      return { cls: 'ctype co', text: 'saved for later' };
+    }
+    return null;
   }
 
   function generatedLists(campaigns) {
@@ -210,6 +232,8 @@
     meta.append(el('span', null, c.client_name || c.client_id || 'unknown client'));
     const ctype = campaignTypeOf(c);
     meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'), ctype.replace(/_/g, ' ')));
+    const runBadge = listRunBadge(c);
+    if (runBadge) meta.append(el('span', runBadge.cls, runBadge.text));
     const chip = basisChipFor(c);
     meta.append(el('span', chip[0], chip[1]));
     if (c.error) meta.append(el('span', null, c.error));
@@ -849,7 +873,7 @@
     const actions = el('div', 'leads-actions');
     let csvHref = '/dashboard/api/campaigns/' + encodeURIComponent(campaignId) + '/leads.csv';
     if (opts.runId) csvHref += '?run_id=' + encodeURIComponent(opts.runId);
-    const exportLink = el('a', null, 'Export CSV');
+    const exportLink = el('a', null, opts.csvLabel || 'Export CSV');
     exportLink.href = csvHref;
     actions.append(exportLink);
     if (opts.showFull !== false) {
@@ -868,8 +892,10 @@
   async function loadLeadsPanel(campaignId, opts) {
     opts = opts || {};
     const panel = el('div', 'panel leads-preview');
+    const viewMode = opts.view === 'full' ? 'full' : 'summary';
     const qs = new URLSearchParams();
     qs.set('preview', String(opts.preview != null ? opts.preview : 15));
+    qs.set('view', viewMode);
     if (opts.runId) qs.set('run_id', opts.runId);
     try {
       const res = await fetch(
@@ -880,21 +906,34 @@
       const noteBits = [
         int(data.total_rows) + ' row' + (data.total_rows === 1 ? '' : 's'),
         data.stage_file ? ('stage ' + data.stage_file) : null,
+        data.view ? ('view ' + data.view) : null,
         data.run_id_filter ? ('run filter ' + data.run_id_filter) : null
       ].filter(Boolean);
       panel.append(el('p', 'note', noteBits.join(' · ')));
+      if (data.note) panel.append(el('p', 'note', data.note));
+      if (data.sheet_url) {
+        const sheet = el('p', 'note');
+        const a = el('a', null, 'Open Google Sheet');
+        a.href = data.sheet_url;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        sheet.append(a);
+        panel.append(sheet);
+      }
       const rows = data.preview || [];
       if (!rows.length) {
         panel.append(el('div', 'empty', 'No leads on disk for this list yet.'));
       } else {
-        const scroll = el('div', 'table-scroll');
-        scroll.append(leadsTable(rows, data.columns));
+        const scroll = el('div', 'table-scroll' + (viewMode === 'full' ? ' wide-leads' : ''));
+        scroll.append(leadsTable(rows, data.columns || (viewMode === 'full' ? null : LEAD_COLS)));
         panel.append(scroll);
         if (rows.length < (data.total_rows || 0)) {
           panel.append(el('p', 'note', 'Showing ' + rows.length + ' of ' + int(data.total_rows) + ' rows.'));
         }
       }
-      panel.append(leadsActionBar(campaignId, opts));
+      panel.append(leadsActionBar(campaignId, Object.assign({}, opts, {
+        csvLabel: 'Export full CSV'
+      })));
     } catch (err) {
       panel.append(el('div', 'empty', 'No leads available to preview.'));
     }
@@ -1015,9 +1054,67 @@
     );
     view.append(section(
       'Campaigns (generated lists)',
-      'Executed lists only. New ICPs appear under Existing ICPs until you run the funnel.',
+      'Executed lists and gated runs (in progress / awaiting approval). Saved-for-later drafts appear below.',
       campaignsPanel
     ));
+
+    const draftPanel = el('div', 'panel');
+    draftPanel.append(el('div', 'empty', 'Loading saved campaigns…'));
+    view.append(section(
+      'In progress & saved for later',
+      'Gated runs and campaigns you deferred from Confirm. Open to resume seed+smoke or approve.',
+      draftPanel
+    ));
+
+    fetch('/builder/api/campaigns')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload) => {
+        clear(draftPanel);
+        const rows = ((payload && payload.campaigns) || []).filter((c) => {
+          if ((c.client_id || '') !== clientId) return false;
+          const phase = (c.list_run && c.list_run.phase) || 'idle';
+          const build = c.list_build_status || '';
+          return build === 'deferred'
+            || ['seeding', 'matching', 'smoking', 'awaiting_approval', 'running_full', 'error']
+              .indexOf(phase) >= 0;
+        });
+        if (!rows.length) {
+          draftPanel.append(el('div', 'empty',
+            'None right now. Use Save for later on Confirm, or start a gated run.'));
+          return;
+        }
+        rows.forEach((c) => {
+          const row = el('a', 'list-row');
+          row.href = '/builder?campaign=' + encodeURIComponent(c.campaign_id);
+          const id = el('div', 'id-cell');
+          id.append(el('span', 'name', c.display_name || c.campaign_id));
+          const meta = el('div', 'meta');
+          meta.append(el('span', 'mono', c.campaign_id));
+          const phase = (c.list_run && c.list_run.phase) || 'idle';
+          const fake = {
+            list_run_phase: phase,
+            list_build_status: c.list_build_status || '',
+          };
+          const badge = listRunBadge(fake);
+          if (badge) meta.append(el('span', badge.cls, badge.text));
+          else if (c.list_build_status === 'deferred') {
+            meta.append(el('span', 'ctype co', 'saved for later'));
+          }
+          id.append(meta);
+          if (c.list_run && c.list_run.message) {
+            id.append(el('div', 'bits', c.list_run.message));
+          }
+          row.append(id);
+          const money = el('div', 'money');
+          money.append(el('span', 'per', 'Open in builder →'));
+          row.append(money);
+          draftPanel.append(row);
+        });
+      })
+      .catch(() => {
+        clear(draftPanel);
+        draftPanel.append(el('div', 'empty', 'Could not load saved campaigns.'));
+      });
 
     const icpPanel = el('div', 'panel icp-accordion');
     icpPanel.append(el('div', 'empty', 'Loading ICPs…'));
@@ -1127,6 +1224,38 @@
           });
       });
       actions.append(saveBtn, status);
+      const delBtn = el('button', 'btn danger', 'Delete ICP');
+      delBtn.type = 'button';
+      delBtn.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const linked = (summary.campaign_ids || []).length;
+        const msg = linked
+          ? ('Delete ICP "' + (summary.display_name || summary.icp_id) + '"?\n'
+            + linked + ' campaign(s) still reference it. Continue with force delete?')
+          : ('Delete ICP "' + (summary.display_name || summary.icp_id) + '"? This cannot be undone.');
+        if (!window.confirm(msg)) return;
+        status.textContent = 'Deleting…';
+        const force = linked ? '1' : '0';
+        fetch('/builder/api/clients/' + encodeURIComponent(clientId)
+          + '/icps/' + encodeURIComponent(summary.icp_id) + '?force=' + force, {
+          method: 'DELETE',
+        })
+          .then((r) => r.json().then((data) => ({ ok: r.ok, status: r.status, data })))
+          .then(({ ok, data }) => {
+            if (!ok) throw new Error((data && data.detail) || 'Delete failed');
+            selectedIcp = '';
+            syncBuilderLinks();
+            fetch('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps')
+              .then((r) => (r.ok ? r.json() : null))
+              .then((payload) => renderLibraryIcps((payload && payload.icps) || []))
+              .catch(() => renderLibraryIcps([]));
+          })
+          .catch((err) => {
+            status.textContent = err.message || 'Delete failed';
+          });
+      });
+      actions.append(delBtn);
       renameRow.append(actions);
       body.append(renameRow);
     }
@@ -1186,6 +1315,9 @@
         const ctype = summary.campaign_type || 'company_outreach';
         titleRow.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
           ctype.replace(/_/g, ' ')));
+        if (summary.ready === false) {
+          titleRow.append(el('span', 'ctype ts', 'incomplete'));
+        }
         const nCamp = (summary.campaign_ids || []).length;
         if (nCamp) {
           titleRow.append(el('span', 'note', nCamp === 1 ? '1 campaign' : (nCamp + ' campaigns')));
@@ -1202,6 +1334,9 @@
           + '  <span>Geo:</span>' + geo
           + '  <span>Size:</span>' + size;
         headMain.append(bits);
+        if (summary.ready === false && summary.remedy) {
+          headMain.append(el('p', 'note', summary.remedy));
+        }
         head.append(headMain);
         head.append(el('span', 'icp-acc-chevron', '▾'));
         head.addEventListener('click', (e) => {
@@ -1262,6 +1397,92 @@
       { label: 'Cost / lead', value: c.per_lead_usd ? usd4(c.per_lead_usd) : '--', foot: 'campaign spend / delivered' },
       { label: 'Seeds in', value: int(counts.seeds), foot: pct(c.delivered_leads, counts.seeds) + ' reached contactable' }
     ]));
+
+    const gatePanel = el('div', 'panel');
+    gatePanel.append(el('div', 'empty', 'Loading gated-run status…'));
+    view.append(section(
+      'Gated run / smoke',
+      'Seed list and smoke results (smoke CSVs live under clients/{id}/smoke/runs/).',
+      gatePanel
+    ));
+    fetch('/builder/api/campaigns/' + encodeURIComponent(campaignId) + '/run')
+      .then((r) => (r.ok ? r.json() : null))
+      .then((payload) => {
+        clear(gatePanel);
+        const lr = (payload && payload.list_run) || {};
+        if (!lr.phase || lr.phase === 'idle') {
+          gatePanel.append(el('div', 'empty',
+            'No gated run yet. Start seed + smoke from the builder Confirm step.'));
+          return;
+        }
+        const bits = el('div', 'bits');
+        bits.appendChild(document.createTextNode(
+          'Phase: ' + lr.phase
+          + (lr.message ? (' · ' + lr.message) : '')
+          + (lr.counts && lr.counts.seeds != null
+            ? (' · ' + lr.counts.seeds + ' seeds') : '')
+          + (lr.counts && lr.counts.smoke_seeds != null
+            ? (' · smoked ' + lr.counts.smoke_seeds + ' companies') : '')
+          + (lr.counts && lr.counts.smoke_contactable != null
+            ? (' · ' + lr.counts.smoke_contactable + ' contactable') : '')
+        ));
+        gatePanel.append(bits);
+
+        const seeds = lr.seed_preview || [];
+        if (seeds.length) {
+          gatePanel.append(el('h3', null,
+            'Seed list (' + (lr.counts && lr.counts.seeds != null ? lr.counts.seeds : seeds.length) + ')'));
+          const ul = el('ul', 'seed-list');
+          seeds.slice(0, 25).forEach((s) => {
+            ul.appendChild(el('li', null,
+              (s.company_name || '')
+              + (s.website ? (' — ' + s.website) : '')
+              + (s.location ? (' · ' + s.location) : '')
+            ));
+          });
+          if ((lr.counts && lr.counts.seeds > 25) || seeds.length >= 25) {
+            ul.appendChild(el('li', 'note', '… see stages/01_raw_seeds.csv for full list'));
+          }
+          gatePanel.append(ul);
+        }
+
+        const smokeRows = lr.smoke_preview || [];
+        if (smokeRows.length || lr.smoke_run_id) {
+          gatePanel.append(el('h3', null, 'Smoke results'));
+          if (smokeRows.length) {
+            const sul = el('ul', 'seed-list');
+            smokeRows.forEach((s) => {
+              const email = s.decision_maker_email || '(no email)';
+              sul.appendChild(el('li', null,
+                (s.company_name || '')
+                + ' — ' + (s.decision_maker_name || '')
+                + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
+                + ' · ' + email
+              ));
+            });
+            gatePanel.append(sul);
+          }
+          gatePanel.append(el('p', 'note',
+            lr.smoke_csv_path
+              ? ('CSV: ' + lr.smoke_csv_path)
+              : ('Run ' + lr.smoke_run_id + ' under data/clients/' + (c.client_id || '…') + '/runs/')
+          ));
+          if (lr.phase === 'awaiting_approval') {
+            const approve = el('a', 'primary', 'Review & approve full batch in builder');
+            approve.href = '/builder?campaign=' + encodeURIComponent(campaignId);
+            approve.style.display = 'inline-block';
+            approve.style.marginTop = '10px';
+            gatePanel.append(approve);
+          }
+        }
+        if (lr.error) {
+          gatePanel.append(el('div', 'callout', lr.error));
+        }
+      })
+      .catch(() => {
+        clear(gatePanel);
+        gatePanel.append(el('div', 'empty', 'Could not load gated-run status.'));
+      });
 
     if (c.error) {
       const warn = el('div', 'panel');
@@ -1340,9 +1561,9 @@
     mountLeadsSection(
       view,
       'Generated leads',
-      'Preview from the richest stage CSV on disk (scored → enriched → contactable).',
+      'Summary columns for a quick scan. Open Full results for the wide field set, or Export CSV / Google Sheet.',
       campaignId,
-      { preview: 15, showFull: true }
+      { preview: 15, showFull: true, view: 'summary' }
     );
 
     const runPanel = el('div', 'panel');
@@ -1440,11 +1661,12 @@
     mountLeadsSection(
       view,
       'Full results',
-      'Up to 200 preview rows from the richest stage CSV. Use Export CSV for the full file.',
+      'Wide field set (up to 200 rows). Use Export CSV for every column on disk.',
       campaignId,
       {
         preview: 200,
         showFull: false,
+        view: 'full',
         backHref: '#/campaign/' + encodeURIComponent(campaignId),
         backLabel: 'Back to campaign'
       }
@@ -1602,9 +1824,16 @@
     DATA = index || DATA;
     if (!DATA.scope) DATA.scope = { kind: 'all', id: null };
     route = parseHash(location.hash);
-    render();
-    document.getElementById('stamp').textContent =
-      'Generated ' + (DATA.logged_at || '') + ' · schema v' + (DATA.schema_version || '');
+    try {
+      render();
+      document.getElementById('stamp').textContent =
+        'Generated ' + (DATA.logged_at || '') + ' · schema v' + (DATA.schema_version || '');
+    } catch (err) {
+      document.getElementById('page-title').textContent = 'Lead List Ledger';
+      document.getElementById('page-sub').textContent =
+        'Dashboard render failed: ' + (err && err.message ? err.message : String(err));
+      console.error(err);
+    }
   }
 
   window.addEventListener('hashchange', function () {
@@ -1616,7 +1845,13 @@
   if (embedded) {
     boot(embedded);
   } else {
-    fetch('/dashboard/api')
+    document.getElementById('page-title').textContent = 'Lead List Ledger';
+    document.getElementById('page-sub').textContent = 'Loading ledger…';
+    // Prefer cached index for fast paint. Pass ?refresh=1 on the URL to force rebuild.
+    const apiUrl = (new URLSearchParams(location.search).get('refresh') === '1')
+      ? '/dashboard/api?refresh=1'
+      : '/dashboard/api';
+    fetch(apiUrl)
       .then((r) => {
         if (!r.ok) throw new Error('Failed to load /dashboard/api');
         return r.json();

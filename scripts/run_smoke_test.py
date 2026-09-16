@@ -121,8 +121,9 @@ def _smoke_paid(args: argparse.Namespace, *, stop_after_apollo: bool) -> int:
 
     if args.client_id:
         sender.client_id = args.client_id
-    elif not args.keep_client_id:
-        sender.client_id = f"{sender.client_id}-smoketest"
+    if getattr(args, "client_suffix", None):
+        sender.client_id = f"{sender.client_id}{args.client_suffix}"
+    # Default keeps campaign client_id so smoke shows on the same dashboard ledger.
 
     seeds: list[CompanySeed] = []
     if args.input:
@@ -221,7 +222,16 @@ def main() -> int:
     parser.add_argument("--max-seeds", type=int, default=2)
     parser.add_argument("--expect-reject", action="append", default=[], help="ICP mode: company names that must fail")
     parser.add_argument("--client-id", default=None)
-    parser.add_argument("--keep-client-id", action="store_true")
+    parser.add_argument(
+        "--client-suffix",
+        default="",
+        help="Optional suffix (e.g. -smoketest) appended to sender.client_id",
+    )
+    parser.add_argument(
+        "--keep-client-id",
+        action="store_true",
+        help="Deprecated no-op: client id is kept by default",
+    )
     args = parser.parse_args()
 
     if args.mode == "icp":

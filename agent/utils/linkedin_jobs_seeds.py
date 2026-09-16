@@ -27,6 +27,9 @@ class LinkedInJobSeed:
     source_url: str
     status: str = "pending"
     notes: str = ""
+    industry: str = ""
+    company_size: str = ""
+    company_linkedin_url: str = ""
 
 
 def root_domain(url: str) -> str:
@@ -37,7 +40,7 @@ def root_domain(url: str) -> str:
     return urlparse(url).netloc.lower().removeprefix("www.")
 
 
-def normalize_website(url: str) -> str:
+def normalize_website(url: str, *, follow_redirects: bool = True) -> str:
     if not url:
         return ""
     url = url.strip()
@@ -46,7 +49,23 @@ def normalize_website(url: str) -> str:
     parsed = urlparse(url)
     if not parsed.netloc:
         return ""
-    return f"https://{parsed.netloc.lower()}"
+    cleaned = f"https://{parsed.netloc.lower()}"
+    if not follow_redirects:
+        return cleaned
+    try:
+        import httpx
+
+        with httpx.Client(follow_redirects=True, timeout=5.0) as client:
+            r = client.head(cleaned)
+            if r.status_code >= 400:
+                r = client.get(cleaned)
+            final = str(r.url)
+            p2 = urlparse(final)
+            if p2.netloc:
+                return f"https://{p2.netloc.lower()}"
+    except Exception:
+        pass
+    return cleaned
 
 
 def normalize_linkedin_jobs_url(url: str) -> str:
@@ -145,6 +164,8 @@ def jobs_to_seeds(
         job_link = (job.get("link") or job.get("url") or job.get("jobUrl") or "").strip()
         employees = job.get("companyEmployeesCount") or job.get("employeesCount")
         industries = job.get("industries") or job.get("companyIndustry") or ""
+        if isinstance(industries, list):
+            industries = ", ".join(str(x) for x in industries if x)
 
         if not name:
             dropped.append({"reason": "missing_company_name", "job": job})
@@ -177,6 +198,8 @@ def jobs_to_seeds(
         if industries:
             notes_parts.append(f"industry: {industries}")
 
+        size_bucket = employee_bucket(employees) if employees is not None else ""
+
         seeds.append(
             LinkedInJobSeed(
                 seed_id="",
@@ -186,10 +209,48 @@ def jobs_to_seeds(
                 geo_segment=geo_segment,
                 source_url=job_link or linkedin or "",
                 notes=" | ".join(notes_parts),
+                industry=str(industries or ""),
+                company_size=str(employees) if employees is not None else (size_bucket or ""),
+                company_linkedin_url=linkedin or "",
             )
         )
 
     return seeds, dropped
+
+
+def prefer_linkedin_company_websites(seeds: list[LinkedInJobSeed]) -> list[LinkedInJobSeed]:
+    """
+    Overwrite jobs ``companyWebsite`` with the LinkedIn *company profile* website.
+
+    Jobs-card websites are often a global .com; the company About page usually
+    has the local domain (e.g. .es). Dedupes by company LinkedIn URL.
+    """
+    url_to_indices: dict[str, list[int]] = {}
+    for i, seed in enumerate(seeds):
+        li = (seed.company_linkedin_url or "").strip()
+        if not li:
+            continue
+        url_to_indices.setdefault(li, []).append(i)
+    if not url_to_indices:
+        return seeds
+
+    from agent.integrations.apify import resolve_websites_from_linkedin_company_urls
+
+    resolved = resolve_websites_from_linkedin_company_urls(
+        {url: url for url in url_to_indices}
+    )
+    for url, site in resolved.items():
+        if not site:
+            continue
+        cleaned = normalize_website(site, follow_redirects=False) or site
+        for idx in url_to_indices.get(url, []):
+            old = seeds[idx].website
+            seeds[idx].website = cleaned
+            if old and old != cleaned:
+                note = (seeds[idx].notes or "").strip()
+                tag = f"website from LI company (was {old})"
+                seeds[idx].notes = f"{note} | {tag}".strip(" |") if note else tag
+    return seeds
 
 
 def assign_seed_ids(seeds: list[LinkedInJobSeed], prefix: str) -> list[LinkedInJobSeed]:

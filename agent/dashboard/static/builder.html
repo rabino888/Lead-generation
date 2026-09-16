@@ -184,9 +184,53 @@
 
         <div class="savebar">
           <span class="savehint" id="save-hint">PUT /builder/api/campaigns/…/plan</span>
-          <div style="display:flex;gap:8px;align-items:center">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span class="savehint" id="save-status"></span>
-            <button type="button" class="btn primary" id="save-btn">Save plan</button>
+            <button type="button" class="btn" id="save-btn">Save plan</button>
+            <button type="button" class="btn primary" id="btn-to-confirm">Continue to confirm build</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="confirm-build" class="hidden">
+        <div class="panel confirm-panel">
+          <div class="panel-head">
+            <h3>Confirm list build</h3>
+            <span class="hint">Gated: seeds → ICP/dedupe → paid smoke → approve → full batch</span>
+          </div>
+          <p class="setup-note" style="margin-top:0">
+            Starting runs seeds → ICP match → dedupe, then a small paid smoke through your modules.
+            If there is no seeds.csv, the dashboard auto-builds LinkedIn company-search URLs from the ICP
+            and scrapes companies via Apify (paid, never jobs), then continues. After smoke, approve the full batch.
+          </p>
+          <dl class="facts" id="confirm-facts"></dl>
+          <div class="confirm-estimate" id="confirm-estimate"></div>
+          <p class="setup-note" id="confirm-seed-plan" style="margin:8px 0 0"></p>
+          <div class="vol" style="margin:14px 0">
+            <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end">
+              <div>
+                <div class="field-label" style="font-size:.7rem;color:var(--ink-3)">Smoke leads (paid test)</div>
+                <input class="num" id="confirm-smoke-leads" type="number" min="1" max="10" value="2">
+              </div>
+              <div>
+                <div class="field-label" style="font-size:.7rem;color:var(--ink-3)">Target contactable (full batch)</div>
+                <input class="num" id="confirm-target-leads" type="number" min="1" max="500" value="50">
+              </div>
+              <div class="presets" id="confirm-lead-presets">
+                <button type="button" data-n="25">25</button>
+                <button type="button" data-n="50">50</button>
+                <button type="button" data-n="100">100</button>
+              </div>
+            </div>
+          </div>
+          <p class="setup-note" id="confirm-run-status" style="margin:8px 0 0"></p>
+          <div id="confirm-run-previews" class="run-previews hidden"></div>
+          <div class="setup-actions" style="margin-top:16px">
+            <button type="button" class="btn primary" id="btn-confirm-yes">Start seed + smoke gate</button>
+            <button type="button" class="btn primary hidden" id="btn-confirm-approve">Approve full batch</button>
+            <button type="button" class="btn" id="btn-confirm-no">Save for later</button>
+            <button type="button" class="btn ghost" id="btn-confirm-back">← Back to modules</button>
+            <span class="savehint" id="confirm-status"></span>
           </div>
         </div>
       </div>
@@ -220,6 +264,7 @@
     setupVisible: false,
     icpDetailVisible: false,
     modulesVisible: false,
+    confirmVisible: false,
   };
 
   const META = [
@@ -368,10 +413,13 @@
     const clientId = currentCreateClientId();
     const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
     let rows = [];
+    let hiddenThin = 0;
     if (mode === 'existing' && clientId) {
       try {
-        const res = await api('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps');
-        rows = res.icps || [];
+        const all = await api('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps');
+        const allRows = all.icps || [];
+        hiddenThin = allRows.filter((c) => c.ready === false).length;
+        rows = allRows.filter((c) => c.ready !== false);
       } catch (_) {
         // Fall back to campaign-linked summaries if ICP library not ready
         rows = state.campaigns
@@ -381,7 +429,9 @@
             display_name: c.display_name || c.campaign_id,
             campaign_type: c.campaign_type,
             icp: c.icp,
-          }));
+            ready: c.icp_ready !== false,
+          }))
+          .filter((c) => c.ready !== false);
       }
     }
     sel.innerHTML = '<option value="">Select an ICP…</option>'
@@ -396,9 +446,15 @@
     else sel.value = '';
     const hint = document.getElementById('create-icp-hint');
     if (hint && mode === 'existing') {
-      hint.textContent = rows.length
-        ? rows.length + ' saved ICP(s) for this client — one ICP can power many campaigns.'
-        : 'No ICPs for this client yet. Create a new ICP first, or switch to “Create new ICP”.';
+      if (rows.length) {
+        hint.textContent = rows.length + ' ready ICP(s) for this client'
+          + (hiddenThin ? (' · ' + hiddenThin + ' incomplete hidden — finish them in Cursor first') : '')
+          + '.';
+      } else {
+        hint.textContent = hiddenThin
+          ? (hiddenThin + ' ICP(s) on disk are too thin to reuse. Finish Automata-depth icp.json in Cursor, then reload.')
+          : 'No ICPs for this client yet. Create a new ICP first, or switch to “Create new ICP”.';
+      }
     }
     syncIcpMode();
   }
@@ -643,6 +699,291 @@
     state.modulesVisible = !!on;
     const el = document.getElementById('plan-modules');
     if (el) el.classList.toggle('hidden', !state.modulesVisible);
+    if (on) {
+      state.confirmVisible = false;
+      const conf = document.getElementById('confirm-build');
+      if (conf) conf.classList.add('hidden');
+    }
+  }
+
+  function setConfirmVisible(on) {
+    state.confirmVisible = !!on;
+    const el = document.getElementById('confirm-build');
+    if (el) el.classList.toggle('hidden', !state.confirmVisible);
+    if (on) {
+      state.modulesVisible = false;
+      const mods = document.getElementById('plan-modules');
+      if (mods) mods.classList.add('hidden');
+      renderConfirmBuild();
+    }
+  }
+
+  function renderConfirmBuild() {
+    const facts = document.getElementById('confirm-facts');
+    const est = document.getElementById('confirm-estimate');
+    if (!facts) return;
+    const c = state.current || {};
+    const p = state.plan || {};
+    const e = state.estimate || {};
+    const mods = (p.modules) || {};
+    const onMods = Object.keys(mods).filter((k) => mods[k]).map((k) => k.replace(/_/g, ' '));
+    facts.innerHTML = [
+      appendFactHtml('Client', c.client_name || state.clientName || state.clientId),
+      appendFactHtml('Campaign', c.display_name || c.campaign_id),
+      appendFactHtml('ICP id', c.icp_id || '—'),
+      appendFactHtml('Type', String(p.campaign_type || c.campaign_type || '').replace(/_/g, ' ')),
+      appendFactHtml('Modules on', onMods),
+    ].join('');
+    const usd = e.usd_total != null ? money(e.usd_total) : '—';
+    const per = e.usd_per_lead != null ? money(e.usd_per_lead)
+      : (e.per_lead_usd != null ? money(e.per_lead_usd) : '—');
+    const smokeEl = document.getElementById('confirm-smoke-leads');
+    const targetEl = document.getElementById('confirm-target-leads');
+    if (smokeEl && !smokeEl.dataset.touched) {
+      const lr = (c.list_run || state.listRun || {});
+      smokeEl.value = String(lr.smoke_leads || 2);
+    }
+    if (targetEl && !targetEl.dataset.touched) {
+      const lr = (c.list_run || state.listRun || {});
+      targetEl.value = String(lr.target_leads || p.target_leads || e.target_leads || 50);
+    }
+    const leads = targetEl ? targetEl.value : (p.target_leads != null ? intfmt(p.target_leads) : '—');
+    if (est) {
+      est.innerHTML = '<p class="confirm-est-line"><b>Estimate</b> · ' + usd
+        + ' total · ' + per + ' / lead · target ' + leads + ' leads'
+        + ' <span class="hint">(modelled full batch — smoke is a small slice)</span></p>';
+    }
+    const ready = c.icp_ready !== false;
+    let banner = document.getElementById('confirm-icp-ready');
+    if (!banner) {
+      banner = document.createElement('p');
+      banner.id = 'confirm-icp-ready';
+      banner.className = 'setup-note';
+      const estNode = document.getElementById('confirm-estimate');
+      if (estNode && estNode.parentNode) {
+        estNode.parentNode.insertBefore(banner, estNode.nextSibling);
+      }
+    }
+    const seedEl = document.getElementById('confirm-seed-plan');
+    const sp = c.seed_plan || {};
+    if (seedEl) {
+      if (sp.message) {
+        seedEl.textContent = sp.message
+          + (sp.url_count ? (' · preview ' + sp.url_count + ' URL(s)') : '')
+          + (sp.mode === 'auto_linkedin_companies' || sp.mode === 'linkedin_companies' ? ' · Apify company search on Start' : '')
+          + (sp.mode === 'auto_google_maps' || sp.mode === 'google_maps' ? ' · Apify Maps on Start' : '');
+        seedEl.style.color = sp.ok === false ? 'var(--warn, #9a6212)' : '';
+      } else {
+        seedEl.textContent = '';
+      }
+    }
+    const startBtn = document.getElementById('btn-confirm-yes');
+    if (!ready) {
+      banner.style.color = 'var(--warn, #9a6212)';
+      banner.textContent = c.icp_remedy
+        || 'ICP is too thin to run. Finish Automata-depth icp.json in Cursor, then Reload ICP.';
+      if (startBtn) startBtn.disabled = true;
+    } else if (sp.ok === false && sp.mode === 'missing') {
+      banner.style.color = 'var(--warn, #9a6212)';
+      banner.textContent = sp.message
+        || 'No seed path — add seeds.csv or ICP keywords/geo for auto LinkedIn company search.';
+      if (startBtn) startBtn.disabled = true;
+    } else {
+      banner.style.color = '';
+      banner.textContent = '';
+      if (startBtn && !(state.listRun && ['seeding','matching','smoking','running_full'].indexOf(state.listRun.phase) >= 0)) {
+        startBtn.disabled = false;
+      }
+    }
+    renderListRunStatus(c.list_run || state.listRun || null);
+    const phase = ((c.list_run || state.listRun || {}).phase) || '';
+    if (['seeding', 'matching', 'smoking', 'running_full', 'awaiting_approval'].indexOf(phase) >= 0) {
+      startListRunPolling();
+    }
+  }
+
+  let _runPollTimer = null;
+
+  function renderRunPreviews(lr) {
+    const box = document.getElementById('confirm-run-previews');
+    if (!box) return;
+    box.innerHTML = '';
+    if (!lr || !lr.phase || lr.phase === 'idle') {
+      box.classList.add('hidden');
+      return;
+    }
+    const seeds = lr.seed_preview || [];
+    const smokeRows = lr.smoke_preview || [];
+    const show = seeds.length || smokeRows.length || lr.phase === 'awaiting_approval'
+      || lr.phase === 'smoking' || lr.phase === 'matching' || lr.phase === 'seeding';
+    if (!show) {
+      box.classList.add('hidden');
+      return;
+    }
+    box.classList.remove('hidden');
+    const counts = lr.counts || {};
+    if (seeds.length) {
+      const h = document.createElement('h4');
+      h.textContent = 'Seed list ('
+        + (counts.seeds != null ? counts.seeds : seeds.length) + ')';
+      box.appendChild(h);
+      const ul = document.createElement('ul');
+      ul.className = 'seed-list';
+      seeds.slice(0, 25).forEach((s) => {
+        const li = document.createElement('li');
+        li.textContent = (s.company_name || '')
+          + (s.website ? (' — ' + s.website) : '')
+          + (s.location ? (' · ' + s.location) : '');
+        ul.appendChild(li);
+      });
+      if ((counts.seeds || seeds.length) > 25) {
+        const more = document.createElement('li');
+        more.className = 'note';
+        more.textContent = '… full list in stages/01_raw_seeds.csv';
+        ul.appendChild(more);
+      }
+      box.appendChild(ul);
+    } else if (['seeding', 'matching', 'smoking'].indexOf(lr.phase) >= 0) {
+      const p = document.createElement('p');
+      p.className = 'setup-note';
+      p.textContent = 'Seed list will appear here when scraping finishes…';
+      box.appendChild(p);
+    }
+    if (smokeRows.length || lr.smoke_run_id || lr.phase === 'awaiting_approval') {
+      const h2 = document.createElement('h4');
+      h2.textContent = 'Smoke results'
+        + (counts.smoke_contactable != null
+          ? (' · ' + counts.smoke_contactable + ' contactable')
+          : '');
+      box.appendChild(h2);
+      if (smokeRows.length) {
+        const sul = document.createElement('ul');
+        sul.className = 'seed-list';
+        smokeRows.forEach((s) => {
+          const li = document.createElement('li');
+          li.textContent = (s.company_name || '')
+            + (s.decision_maker_name ? (' — ' + s.decision_maker_name) : '')
+            + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
+            + ' · ' + (s.decision_maker_email || '(no email)');
+          sul.appendChild(li);
+        });
+        box.appendChild(sul);
+      } else if (lr.phase === 'awaiting_approval') {
+        const p = document.createElement('p');
+        p.className = 'setup-note';
+        p.textContent = 'Smoke finished with no contactable emails (Apollo reject). '
+          + 'Seed list above is still reviewable — re-smoke or approve with caution.';
+        box.appendChild(p);
+      }
+      const campId = (state.current && state.current.campaign_id) || '';
+      if (campId) {
+        const a = document.createElement('a');
+        a.className = 'btn ghost';
+        a.style.marginTop = '8px';
+        a.style.display = 'inline-block';
+        a.href = '/dashboard#/campaign/' + encodeURIComponent(campId);
+        a.textContent = 'Open on dashboard';
+        box.appendChild(a);
+      }
+    }
+  }
+
+  function renderListRunStatus(lr) {
+    const el = document.getElementById('confirm-run-status');
+    const hint = document.getElementById('confirm-status');
+    const startBtn = document.getElementById('btn-confirm-yes');
+    const approveBtn = document.getElementById('btn-confirm-approve');
+    if (!el) return;
+    if (!lr || !lr.phase || lr.phase === 'idle') {
+      el.textContent = '';
+      renderRunPreviews(null);
+      if (hint && (hint.textContent || '').indexOf('Running') === 0) hint.textContent = '';
+      if (startBtn) {
+        startBtn.disabled = false;
+        startBtn.classList.remove('hidden');
+      }
+      if (approveBtn) approveBtn.classList.add('hidden');
+      return;
+    }
+    const counts = lr.counts || {};
+    const bits = [
+      'Phase: ' + lr.phase,
+      lr.message || '',
+      counts.seeds != null ? (counts.seeds + ' seeds') : '',
+      counts.deduped != null ? ('deduped ' + counts.deduped) : '',
+      counts.smoke_seeds != null ? ('smoked ' + counts.smoke_seeds) : '',
+      counts.smoke_contactable != null ? (counts.smoke_contactable + ' contactable') : '',
+      lr.error ? ('Error: ' + lr.error) : '',
+    ].filter(Boolean);
+    el.textContent = bits.join(' · ');
+    renderRunPreviews(lr);
+    const active = ['seeding', 'matching', 'smoking', 'running_full'].indexOf(lr.phase) >= 0;
+    if (hint) {
+      if (lr.phase === 'awaiting_approval') {
+        hint.textContent = 'Smoke done — review seed list + smoke below, then Approve full batch';
+      } else if (lr.phase === 'completed') {
+        hint.textContent = 'Full batch finished';
+      } else if (lr.phase === 'error') {
+        hint.textContent = lr.error || 'Gated run failed';
+      } else if (active) {
+        hint.textContent = 'Running — stay on this page (Apify/Apollo may take several minutes)…';
+      }
+    }
+    if (startBtn) {
+      startBtn.disabled = active;
+      startBtn.classList.toggle('hidden', lr.phase === 'awaiting_approval');
+    }
+    if (approveBtn) {
+      approveBtn.classList.toggle('hidden', lr.phase !== 'awaiting_approval');
+      approveBtn.disabled = false;
+    }
+  }
+
+  async function pollListRun() {
+    const id = state.current && state.current.campaign_id;
+    if (!id) return;
+    try {
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/run');
+      state.listRun = res.list_run;
+      if (state.current) state.current.list_run = res.list_run;
+      renderListRunStatus(res.list_run);
+      const phase = (res.list_run && res.list_run.phase) || '';
+      const needsPreview = phase === 'awaiting_approval'
+        && !(res.list_run.seed_preview || []).length
+        && !(res.list_run.smoke_preview || []).length;
+      if (['seeding', 'matching', 'smoking', 'running_full'].indexOf(phase) >= 0 || needsPreview) {
+        _runPollTimer = setTimeout(pollListRun, 2500);
+      } else {
+        _runPollTimer = null;
+      }
+    } catch (err) {
+      const hint = document.getElementById('confirm-status');
+      if (hint) hint.textContent = errText(err);
+      _runPollTimer = setTimeout(pollListRun, 4000);
+    }
+  }
+
+  function startListRunPolling() {
+    if (_runPollTimer) clearTimeout(_runPollTimer);
+    pollListRun();
+  }
+
+  async function setListBuildStatus(status) {
+    const id = state.current && state.current.campaign_id;
+    const hint = document.getElementById('confirm-status');
+    if (!id) return;
+    if (hint) hint.textContent = 'Saving…';
+    const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/meta', {
+      method: 'PUT',
+      body: JSON.stringify({
+        display_name: (state.current && state.current.display_name) || id,
+        list_build_status: status,
+      }),
+    });
+    if (state.current) {
+      state.current.list_build_status = (res.campaign && res.campaign.list_build_status) || status;
+    }
+    return res;
   }
 
   function setSetupVisible(on) {
@@ -1044,7 +1385,7 @@
       </div>`).join('')
       : '<p style="margin:0;font-size:.84rem;color:var(--ink-3)">No sources yet. Ask the IDE agent to draft <code>seed_sources.json</code> from directories / notes, or add a csv_ingest entry after save.</p>';
     document.getElementById('seed-fields').innerHTML = `
-      <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">Primary path is usually <b>csv_ingest</b> ($0). LinkedIn jobs spends Apify.</p>
+      <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">Primary path is <b>linkedin_companies</b> (ICP → company-search URLs → Apify) or <b>csv_ingest</b> ($0). LinkedIn jobs is blocked.</p>
       ${cards}
       <div class="setup-actions" style="margin-top:4px">
         <button type="button" class="btn" id="add-csv-seed">+ csv_ingest source</button>
@@ -1432,7 +1773,135 @@
       state.current.plan = res.plan;
       await refreshEstimate();
       renderBoard();
+      const st = document.getElementById('save-status');
+      if (st) st.textContent = 'Plan saved — continue to confirm when ready';
     } catch (err) {
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-to-confirm').addEventListener('click', async () => {
+    try {
+      if (state.current && state.current.icp_ready === false) {
+        throw new Error(state.current.icp_remedy
+          || 'ICP is too thin to confirm a list build. Finish Automata-depth icp.json first.');
+      }
+      if (state.dirty || !(state.current && state.current.has_saved_plan)) {
+        const id = state.current.campaign_id;
+        const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/plan', {
+          method: 'PUT',
+          body: JSON.stringify({ plan: state.plan }),
+        });
+        state.plan = res.plan;
+        state.dirty = false;
+        state.current.has_saved_plan = true;
+        state.current.plan = res.plan;
+        await refreshEstimate();
+        renderBoard();
+      }
+      setConfirmVisible(true);
+      const conf = document.getElementById('confirm-build');
+      if (conf) conf.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    } catch (err) {
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-confirm-back').addEventListener('click', () => {
+    setModulesVisible(true);
+    const plan = document.getElementById('plan-modules');
+    if (plan) plan.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  document.getElementById('confirm-smoke-leads').addEventListener('change', (e) => {
+    e.target.dataset.touched = '1';
+  });
+  document.getElementById('confirm-target-leads').addEventListener('change', (e) => {
+    e.target.dataset.touched = '1';
+    if (state.plan) {
+      state.plan.target_leads = Math.max(1, parseInt(e.target.value, 10) || 50);
+      bump();
+    }
+  });
+  document.querySelectorAll('#confirm-lead-presets button').forEach((b) => {
+    b.addEventListener('click', () => {
+      const target = document.getElementById('confirm-target-leads');
+      if (target) {
+        target.value = b.dataset.n;
+        target.dataset.touched = '1';
+        target.dispatchEvent(new Event('change'));
+      }
+    });
+  });
+  document.getElementById('btn-confirm-yes').addEventListener('click', async () => {
+    const hint = document.getElementById('confirm-status');
+    try {
+      const id = state.current && state.current.campaign_id;
+      if (!id) throw new Error('No campaign selected');
+      if (state.dirty || !(state.current && state.current.has_saved_plan)) {
+        const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/plan', {
+          method: 'PUT',
+          body: JSON.stringify({ plan: state.plan }),
+        });
+        state.plan = res.plan;
+        state.dirty = false;
+        state.current.has_saved_plan = true;
+        state.current.plan = res.plan;
+      }
+      const smoke = Math.max(1, Math.min(10, parseInt(
+        (document.getElementById('confirm-smoke-leads') || {}).value, 10
+      ) || 2));
+      const target = Math.max(smoke, Math.min(500, parseInt(
+        (document.getElementById('confirm-target-leads') || {}).value, 10
+      ) || 50));
+      if (hint) hint.textContent = 'Starting gated run…';
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/run', {
+        method: 'POST',
+        body: JSON.stringify({ smoke_leads: smoke, target_leads: target }),
+      });
+      state.listRun = res.list_run;
+      if (state.current) {
+        state.current.list_run = res.list_run;
+        if (res.campaign) Object.assign(state.current, res.campaign);
+      }
+      if (hint) hint.textContent = 'Running — smoke will call Apollo/Apify. Stay on this page.';
+      renderListRunStatus(res.list_run);
+      startListRunPolling();
+    } catch (err) {
+      if (hint) hint.textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-confirm-approve').addEventListener('click', async () => {
+    const hint = document.getElementById('confirm-status');
+    try {
+      const id = state.current && state.current.campaign_id;
+      if (!id) throw new Error('No campaign selected');
+      if (hint) hint.textContent = 'Starting full batch…';
+      const res = await api(
+        '/builder/api/campaigns/' + encodeURIComponent(id) + '/run/approve',
+        { method: 'POST', body: JSON.stringify({ confirm: true }) }
+      );
+      state.listRun = res.list_run;
+      if (state.current) state.current.list_run = res.list_run;
+      if (hint) hint.textContent = 'Full batch running…';
+      renderListRunStatus(res.list_run);
+      startListRunPolling();
+    } catch (err) {
+      if (hint) hint.textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-confirm-no').addEventListener('click', async () => {
+    const hint = document.getElementById('confirm-status');
+    try {
+      await setListBuildStatus('deferred');
+      if (hint) hint.textContent = 'Saved for later — reopen anytime from the client page';
+      const client = (state.current && state.current.client_id) || state.clientId || '';
+      if (client) {
+        setTimeout(() => {
+          location.href = '/dashboard#/client/' + encodeURIComponent(client);
+        }, 900);
+      }
+    } catch (err) {
+      if (hint) hint.textContent = errText(err);
       alert(errText(err));
     }
   });

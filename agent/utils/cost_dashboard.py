@@ -429,6 +429,21 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
         usd = float(c.get("usd_total") or 0)
         c["per_lead_usd"] = _round_usd(usd / delivered) if delivered and usd else None
 
+        # Gated-run status for dashboard "in progress / awaiting approval" badges
+        try:
+            from agent.utils.list_run import load_list_run
+
+            lr = load_list_run(Path(camp_path), c.get("campaign_id") or "")
+            c["list_run_phase"] = lr.get("phase") or "idle"
+            c["list_run_message"] = lr.get("message") or ""
+            c["list_build_status"] = (
+                (_campaign_json_meta(Path(camp_path)).get("list_build_status") or "")
+            )
+        except Exception:
+            c["list_run_phase"] = "idle"
+            c["list_run_message"] = ""
+            c["list_build_status"] = ""
+
         bucket = by_client.get(c.get("client_id") or "")
         if bucket is not None:
             bucket["contactable_leads"] = int(bucket.get("contactable_leads") or 0) + delivered
@@ -437,6 +452,9 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
         leads = int(bucket.get("contactable_leads") or 0)
         usd = float(bucket.get("usd_total") or 0)
         bucket["per_lead_usd"] = _round_usd(usd / leads) if leads and usd else None
+
+    # Ensure every folder under data/clients/ appears even with $0 / no cost runs yet.
+    _merge_clients_from_disk(data_root, by_client)
 
     all_runs.sort(key=lambda r: r.get("started_at_utc") or r.get("run_date") or "", reverse=True)
     campaigns.sort(key=lambda c: float(c.get("usd_total") or 0), reverse=True)
@@ -458,3 +476,53 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
             "delivered_leads": sum(int(c.get("delivered_leads") or 0) for c in campaigns),
         },
     }
+
+
+def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any]]) -> None:
+    """Register clients that exist on disk (ICPs / campaigns) even with no spend yet."""
+    clients_root = Path(data_root) / "clients"
+    if not clients_root.is_dir():
+        return
+    for client_dir in clients_root.iterdir():
+        if not client_dir.is_dir() or client_dir.name.startswith("."):
+            continue
+        cid = client_dir.name
+        # Legacy smoke isolation folders — never surface on the ledger
+        if cid.endswith("-smoketest"):
+            by_client.pop(cid, None)
+            continue
+        meta: dict[str, Any] = {}
+        meta_path = client_dir / "client.json"
+        if meta_path.is_file():
+            try:
+                loaded = json.loads(meta_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    meta = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        camp_ids = []
+        camps = client_dir / "campaigns"
+        if camps.is_dir():
+            camp_ids = sorted(
+                p.name for p in camps.iterdir() if p.is_dir() and not p.name.startswith(".")
+            )
+        bucket = by_client.setdefault(
+            cid,
+            {
+                "client_id": cid,
+                "client_name": meta.get("client_name") or cid,
+                "usd_total": 0.0,
+                "campaign_ids": [],
+                "contactable_leads": 0,
+                "per_lead_usd": None,
+            },
+        )
+        if meta.get("client_name") and not bucket.get("client_name"):
+            bucket["client_name"] = meta["client_name"]
+        elif meta.get("client_name") and bucket.get("client_name") == cid:
+            bucket["client_name"] = meta["client_name"]
+        # Union campaign ids from disk
+        existing = set(bucket.get("campaign_ids") or [])
+        for name in camp_ids:
+            if name not in existing:
+                bucket.setdefault("campaign_ids", []).append(name)

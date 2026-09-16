@@ -43,7 +43,11 @@ async def run_pipeline(
     """
     Full async deterministic pipeline. Updates run_tracker state throughout.
   """
-    log = get_run_logger(run_id, client_profile.client_id)
+    log = get_run_logger(
+        run_id,
+        client_profile.client_id,
+        keyword=(run_tracker.get_run(run_id).keyword if run_tracker.get_run(run_id) else None),
+    )
     log.info("=" * 60)
     log.info("PIPELINE START — run_id: %s | client: %s", run_id, client_profile.client_id)
     log.info("Mode: %s | max_leads: %d", request.mode.value, request.max_leads)

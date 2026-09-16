@@ -3,7 +3,8 @@ Run a registered deterministic seed source into stages/01_raw_seeds.csv.
 
 Usage:
   python scripts/run_seed_source.py --campaign {campaign_id} --source csv_ingest --csv path/to/seeds.csv
-  python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_jobs --url "https://..."
+  python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_companies
+  python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_jobs --url "…"  # legacy
 """
 from __future__ import annotations
 
@@ -26,9 +27,10 @@ def main() -> int:
         help=f"One of: {', '.join(list_sources())}",
     )
     parser.add_argument("--csv", default="", help="Input CSV for csv_ingest")
-    parser.add_argument("--url", action="append", default=[], help="LinkedIn jobs search URL")
-    parser.add_argument("--url-file", default="", help="File with LinkedIn jobs URLs")
+    parser.add_argument("--url", action="append", default=[], help="Legacy LinkedIn jobs URL")
+    parser.add_argument("--url-file", default="", help="File with LinkedIn jobs URLs (legacy)")
     parser.add_argument("--count", type=int, default=100)
+    parser.add_argument("--max-results", type=int, default=80)
     parser.add_argument("--actor", default="")
     parser.add_argument("--geo-segment", default="")
     args = parser.parse_args()
@@ -47,10 +49,21 @@ def main() -> int:
             print("ERROR: --csv is required for csv_ingest", file=sys.stderr)
             return 2
         kwargs["csv_path"] = args.csv
+    elif sid == "linkedin_companies":
+        kwargs["max_results"] = args.max_results or args.count
+        if args.actor:
+            kwargs["actor"] = args.actor
+        if args.geo_segment:
+            kwargs["geo_segment"] = args.geo_segment
+    elif sid == "google_maps":
+        kwargs["max_results"] = args.max_results or args.count
+        if args.geo_segment:
+            kwargs["geo_segment"] = args.geo_segment
     elif sid == "linkedin_jobs":
         kwargs["urls"] = args.url or None
         kwargs["url_file"] = args.url_file or None
         kwargs["count"] = args.count
+        kwargs["_allow_jobs"] = True
         if args.actor:
             kwargs["actor"] = args.actor
         if args.geo_segment:
@@ -61,8 +74,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
-    print(f"Wrote raw seeds -> {out}")
+    print(f"Wrote {out}")
     return 0
 
 

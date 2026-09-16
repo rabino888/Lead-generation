@@ -3,10 +3,15 @@ Deterministic seed-source registry.
 
 Operator step 2 (LLM) chooses a source id; step 4 runs it with no LLM.
 Apollo mixed_companies/search is intentionally NOT registered.
+
+Company discovery: prefer google_maps (businesses by keyword+location).
+linkedin_jobs remains for hiring_first / talent-adjacent lists only.
 """
 from __future__ import annotations
 
 import csv
+import json
+import os
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Callable
@@ -47,6 +52,14 @@ def _write_raw_seeds_csv(campaign: CampaignConfig, rows: list[dict[str, Any]]) -
         for row in rows:
             w.writerow(row)
     return out
+
+
+def _maybe_firmographics(rows: list[dict[str, Any]], *, enabled: bool) -> list[dict[str, Any]]:
+    if not enabled or not rows:
+        return rows
+    from agent.utils.firmographics import enrich_seed_rows_firmographics
+
+    return enrich_seed_rows_firmographics(rows, prefer_enriched_website=True)
 
 
 def run_csv_ingest(
@@ -94,6 +107,107 @@ def run_csv_ingest(
     return out
 
 
+def run_google_maps(
+    campaign: CampaignConfig,
+    *,
+    queries: list[dict[str, str]] | None = None,
+    keyword: str = "",
+    location: str = "",
+    max_results: int = 50,
+    geo_segment: str = "",
+    firmographics: bool = True,
+) -> Path:
+    """Discover companies via Google Maps (Apify) → stages/01_raw_seeds.csv."""
+    from agent.integrations.apify import google_maps_search
+
+    cfg = load_seed_sources(campaign)
+    entry = cfg.source_by_id("google_maps")
+    resolved_queries: list[dict[str, str]] = list(queries or [])
+    if not resolved_queries and entry:
+        conf = entry.config or {}
+        resolved_queries = list(conf.get("queries") or [])
+        max_results = int(conf.get("max_results") or max_results)
+        geo_segment = conf.get("geo_segment") or geo_segment
+        if conf.get("firmographics") is False:
+            firmographics = False
+        if not resolved_queries and conf.get("keyword"):
+            resolved_queries = [{
+                "keyword": str(conf.get("keyword")),
+                "location": str(conf.get("location") or geo_segment or ""),
+            }]
+    if not resolved_queries and keyword:
+        resolved_queries = [{"keyword": keyword, "location": location or geo_segment}]
+    if not resolved_queries:
+        raise ValueError(
+            "google_maps requires queries=[{keyword, location}] or seed_sources.json config"
+        )
+
+    segment = geo_segment or (
+        campaign.segment_order[0] if campaign.segment_order else "default"
+    )
+    per_query = max(5, int(max_results) // max(1, len(resolved_queries)))
+    seen_domains: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for q in resolved_queries:
+        kw = (q.get("keyword") or "").strip()
+        loc = (q.get("location") or location or "").strip()
+        if not kw:
+            continue
+        companies = google_maps_search(kw, loc, max_results=per_query)
+        for c in companies:
+            website = (c.website or "").strip()
+            if not website:
+                continue
+            from agent.utils.google_maps_seeds import root_domain
+
+            domain = root_domain(website)
+            if domain and domain in seen_domains:
+                continue
+            if domain:
+                seen_domains.add(domain)
+            rows.append(
+                {
+                    "seed_id": "",
+                    "company_name": c.company_name or "",
+                    "website": website if website.startswith("http") else f"https://{website}",
+                    "location": c.location or loc,
+                    "geo_segment": segment,
+                    "source_url": f"google_maps:{kw}",
+                    "status": "pending",
+                    "notes": f"Google Maps | query: {kw}",
+                    "industry": c.industry or "",
+                    "company_size": c.company_size or "",
+                }
+            )
+
+    rows = _maybe_firmographics(rows, enabled=firmographics)
+    for i, row in enumerate(rows, start=1):
+        row["seed_id"] = f"{campaign.seed_id_prefix}-{i:04d}"
+
+    out = _write_raw_seeds_csv(campaign, rows)
+    with campaign.seeds_csv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SEED_HEADERS, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+    touch_seed_source_run(
+        campaign,
+        "google_maps",
+        ref=str(out),
+        seeds_added=len(rows),
+        why_chosen="Google Maps keyword+location → company seeds",
+        source_type="google_maps",
+        config_update={
+            "queries": resolved_queries,
+            "max_results": max_results,
+            "geo_segment": segment,
+            "firmographics": firmographics,
+        },
+    )
+    return out
+
+
 def run_linkedin_jobs(
     campaign: CampaignConfig,
     *,
@@ -102,6 +216,8 @@ def run_linkedin_jobs(
     count: int = 100,
     actor: str | None = None,
     geo_segment: str = "",
+    firmographics: bool = True,
+    resolve_li_websites: bool | None = None,
 ) -> Path:
     """Scrape LinkedIn jobs via Apify and write stages/01_raw_seeds.csv."""
     from agent.utils.linkedin_jobs_seeds import (
@@ -110,6 +226,7 @@ def run_linkedin_jobs(
         assign_seed_ids,
         jobs_to_seeds,
         load_linkedin_jobs_urls,
+        prefer_linkedin_company_websites,
         scrape_linkedin_jobs,
     )
 
@@ -124,6 +241,8 @@ def run_linkedin_jobs(
         count = int(entry.config.get("count") or count)
         actor = entry.config.get("actor") or actor
         geo_segment = entry.config.get("geo_segment") or geo_segment
+        if entry.config.get("firmographics") is False:
+            firmographics = False
 
     try:
         resolved_urls = load_linkedin_jobs_urls(
@@ -139,10 +258,29 @@ def run_linkedin_jobs(
         campaign.segment_order[0] if campaign.segment_order else DEFAULT_GEO_SEGMENT
     )
     jobs = scrape_linkedin_jobs(resolved_urls, count=count, actor_id=actor_id)
-    seeds, dropped = jobs_to_seeds(jobs, geo_segment=segment, require_website=True)
-    seeds = assign_seed_ids(seeds, prefix=campaign.seed_id_prefix)
 
+    # Persist raw jobs for forensics / employee index (pre-Apollo gate)
+    raw_path = campaign.campaign_dir / "linkedin_jobs_raw.json"
+    try:
+        raw_path.write_text(json.dumps(jobs, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+    seeds, dropped = jobs_to_seeds(jobs, geo_segment=segment, require_website=True)
+
+    # Prefer LinkedIn company About website over jobs-card companyWebsite when
+    # explicitly enabled or for tiny lists (smoke-scale). Default bulk fix = foxlabs.
+    if resolve_li_websites is None:
+        resolve_li_websites = os.environ.get(
+            "LINKEDIN_RESOLVE_SEED_WEBSITES", ""
+        ).lower() in ("1", "true", "yes") or len(seeds) <= 5
+    if resolve_li_websites and seeds:
+        seeds = prefer_linkedin_company_websites(seeds)
+
+    seeds = assign_seed_ids(seeds, prefix=campaign.seed_id_prefix)
     rows = [asdict(s) for s in seeds]
+    rows = _maybe_firmographics(rows, enabled=firmographics)
+
     out = _write_raw_seeds_csv(campaign, rows)
 
     with campaign.seeds_csv.open("w", encoding="utf-8", newline="") as f:
@@ -156,7 +294,7 @@ def run_linkedin_jobs(
         "linkedin_jobs",
         ref=str(out),
         seeds_added=len(rows),
-        why_chosen="LinkedIn jobs search → company seeds",
+        why_chosen="LinkedIn jobs search → company seeds (hiring signal; not primary discovery)",
         source_type="linkedin_jobs",
         config_update={
             "urls": resolved_urls,
@@ -164,6 +302,99 @@ def run_linkedin_jobs(
             "actor": actor_id,
             "geo_segment": segment,
             "dropped_count": len(dropped),
+            "firmographics": firmographics,
+            "resolve_li_websites": bool(resolve_li_websites),
+        },
+    )
+    return out
+
+
+def run_linkedin_companies(
+    campaign: CampaignConfig,
+    *,
+    queries: list[dict[str, Any]] | None = None,
+    urls: list[str] | None = None,
+    max_results: int = 80,
+    actor: str | None = None,
+    geo_segment: str = "",
+    scraper_mode: str = "full",
+    firmographics: bool = False,
+) -> Path:
+    """
+    LinkedIn company search (not jobs) → stages/01_raw_seeds.csv.
+
+    Deterministic: ICP → company-search URLs/queries → harvestapi scrape.
+    Full mode returns the company About website (correct local TLD).
+    """
+    from agent.utils.linkedin_company_seeds import (
+        DEFAULT_ACTOR,
+        companies_to_seed_rows,
+        scrape_linkedin_companies,
+    )
+
+    cfg = load_seed_sources(campaign)
+    entry = cfg.source_by_id("linkedin_companies")
+    resolved_queries: list[dict[str, Any]] = list(queries or [])
+    if not resolved_queries and entry:
+        conf = entry.config or {}
+        resolved_queries = list(conf.get("queries") or [])
+        max_results = int(conf.get("max_results") or max_results)
+        geo_segment = conf.get("geo_segment") or geo_segment
+        actor = conf.get("actor") or actor
+        scraper_mode = conf.get("scraper_mode") or scraper_mode
+        if conf.get("firmographics") is True:
+            firmographics = True
+    if not resolved_queries:
+        raise ValueError(
+            "linkedin_companies requires queries from ICP / seed_sources.json "
+            "(searchQuery + locations). Jobs search is not used."
+        )
+
+    segment = geo_segment or (
+        campaign.segment_order[0] if campaign.segment_order else "default"
+    )
+    actor_id = actor or DEFAULT_ACTOR
+    companies = scrape_linkedin_companies(
+        resolved_queries,
+        max_results=max_results,
+        actor_id=actor_id,
+        scraper_mode=scraper_mode,
+    )
+
+    raw_path = campaign.campaign_dir / "linkedin_companies_raw.json"
+    try:
+        raw_path.write_text(
+            json.dumps(companies, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+    rows = companies_to_seed_rows(
+        companies, geo_segment=segment, prefix=campaign.seed_id_prefix
+    )
+    rows = _maybe_firmographics(rows, enabled=firmographics)
+
+    out = _write_raw_seeds_csv(campaign, rows)
+    with campaign.seeds_csv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SEED_HEADERS, extrasaction="ignore")
+        w.writeheader()
+        for row in rows:
+            w.writerow(row)
+
+    touch_seed_source_run(
+        campaign,
+        "linkedin_companies",
+        ref=str(out),
+        seeds_added=len(rows),
+        why_chosen="LinkedIn company search URLs from ICP → company seeds",
+        source_type="linkedin_companies",
+        config_update={
+            "queries": resolved_queries,
+            "urls": list(urls or []) or [q.get("url") for q in resolved_queries if q.get("url")],
+            "max_results": max_results,
+            "actor": actor_id,
+            "geo_segment": segment,
+            "scraper_mode": scraper_mode,
         },
     )
     return out
@@ -172,12 +403,15 @@ def run_linkedin_jobs(
 def _blocked_apollo(**_kwargs: Any) -> Path:
     raise RuntimeError(
         "Apollo company search (mixed_companies/search) is not a registered seed source. "
-        "Use csv_ingest or linkedin_jobs. See docs/OPERATOR-WORKFLOW.md."
+        "Use csv_ingest, google_maps, or linkedin_jobs. See docs/OPERATOR-WORKFLOW.md."
     )
 
 
 REGISTRY: dict[str, Runner] = {
     "csv_ingest": run_csv_ingest,
+    "google_maps": run_google_maps,
+    "linkedin_companies": run_linkedin_companies,
+    # linkedin_jobs kept for legacy CLI only — gated auto-seed never calls it
     "linkedin_jobs": run_linkedin_jobs,
 }
 
@@ -190,6 +424,13 @@ def run_source(campaign_id: str, source_id: str, **kwargs: Any) -> Path:
     sid = source_id.strip().lower()
     if sid in BLOCKED_APOLLO_SOURCES:
         return _blocked_apollo()
+    if sid == "linkedin_jobs" and kwargs.pop("_allow_jobs", None) is not True:
+        # Hard block unless explicit legacy opt-in (CLI scripts pass _allow_jobs=True)
+        if os.environ.get("ALLOW_LINKEDIN_JOBS_SEED", "").lower() not in ("1", "true", "yes"):
+            raise RuntimeError(
+                "linkedin_jobs seeding is disabled. Use linkedin_companies (company search) "
+                "or csv_ingest / google_maps. Set ALLOW_LINKEDIN_JOBS_SEED=1 only for legacy runs."
+            )
     if sid not in REGISTRY:
         raise KeyError(
             f"Unknown seed source '{source_id}'. "

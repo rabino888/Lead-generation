@@ -497,6 +497,106 @@ def list_campaign_dirs(campaigns_root: Path) -> list[Path]:
     )
 
 
+def _list_run_summary(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
+    try:
+        from agent.utils.list_run import load_list_run
+
+        return load_list_run(campaign_dir, campaign_id)
+    except Exception:
+        return {
+            "schema_version": 1,
+            "campaign_id": campaign_id,
+            "phase": "idle",
+            "smoke_leads": 2,
+            "target_leads": 50,
+            "message": "",
+            "error": "",
+        }
+
+
+def _seed_plan_summary(campaign_dir: Path, icp: dict[str, Any]) -> dict[str, Any]:
+    """How the gated run will obtain company seeds (dashboard Confirm)."""
+    from agent.utils.linkedin_company_seeds import preview_auto_linkedin_companies_seed
+    from agent.utils.seeds import load_company_seeds_csv
+
+    stages = campaign_dir / "stages" / "01_raw_seeds.csv"
+    if stages.is_file():
+        try:
+            import csv as _csv
+
+            with stages.open(encoding="utf-8-sig", newline="") as f:
+                n = sum(1 for r in _csv.DictReader(f) if (r.get("company_name") or "").strip())
+            if n:
+                return {
+                    "ok": True,
+                    "mode": "stage_csv",
+                    "count": n,
+                    "message": f"Using existing stages/01_raw_seeds.csv ({n} companies).",
+                }
+        except Exception:
+            pass
+
+    seeds_csv = campaign_dir / "seeds.csv"
+    if seeds_csv.is_file():
+        try:
+            rows = load_company_seeds_csv(seeds_csv)
+            if rows:
+                return {
+                    "ok": True,
+                    "mode": "csv_ingest",
+                    "count": len(rows),
+                    "message": f"Using seeds.csv ({len(rows)} companies) — free ingest.",
+                }
+        except Exception:
+            pass
+
+    ss_path = campaign_dir / "seed_sources.json"
+    if ss_path.is_file():
+        try:
+            cfg = json.loads(ss_path.read_text(encoding="utf-8"))
+            for entry in cfg.get("sources") or []:
+                if not isinstance(entry, dict) or entry.get("enabled") is False:
+                    continue
+                sid = (entry.get("id") or entry.get("type") or "").strip()
+                conf = entry.get("config") if isinstance(entry.get("config"), dict) else {}
+                if sid == "linkedin_jobs":
+                    continue
+                if sid == "linkedin_companies":
+                    queries = list(conf.get("queries") or [])
+                    urls = list(conf.get("urls") or [])
+                    if queries or urls:
+                        return {
+                            "ok": True,
+                            "mode": "linkedin_companies",
+                            "query_count": len(queries) or len(urls),
+                            "urls": (urls or [q.get("url") for q in queries])[:8],
+                            "count": int(conf.get("max_results") or 80),
+                            "message": (
+                                f"Configured linkedin_companies — "
+                                f"{len(queries) or len(urls)} company-search quer(y/ies), "
+                                "Apify scrape on Start (paid; not jobs)."
+                            ),
+                        }
+                if sid == "google_maps":
+                    queries = list(conf.get("queries") or [])
+                    if queries or conf.get("keyword"):
+                        return {
+                            "ok": True,
+                            "mode": "google_maps",
+                            "query_count": len(queries) or 1,
+                            "queries": queries[:8],
+                            "count": int(conf.get("max_results") or 80),
+                            "message": (
+                                f"Configured google_maps — {len(queries) or 1} quer(y/ies), "
+                                "Apify company discovery on Start (paid)."
+                            ),
+                        }
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    return preview_auto_linkedin_companies_seed(icp)
+
+
 def campaign_summary(campaign_dir: Path) -> dict[str, Any]:
     campaign_id = campaign_dir.name
     display_name = campaign_id
@@ -552,16 +652,28 @@ def campaign_summary(campaign_dir: Path) -> dict[str, Any]:
             except (OSError, json.JSONDecodeError):
                 pass
 
+    from agent.utils.icp_readiness import assess_icp_depth
+
+    ctype = plan.get("campaign_type") or campaign_meta.get("campaign_type") or "company_outreach"
+    depth = assess_icp_depth(icp if isinstance(icp, dict) else {}, campaign_type=ctype)
+    seed_plan = _seed_plan_summary(campaign_dir, icp if isinstance(icp, dict) else {})
+
     return {
         "campaign_id": campaign_id,
         "display_name": display_name,
         "client_id": client_id or None,
         "client_name": client_name or None,
         "icp_id": campaign_meta.get("icp_id") or None,
-        "campaign_type": plan.get("campaign_type") or "company_outreach",
+        "campaign_type": ctype,
         "has_saved_plan": has_plan_file,
         "plan_updated_at_utc": plan.get("updated_at_utc"),
         "brief": campaign_meta.get("brief") or "",
+        "list_build_status": campaign_meta.get("list_build_status") or "",
+        "list_run": _list_run_summary(campaign_dir, campaign_id),
+        "icp_ready": depth["ready"],
+        "icp_missing": depth["missing"],
+        "icp_remedy": depth["remedy"],
+        "seed_plan": seed_plan,
         "disk_path": str(campaign_dir.resolve()),
         "icp": {
             "job_titles": titles[:12],

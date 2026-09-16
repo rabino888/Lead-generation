@@ -111,6 +111,9 @@ def main() -> int:
         elif args.source == "linkedin_jobs":
             kwargs["urls"] = args.url or None
             kwargs["url_file"] = args.url_file or None
+            kwargs["_allow_jobs"] = True
+        elif args.source == "linkedin_companies":
+            pass
         out = run_source(args.campaign, args.source, **kwargs)
         print(f"Raw seeds -> {out}")
     elif not stage_path(campaign, "raw_seeds").exists():

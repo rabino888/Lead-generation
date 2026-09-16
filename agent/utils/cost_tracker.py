@@ -231,7 +231,10 @@ class CostTracker:
 def persist_cost_diagnostic(diagnostic: dict[str, Any]) -> str:
   client_id = diagnostic.get("client_id", "unknown")
   run_id = diagnostic.get("run_id", "unknown")
-  out_dir = Path("data") / "clients" / client_id / "runs"
+  from agent.utils.client_paths import client_runs_dir
+
+  keyword = diagnostic.get("keyword")
+  out_dir = client_runs_dir(client_id, keyword=keyword if isinstance(keyword, str) else None)
   out_dir.mkdir(parents=True, exist_ok=True)
   path = out_dir / f"{run_id}_cost_diagnostic.json"
   with open(path, "w", encoding="utf-8") as f:

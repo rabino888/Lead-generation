@@ -12,6 +12,16 @@ from urllib.parse import urlparse
 from agent.utils.icp_rules import IcpRules
 from agent.utils.icp_seed_quality import weak_seed_reason
 
+# Always-on cheap gate: LinkedIn jobs often label recruiters as the client's industry.
+RECRUITER_NAME_RE = re.compile(
+    r"\b("
+    r"talent|staffing|recruit|reclut|headhunt|rr\.?\s*hh|recursos\s+humanos|"
+    r"selecci[oó]n(\s+de\s+personal)?|new\s+talent|people\s+search|"
+    r"executive\s+search|personnel|manpower|adecco|randstad"
+    r")\b",
+    re.I,
+)
+
 
 def _root_domain(url: str) -> str:
     if not url:
@@ -73,11 +83,15 @@ def match_company(
     if not website:
         return False, ["missing website"]
 
-    # Excluded name / industry patterns
+    # Cheap recruiter / staffing name gate (no website crawl required)
+    if RECRUITER_NAME_RE.search(name):
+        return False, ["recruiter_or_staffing_name"]
+
+    # Excluded name / industry patterns — also scan notes (LinkedIn often buries industry there)
     pattern_str = rules.merged_excluded_name_pattern()
     if pattern_str:
         pattern = re.compile(pattern_str, re.I)
-        if pattern.search(name) or pattern.search(industry):
+        if pattern.search(name) or pattern.search(industry) or pattern.search(blob):
             return False, ["excluded_name_pattern"]
 
     # Excluded keywords (substring in company blob)
@@ -95,6 +109,11 @@ def match_company(
             return False, [f"excluded_website_suffix:{s}"]
 
     industry_lower = industry.lower()
+    if not industry_lower:
+        # LinkedIn jobs often only put industry into notes
+        m = re.search(r"industry:\s*([^|]+)", blob, re.I)
+        if m:
+            industry_lower = m.group(1).strip().lower()
     for blocked in rules.excluded_industries:
         if blocked and blocked.lower() in industry_lower:
             return False, [f"excluded_industry:{blocked}"]
@@ -113,17 +132,19 @@ def match_company(
         if rules.company_size_max is not None and emp > rules.company_size_max:
             return False, [f"company_size_above_max:{emp}>{rules.company_size_max}"]
 
-    # Location hints — opt-in hard gate (curated seeds often omit reliable geo)
+    # Location — hard gate when require_location_match (company location only;
+    # do not trust search geo_segment — jobs/maps queries stamp every row).
     if rules.require_location_match:
-        hints = [h.lower() for h in rules.location_hints if h]
-        if rules.location:
-            hints.append(rules.location.lower())
-        if hints:
-            loc_l = location.lower()
-            geo = (seed_row.get("geo_segment") or "").lower()
-            hay = f"{loc_l} {geo}"
-            if not any(h in hay for h in hints):
-                return False, ["location_mismatch"]
+        from agent.utils.location_match import location_matches_icp
+
+        if not location_matches_icp(
+            location,
+            website=website,
+            primary_location=rules.location,
+            location_hints=rules.location_hints,
+            contact_locations=rules.contact_locations,
+        ):
+            return False, ["location_mismatch"]
 
     if rules.require_include_keywords and rules.keywords:
         if not any(kw.lower() in blob for kw in rules.keywords if kw):
