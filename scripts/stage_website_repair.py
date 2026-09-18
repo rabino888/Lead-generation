@@ -155,7 +155,12 @@ def main() -> int:
         action="store_true",
         help="Bypass lock and 24h run cap (operator override)",
     )
-    parser.add_argument("--rebuild-cost-dashboard", action="store_true")
+    parser.add_argument(
+        "--rebuild-cost-dashboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rebuild cost ledger after logging (default: on)",
+    )
     args = parser.parse_args()
 
     log = get_logger("stage_website_repair")

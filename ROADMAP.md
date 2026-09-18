@@ -6,7 +6,11 @@ Locked decisions and rationale: **`docs/DECISIONS.md`**. Operator playbook:
 `docs/OPERATOR-WORKFLOW.md`. Automata pass improvements: **`docs/Improvements 24-08.md`**.
 Pre-run list-building control: **`SPEC-dashboard.md`**; MVP at **`GET /builder`**
 (plan save → `enrichment_plan.json`, live $/lead estimate). Post-run cost ledger: `/dashboard`.
-Talent search pipeline: **`SPEC-talent-search.md`** (board live; stages TBD).
+
+Talent search pipeline: **`SPEC-talent-search.md`** — **T01–T06** +
+`scripts/run_talent_campaign.py` done (seed → dedupe → ICP → profile → Apollo →
+optional phone via company webhook path). **Builder gated run** works for talent
+(Confirm smoke → Approve full batch via `talent_list_run`).
 
 | Campaign snapshot | Status |
 |-------------------|--------|
@@ -15,6 +19,101 @@ Talent search pipeline: **`SPEC-talent-search.md`** (board live; stages TBD).
 | **Allyjob Spain** (2026-07-06) | 52 contactable, 45 phones |
 | Phone webhook | Railway standalone (`apollo-phone-webhook` repo) |
 | Main FastAPI app | Local only (not on Railway yet) |
+
+---
+
+## Talent Search — Executable tasks (SPEC-talent-search.md)
+
+**Spec:** [`SPEC-talent-search.md`](SPEC-talent-search.md) (approved for build).  
+**Reuse first:** `agent/utils/talent_people.py`, `linkedin_people_seeds.py`,
+`scripts/stage_talent_seed.py`, `agent/integrations/apify.py` (`get_linkedin_person_profile`),
+`agent/utils/deduplication.py`, `agent/integrations/apollo.py`, `agent/utils/enrichment_plan.py`,
+`/builder` talent board. Do **not** reimplement company website/LinkedIn-jobs paths.
+
+### Parallel groups
+
+| Group | Tasks | Notes |
+|-------|-------|-------|
+| **G0** | TS-0 | Foundation — renumber stage constants to match locked order |
+| **G1** | TS-1, TS-2, TS-3, TS-4 | After TS-0; spawn together (disjoint files) |
+| **G2** | TS-5, TS-6 | After G1 (need T02/T03 CSV contracts) |
+| **G3** | TS-7 | Orchestrator after G2 |
+| **G4** | TS-8 | Phone — after TS-7 (phase E); optional in MVP |
+
+### Tasks
+
+#### [x] TS-0 — Renumber talent stage constants + filenames
+- **Creates:** Updated `STAGE_*` in `agent/utils/talent_people.py`; fix any imports/tests that assumed profile=T02
+- **Context:** `SPEC-talent-search.md` §6; `agent/utils/talent_people.py`; `tests/test_talent_people.py`
+- **Done means:** Constants are T01 raw → T02 dedupe → T03 ICP → T04 profiles → T05 Apollo → T06 phone; tests green
+- **Depends on:** —
+
+#### [x] TS-1 — Lock HarvestAPI people seed actor
+- **Creates:** Default `harvestapi/linkedin-profile-search` in `linkedin_people_seeds.py`; actor input builder (query/title/location/maxItems); env `APIFY_LINKEDIN_PEOPLE_SEARCH_ACTOR` override only
+- **Context:** `SPEC-talent-search.md` §7 T01; `agent/utils/linkedin_people_seeds.py`; `agent/utils/seed_sources.py` (`run_linkedin_people`); company pattern in `linkedin_company_seeds.py`
+- **Done means:** `linkedin_people` runs without requiring a blank actor; maps HarvestAPI items → T01 rows; unit test with fixture JSON (no live Apify)
+- **Depends on:** TS-0
+
+#### [x] TS-2 — T02 person dedupe stage CLI
+- **Creates:** `scripts/stage_talent_dedupe.py`; helper in `agent/utils/` (or extend deduplication) writing `T02_deduped.csv` / `T02_dedupe_rejected.csv`
+- **Context:** `SPEC-talent-search.md` §7 T02; `agent/utils/deduplication.py`; `scripts/stage_dedupe.py` (pattern only)
+- **Done means:** Dedupes T01 by normalized LinkedIn URL; optional Sheets ContactDedup hook behind flag; pytest with fixture CSV
+- **Depends on:** TS-0
+
+#### [x] TS-3 — T03 person ICP match stage CLI
+- **Creates:** `agent/utils/talent_icp.py`; `scripts/stage_talent_icp.py` → `T03_icp_matched.csv` / `T03_icp_rejected.csv`
+- **Context:** `SPEC-talent-search.md` §7 T03 + §8; `agent/utils/icp_match.py`; `agent/utils/icp_readiness.py`; `location_match.py`
+- **Done means:** Rules on seed title/headline/location/keywords/exclusions; reject reasons written; no LLM; pytest
+- **Depends on:** TS-0
+
+#### [x] TS-4 — Estimate + builder copy: profile after ICP
+- **Creates:** Updated `_estimate_talent` in `enrichment_plan.py`; builder warning strings; tests in `tests/test_builder.py`
+- **Context:** `SPEC-talent-search.md` §4.2; `agent/utils/enrichment_plan.py`; `agent/dashboard/static/builder.html` (talent warnings if present)
+- **Done means:** Profile line uses `survivors_after_icp × profile_usd`; warning no longer says every seed pays profile; estimate tests updated
+- **Depends on:** —
+
+#### [x] TS-5 — T04 personal profile stage CLI
+- **Creates:** `scripts/stage_talent_profile.py` reading T03 → `T04_profiles.csv` / `T04_profile_failed.csv`
+- **Context:** `SPEC-talent-search.md` §7 T04; `agent/integrations/apify.py` (`get_linkedin_person_profile`); cost manifest patterns from `stage_linkedin_enrich.py`
+- **Done means:** Only ICP survivors scraped; `APIFY_SKIP_LINKEDIN_POSTS=1`; `profile_status` set; cost_runs append; mockable unit test
+- **Depends on:** TS-0, TS-3 (schema)
+
+#### [x] TS-6 — T05 Apollo email-by-LinkedIn stage CLI
+- **Creates:** `scripts/stage_talent_apollo.py` → `T05_apollo_contactable.csv` / `T05_apollo_rejected.csv`
+- **Context:** `SPEC-talent-search.md` §7 T05; `agent/integrations/apollo.py`; `scripts/stage_apollo.py` (pattern); D3 personal email gate
+- **Done means:** Match/reveal by LinkedIn URL; no email → rejected; cost tracking; pytest with mocked Apollo
+- **Depends on:** TS-0, TS-5 (input is profiled rows; allow `--input` override for tests)
+
+#### [x] TS-7 — Talent orchestrator T01→T05
+- **Creates:** `scripts/run_talent_campaign.py`; refuse path already on company runner stays
+- **Context:** `SPEC-talent-search.md` §6.1; `scripts/run_deterministic_campaign.py` (refuse pattern); stage CLIs from TS-1…TS-6
+- **Done means:** Loads `enrichment_plan.json` requiring `talent_search`; runs stages in locked order; `--skip-paid` stops before T04; dry-run docs in script docstring
+- **Depends on:** TS-1, TS-2, TS-3, TS-5, TS-6
+
+#### [x] TS-8 — T06 phone + talent deliverable (phase E)
+- **Creates:** Wire phone reveal into talent orchestrator when `modules.apollo_phone`; person Sheet/CSV export columns
+- **Context:** `SPEC-talent-search.md` §7 T06; `scripts/request_apollo_phone_reveals.py`; report/Sheets helpers
+- **Done means:** Phone skipped when plan off; webhook path reused; delivered columns person-oriented
+- **Depends on:** TS-7
+
+### Review log
+
+| Task | Verdict | Notes |
+|------|---------|-------|
+| TS-0 | pass | Constants match SPEC §6; fixed stale list_run talent error copy; 6 tests pass |
+| TS-1 | pass | HarvestAPI default + Short input; fixed `source_by_type` for custom source ids |
+| TS-2 | pass | T02 dedupe CLI + helper; 5 tests |
+| TS-3 | pass | Seed-field ICP → T03; 9 tests |
+| TS-4 | pass | Profile cost on ICP survivors; builder board order updated |
+| TS-5 | pass | T04 profile CLI; cost phase=`talent_linkedin_profile`; PERSON_ACTOR env alias |
+| TS-6 | pass | T05 Apollo D3 gate; `--include-failed-profiles` loads failed CSV |
+| TS-7 | pass | Orchestrator T01→T05; `--skip-paid` after T03; fixed URL→keywords seed path |
+| TS-8 | pass | T06 reuses company phone webhook; plan gate + `--skip-phone`; 17 tests |
+| — | — | — |
+
+---
+
+## Company funnel status (unchanged)
 
 The funnel uses `icp.json` rules + keyword-overlap scoring only — no LLM company prefilter or LLM qualify. Entry points:
 `scripts/run_seed_source.py`, `scripts/match_campaign_icp.py`, independent `stage_*.py` CLIs,

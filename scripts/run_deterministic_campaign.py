@@ -102,6 +102,28 @@ def main() -> int:
     ensure_stages_dir(campaign)
     rules = load_icp_rules(campaign)
 
+    # Refuse talent campaigns / person seed sources (SPEC-talent-search.md §11)
+    from agent.utils.enrichment_plan import load_plan
+
+    plan = load_plan(campaign.campaign_dir, campaign.campaign_id)
+    if (plan.get("campaign_type") or "").strip() == "talent_search":
+        print(
+            "ERROR: this is a talent_search campaign. "
+            "Use scripts/stage_talent_seed.py (T01) / run_talent_campaign.py — "
+            "not run_deterministic_campaign.py.",
+            file=sys.stderr,
+        )
+        return 2
+    talent_sources = {"people_csv_ingest", "linkedin_people"}
+    if (args.source or "").strip().lower() in talent_sources:
+        print(
+            "ERROR: talent seed sources belong to the people funnel. "
+            "Use: python scripts/stage_talent_seed.py --campaign … --source "
+            f"{args.source}",
+            file=sys.stderr,
+        )
+        return 2
+
     # ── Stage 4: seed scrape / ingest ─────────────────────────────────────────
     if args.source:
         kwargs: dict = {}

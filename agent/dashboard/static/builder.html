@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/portal.css">
+  <script src="/static/create_prefill.js"></script>
 </head>
 <body>
   <div class="page">
@@ -45,22 +46,24 @@
               <input id="create-client-name" type="text" placeholder="e.g. Allyjob" autocomplete="organization"></label>
             <label>Client id <span class="hint" style="text-transform:none;letter-spacing:0;font-weight:400">(folder key · auto from name)</span>
               <input id="create-client-new" type="text" placeholder="e.g. allyjob" autocomplete="off"></label>
+            <label>Client brief (optional)
+              <textarea id="create-brief" placeholder="What this client does / who they sell to. Saved on client.json — used when prefilling a new ICP/ITP."></textarea></label>
           </div>
 
-          <p class="create-step">2 · ICP</p>
-          <label>ICP source
+          <p class="create-step" id="create-step-targeting">2 · ICP</p>
+          <label id="create-icp-mode-label"><span id="create-noun-source">ICP</span> source
             <select id="create-icp-mode">
-              <option value="new">Create new ICP</option>
-              <option value="existing">Use existing ICP (copy targeting)</option>
+              <option value="new" id="create-icp-opt-new">Create new ICP</option>
+              <option value="existing" id="create-icp-opt-existing">Use existing ICP (copy targeting)</option>
             </select></label>
-          <label id="create-icp-source-wrap" class="hidden">Existing ICP
+          <label id="create-icp-source-wrap" class="hidden"><span id="create-noun-existing">Existing ICP</span>
             <select id="create-icp-source">
               <option value="">Select an ICP…</option>
             </select></label>
           <p class="savehint" id="create-icp-hint">New ICP opens blank/heuristic setup next. Existing copies rules into this campaign.</p>
 
           <p class="create-step">3 · Campaign name</p>
-          <label>ICP / campaign name
+          <label id="create-label-wrap"><span id="create-noun-label">ICP</span> / campaign name
             <input id="create-label" type="text" placeholder="e.g. Headhunting US 1-50" required></label>
           <p class="savehint" id="create-folder-hint">Folder id is auto-assigned; this name is what you see on the ledger.</p>
 
@@ -68,11 +71,9 @@
             <span class="seglabel">Outreach type</span>
             <div class="segmented" id="create-type">
               <button type="button" class="segbtn on" data-type="company_outreach">Company outreach</button>
-              <button type="button" class="segbtn" data-type="talent_search">Talent search</button>
+              <button type="button" class="segbtn" data-type="talent_search">Talent outreach</button>
             </div>
           </div>
-          <label>Client brief (optional)
-            <textarea id="create-brief" placeholder="e.g. COOs, CTOs, marketing directors of headhunting companies in USA between 1 and 50 employees. Prefills ICP locally — no Gemini/OpenAI."></textarea></label>
         </div>
         <div class="create-actions">
           <button type="button" class="btn primary" id="btn-create">Create &amp; open ICP setup</button>
@@ -119,12 +120,12 @@
         </div>
         <div class="brief-block" id="setup-brief-block">
           <div class="brief-head">
-            <h3>Client brief</h3>
-            <span class="hint" id="setup-brief-hint">Editable · saved with the campaign</span>
+            <h3 id="setup-brief-title">ICP description</h3>
+            <span class="hint" id="setup-brief-hint">Editable · saved on the ICP/ITP</span>
           </div>
           <textarea id="setup-brief-edit" class="brief-edit" rows="4" placeholder="Titles, industry, geo, size, must-haves…"></textarea>
           <div class="setup-actions" style="margin-top:8px">
-            <button type="button" class="btn" id="btn-save-brief">Save brief</button>
+            <button type="button" class="btn" id="btn-save-brief">Save description</button>
             <span class="savehint" id="brief-status"></span>
           </div>
         </div>
@@ -252,6 +253,7 @@
   const qs = new URLSearchParams(location.search);
   const state = {
     campaigns: [],
+    clients: [],
     clientId: null,
     clientName: null,
     activeCampaignId: null,
@@ -292,6 +294,9 @@
 
   function money(n) { return '$' + (Math.round((n || 0) * 100) / 100).toFixed(2); }
   function intfmt(n) { return Math.round(n || 0).toLocaleString('en-US'); }
+  function outreachLabel(ctype) { return ctype === 'talent_search' ? 'talent outreach' : 'company outreach'; }
+  function targetingLabel(ctype) { return ctype === 'talent_search' ? 'ITP' : 'ICP'; }
+  const TYPE_LABEL = { company_outreach: 'company outreach', talent_search: 'talent outreach' };
 
   /** FastAPI may return detail as string, object, or list of {msg,loc} — never alert raw objects. */
   function formatApiDetail(detail, fallback) {
@@ -338,6 +343,12 @@
   async function loadList() {
     const data = await api('/builder/api/campaigns');
     state.campaigns = data.campaigns || [];
+    try {
+      const clientsPayload = await api('/builder/api/clients');
+      state.clients = clientsPayload.clients || [];
+    } catch (_) {
+      state.clients = [];
+    }
     fillClientFilters();
 
     const campaignId = qs.get('campaign');
@@ -353,37 +364,91 @@
       return;
     }
     if (isNew || (clientParam && isNew)) {
-      showCreateView(true);
-      const client = clientParam;
-      const ctype = qs.get('type');
-      if (ctype === 'talent_search' || ctype === 'company_outreach') {
-        document.querySelectorAll('#create-type .segbtn').forEach((b) => {
-          b.classList.toggle('on', b.dataset.type === ctype);
-        });
-      }
-      if (client) {
-        const known = [...document.querySelectorAll('#create-client option')].some((o) => o.value === client);
-        const mode = document.getElementById('create-client-mode');
-        if (known) {
-          if (mode) mode.value = 'existing';
-          document.getElementById('create-client').value = client;
-        } else {
-          if (mode) mode.value = 'new';
-          document.getElementById('create-client-new').value = client;
-        }
-        syncClientMode();
-      }
-      try {
-        const brief = sessionStorage.getItem('builder_brief');
-        if (brief) {
-          document.getElementById('create-brief').value = brief;
-          sessionStorage.removeItem('builder_brief');
-        }
-      } catch (e) { /* ignore */ }
+      await applyCreateQueryPrefill();
       return;
     }
     // No builder context — cost ledger is the only home page
     location.replace('/dashboard');
+  }
+
+  async function applyCreateQueryPrefill() {
+    const client = (qs.get('client') || '').trim();
+    const ctype = qs.get('type');
+    const icpParam = (qs.get('icp') || '').trim();
+
+    showCreateView(true);
+
+    // Prefer server-side modular prefill (works for every client, ICP-only included)
+    if (client && window.PortalCreatePrefill) {
+      try {
+        const params = new URLSearchParams();
+        params.set('client', client);
+        if (icpParam) params.set('icp', icpParam);
+        if (ctype) params.set('type', ctype);
+        const prefill = await api('/builder/api/create-prefill?' + params.toString());
+        // Keep local client cache in sync with disk list from prefill
+        if (prefill.clients && prefill.clients.length) {
+          state.clients = prefill.clients;
+          fillClientFilters();
+        }
+        await window.PortalCreatePrefill.applyPrefillPayload(prefill, {
+          syncClientMode: syncClientMode,
+          syncIcpMode: syncIcpMode,
+          syncCreateTypeLabels: syncCreateTypeLabels,
+          fillCreateIcpSource: fillCreateIcpSource,
+          applyCreateIcpSourceType: applyCreateIcpSourceType,
+        });
+        return;
+      } catch (err) {
+        const status = document.getElementById('create-status');
+        if (status) status.textContent = errText(err, 'Prefill failed — fill the form manually');
+      }
+    }
+
+    // Fallback (no shared module / API error)
+    if (ctype === 'talent_search' || ctype === 'company_outreach') {
+      document.querySelectorAll('#create-type .segbtn').forEach((b) => {
+        b.classList.toggle('on', b.dataset.type === ctype);
+      });
+    }
+    if (client) {
+      const mode = document.getElementById('create-client-mode');
+      if (mode) mode.value = 'existing';
+      ensureClientInSelect(client);
+      const createSel = document.getElementById('create-client');
+      if (createSel) createSel.value = client;
+      syncClientMode();
+    }
+    syncCreateTypeLabels();
+    if (icpParam) {
+      const icpMode = document.getElementById('create-icp-mode');
+      if (icpMode) icpMode.value = 'existing';
+      syncIcpMode();
+    }
+    await fillCreateIcpSource();
+    if (icpParam) {
+      const sel = document.getElementById('create-icp-source');
+      if (sel && [...sel.options].some((o) => o.value === icpParam)) {
+        sel.value = icpParam;
+        applyCreateIcpSourceType();
+      }
+    }
+  }
+
+  function ensureClientInSelect(clientId) {
+    const createSel = document.getElementById('create-client');
+    if (!createSel || !clientId) return;
+    if ([...createSel.options].some((o) => o.value === clientId)) return;
+    const known = (state.clients || []).find((c) => c.client_id === clientId);
+    const name = (known && known.client_name) || clientId;
+    // Drop placeholder "No clients yet" if present
+    if (createSel.options.length === 1 && !createSel.options[0].value) {
+      createSel.innerHTML = '';
+    }
+    const opt = document.createElement('option');
+    opt.value = clientId;
+    opt.textContent = name + ' (' + clientId + ')';
+    createSel.appendChild(opt);
   }
 
   function showCreateView(on) {
@@ -391,10 +456,19 @@
     const create = document.getElementById('view-create');
     if (create) create.classList.toggle('hidden', !on);
     if (on) {
-      syncClientMode();
+      syncClientModeUiOnly();
+      syncCreateTypeLabels();
       updateFolderHint();
-      fillCreateIcpSource();
     }
+  }
+
+  function syncClientModeUiOnly() {
+    const mode = (document.getElementById('create-client-mode') || {}).value || 'existing';
+    const existingWrap = document.getElementById('create-client-existing-wrap');
+    const newWrap = document.getElementById('create-client-new-wrap');
+    const isNew = mode === 'new';
+    if (existingWrap) existingWrap.classList.toggle('hidden', isNew);
+    if (newWrap) newWrap.classList.toggle('hidden', !isNew);
   }
 
   function currentCreateClientId() {
@@ -434,28 +508,53 @@
           .filter((c) => c.ready !== false);
       }
     }
-    sel.innerHTML = '<option value="">Select an ICP…</option>'
+    sel.innerHTML = '<option value="">Select a ' + targetingLabel(
+      ((document.querySelector('#create-type .segbtn.on') || {}).dataset || {}).type || 'company_outreach'
+    ) + '…</option>'
       + rows.map((c) => {
-        const ctype = String(c.campaign_type || 'company_outreach').replace(/_/g, ' ');
+        const ctype = c.campaign_type || 'company_outreach';
         const name = c.display_name || c.icp_id;
         const titles = ((c.icp && c.icp.job_titles) || []).slice(0, 2).join(', ');
-        const label = name + ' · ' + ctype + (titles ? ' · ' + titles : '');
-        return `<option value="${c.icp_id}" data-type="${c.campaign_type || 'company_outreach'}">${label}</option>`;
+        const label = name + ' · ' + (TYPE_LABEL[ctype] || outreachLabel(ctype))
+          + (titles ? ' · ' + titles : '');
+        return `<option value="${c.icp_id}" data-type="${ctype}">${label}</option>`;
       }).join('');
     if (prev && [...sel.options].some((o) => o.value === prev)) sel.value = prev;
     else sel.value = '';
     const hint = document.getElementById('create-icp-hint');
     if (hint && mode === 'existing') {
+      const noun = targetingLabel(
+        ((document.querySelector('#create-type .segbtn.on') || {}).dataset || {}).type || 'company_outreach'
+      );
       if (rows.length) {
-        hint.textContent = rows.length + ' ready ICP(s) for this client'
+        hint.textContent = rows.length + ' ready ' + noun + '(s) for this client'
           + (hiddenThin ? (' · ' + hiddenThin + ' incomplete hidden — finish them in Cursor first') : '')
           + '.';
       } else {
         hint.textContent = hiddenThin
-          ? (hiddenThin + ' ICP(s) on disk are too thin to reuse. Finish Automata-depth icp.json in Cursor, then reload.')
-          : 'No ICPs for this client yet. Create a new ICP first, or switch to “Create new ICP”.';
+          ? (hiddenThin + ' ' + noun + '(s) on disk are too thin to reuse. Finish Automata-depth icp.json in Cursor, then reload.')
+          : 'No ' + noun + 's for this client yet. Create a new ' + noun + ' first, or switch to “Create new ' + noun + '”.';
       }
     }
+    syncIcpMode();
+  }
+
+  function syncCreateTypeLabels() {
+    const typeBtn = document.querySelector('#create-type .segbtn.on');
+    const ctype = (typeBtn && typeBtn.dataset.type) || 'company_outreach';
+    const noun = targetingLabel(ctype);
+    const step = document.getElementById('create-step-targeting');
+    if (step) step.textContent = '2 · ' + noun;
+    const src = document.getElementById('create-noun-source');
+    if (src) src.textContent = noun;
+    const existing = document.getElementById('create-noun-existing');
+    if (existing) existing.textContent = 'Existing ' + noun;
+    const labelNoun = document.getElementById('create-noun-label');
+    if (labelNoun) labelNoun.textContent = noun;
+    const optNew = document.getElementById('create-icp-opt-new');
+    if (optNew) optNew.textContent = 'Create new ' + noun;
+    const optEx = document.getElementById('create-icp-opt-existing');
+    if (optEx) optEx.textContent = 'Use existing ' + noun + ' (copy targeting)';
     syncIcpMode();
   }
 
@@ -464,11 +563,13 @@
     const wrap = document.getElementById('create-icp-source-wrap');
     if (wrap) wrap.classList.toggle('hidden', mode !== 'existing');
     const hint = document.getElementById('create-icp-hint');
+    const typeBtn = document.querySelector('#create-type .segbtn.on');
+    const noun = targetingLabel((typeBtn && typeBtn.dataset.type) || 'company_outreach');
     if (hint) {
       if (mode === 'existing') {
         hint.textContent = 'Copies targeting into a new campaign folder. You still name this list in step 3.';
       } else {
-        hint.textContent = 'Opens ICP setup next (brief heuristics + Cursor planning). Name the list in step 3.';
+        hint.textContent = 'Opens ' + noun + ' setup next (brief heuristics + Cursor planning). Name the list in step 3.';
       }
     }
     updateFolderHint();
@@ -482,10 +583,11 @@
     document.querySelectorAll('#create-type .segbtn').forEach((b) => {
       b.classList.toggle('on', b.dataset.type === ctype);
     });
+    syncCreateTypeLabels();
     const labelEl = document.getElementById('create-label');
     if (labelEl && !labelEl.value.trim() && opt) {
       const text = (opt.textContent || '').split(' · ')[0];
-      if (text && text !== 'Select an ICP…') labelEl.value = text + ' (new list)';
+      if (text && !text.startsWith('Select a')) labelEl.value = text + ' (new list)';
     }
     updateFolderHint();
   }
@@ -520,11 +622,12 @@
     const label = (document.getElementById('create-label') || {}).value || '';
     const typeBtn = document.querySelector('#create-type .segbtn.on');
     const ctype = (typeBtn && typeBtn.dataset.type) || 'company_outreach';
+    const profile = ctype === 'talent_search' ? 'talent_outreach' : 'company_outreach';
     const suffix = label.trim()
       ? slugPart(label, ctype === 'talent_search' ? 'talent' : 'outreach')
       : (ctype === 'talent_search' ? 'talent' : 'outreach');
     hint.textContent = 'Ledger name is what you type above. Folder example: data/clients/'
-      + slugPart(clientId, 'client') + '/campaigns/'
+      + slugPart(clientId, 'client') + '/' + profile + '/campaigns/'
       + slugPart(clientId, 'client') + '_' + suffix + '/';
   }
 
@@ -556,7 +659,10 @@
     }
     const label = (document.getElementById('create-label').value || '').trim();
     if (!label) {
-      alert('Enter an ICP / campaign name (e.g. Headhunting US 1-50).');
+      const noun = targetingLabel(
+        ((document.querySelector('#create-type .segbtn.on') || {}).dataset || {}).type || 'company_outreach'
+      );
+      alert('Enter an ' + noun + ' / campaign name (e.g. Headhunting US 1-50).');
       return;
     }
     const icpMode = (document.getElementById('create-icp-mode') || {}).value || 'new';
@@ -564,16 +670,27 @@
       ? ((document.getElementById('create-icp-source') || {}).value || '')
       : '';
     if (icpMode === 'existing' && !icpSource) {
-      alert('Select an existing ICP to link, or switch to “Create new ICP”.');
+      const noun = targetingLabel(
+        ((document.querySelector('#create-type .segbtn.on') || {}).dataset || {}).type || 'company_outreach'
+      );
+      alert('Select an existing ' + noun + ' to link, or switch to “Create new ' + noun + '”.');
       return;
     }
-    const brief = (document.getElementById('create-brief').value || '').trim();
+    const briefEl = document.getElementById('create-brief');
+    const brief = (mode === 'new' && briefEl) ? (briefEl.value || '').trim() : '';
     if (icpSource) applyCreateIcpSourceType();
     const typeBtn = document.querySelector('#create-type .segbtn.on');
     const campaign_type = (typeBtn && typeBtn.dataset.type) || 'company_outreach';
+    const noun = targetingLabel(campaign_type);
     const status = document.getElementById('create-status');
     status.textContent = 'Creating…';
     try {
+      if (mode === 'new') {
+        await api('/builder/api/clients/' + encodeURIComponent(client_id), {
+          method: 'PUT',
+          body: JSON.stringify({ client_name, brief: brief || null }),
+        });
+      }
       const payload = {
         client_id,
         client_name,
@@ -587,7 +704,7 @@
         body: JSON.stringify(payload),
       });
       const campaign_id = res.campaign.campaign_id;
-      status.textContent = 'Created ' + label + ' — opening ICP setup';
+      status.textContent = 'Created ' + label + ' — opening ' + noun + ' setup';
       qs.delete('new');
       qs.delete('campaign');
       const refreshed = await api('/builder/api/campaigns');
@@ -607,13 +724,14 @@
   }
 
   function clientOptions() {
-    const map = {};
-    state.campaigns.forEach((c) => {
-      const id = c.client_id || '';
-      if (!id) return;
-      map[id] = c.client_name || id;
-    });
-    return Object.entries(map).sort((a, b) => a[1].localeCompare(b[1]));
+    const merged = (window.PortalCreatePrefill
+      && window.PortalCreatePrefill.mergeClientOptions)
+      ? window.PortalCreatePrefill.mergeClientOptions(state.clients || [], state.campaigns || [])
+      : (state.clients || []).map((c) => ({
+        client_id: c.client_id,
+        client_name: c.client_name || c.client_id,
+      }));
+    return merged.map((c) => [c.client_id, c.client_name || c.client_id]);
   }
 
   function fillClientFilters() {
@@ -628,13 +746,20 @@
       : '<option value="">No clients yet — register a new one</option>';
     if (preferred && known.has(preferred)) {
       createSel.value = preferred;
+    } else if (preferred) {
+      // ICP-only / race: inject preferred client so Generate campaign can prefill
+      ensureClientInSelect(preferred);
+      createSel.value = preferred;
+      known.add(preferred);
     } else if (existing && known.has(existing)) {
       createSel.value = existing;
     } else if (opts.length) {
       createSel.selectedIndex = 0;
     }
     const mode = document.getElementById('create-client-mode');
-    if (mode && preferred && !known.has(preferred) && qs.get('new') === '1') {
+    if (mode && preferred && (known.has(preferred) || qs.get('icp'))) {
+      mode.value = 'existing';
+    } else if (mode && preferred && !known.has(preferred) && qs.get('new') === '1') {
       mode.value = 'new';
       const idInput = document.getElementById('create-client-new');
       if (idInput) idInput.value = preferred;
@@ -643,8 +768,11 @@
     } else if (mode && !opts.length) {
       mode.value = 'new';
     }
-    syncClientMode();
-    fillCreateIcpSource();
+    syncClientModeUiOnly();
+    // Don't fire fillCreateIcpSource here during new+icp bootstrap — applyCreateQueryPrefill awaits it
+    if (!(qs.get('new') === '1' && (qs.get('icp') || '').trim())) {
+      fillCreateIcpSource();
+    }
   }
 
   function appendFactHtml(label, value) {
@@ -815,7 +943,8 @@
     const seeds = lr.seed_preview || [];
     const smokeRows = lr.smoke_preview || [];
     const show = seeds.length || smokeRows.length || lr.phase === 'awaiting_approval'
-      || lr.phase === 'smoking' || lr.phase === 'matching' || lr.phase === 'seeding';
+      || lr.phase === 'smoking' || lr.phase === 'matching' || lr.phase === 'seeding'
+      || lr.phase === 'error';
     if (!show) {
       box.classList.add('hidden');
       return;
@@ -849,7 +978,7 @@
       p.textContent = 'Seed list will appear here when scraping finishes…';
       box.appendChild(p);
     }
-    if (smokeRows.length || lr.smoke_run_id || lr.phase === 'awaiting_approval') {
+    if (smokeRows.length || lr.smoke_run_id || lr.phase === 'awaiting_approval' || lr.phase === 'error') {
       const h2 = document.createElement('h4');
       h2.textContent = 'Smoke results'
         + (counts.smoke_contactable != null
@@ -873,6 +1002,12 @@
         p.className = 'setup-note';
         p.textContent = 'Smoke finished with no contactable emails (Apollo reject). '
           + 'Seed list above is still reviewable — re-smoke or approve with caution.';
+        box.appendChild(p);
+      } else if (lr.phase === 'error') {
+        const p = document.createElement('p');
+        p.className = 'setup-note';
+        p.textContent = 'Smoke was interrupted before a contactable CSV was written. '
+          + 'Partial Apollo outcomes may appear above after refresh; otherwise re-run smoke.';
         box.appendChild(p);
       }
       const campId = (state.current && state.current.campaign_id) || '';
@@ -1261,8 +1396,9 @@
     const disk = campaignDiskPath();
     const brief = ((state.current && state.current.brief) || '').trim();
     const ctype = (state.plan && state.plan.campaign_type) || 'company_outreach';
+    const noun = targetingLabel(ctype);
     return [
-      'Draft a complete deterministic ICP for this lead-gen campaign.',
+      'Draft a complete deterministic ' + noun + ' for this lead-gen campaign.',
       '',
       'Constraints:',
       '- No paid LLM/vendor APIs for this step — edit local files only.',
@@ -1274,13 +1410,13 @@
       '  excluded_domains, job_titles, contact_locations, website_analysis_mode, …).',
       '- Prefer the icp-draft skill / SOP-ICP-PLANNING.md when available.',
       '- Also follow docs/ICP-INTAKE-TEMPLATE.md for field meaning.',
-      '- Campaign type: ' + ctype,
-      '- Personalise every field to this client brief — do not leave a thin stub.',
-      '- Ask me clarifying questions before writing if the brief is thin.',
+      '- Campaign type: ' + (TYPE_LABEL[ctype] || outreachLabel(ctype)),
+      '- Personalise every field to this ' + noun + ' description — do not leave a thin stub.',
+      '- Ask me clarifying questions before writing if the ' + noun + ' description is thin.',
       '- After writing the file, summarize what you set and what is still uncertain.',
       '',
-      'Client brief:',
-      brief || '(no brief saved — ask me for titles, industry, geo, size, excludes)',
+      noun + ' description:',
+      brief || '(no description saved — ask me for titles, industry, geo, size, excludes)',
       '',
       'When done, I will click “Reload ICP from disk” in /builder.',
     ].join('\n');
@@ -1345,18 +1481,24 @@
   function renderSetupBrief() {
     const briefEl = document.getElementById('setup-brief-edit');
     const hintEl = document.getElementById('setup-brief-hint');
+    const titleEl = document.getElementById('setup-brief-title');
     const pathEl = document.getElementById('setup-campaign-path');
     const notePath = document.getElementById('setup-note-path');
     const disk = campaignDiskPath();
     if (pathEl) pathEl.textContent = disk;
     if (notePath) notePath.textContent = disk;
+    const ctype = (state.plan && state.plan.campaign_type)
+      || (state.current && state.current.campaign_type)
+      || 'company_outreach';
+    const noun = targetingLabel(ctype);
+    if (titleEl) titleEl.textContent = noun + ' description';
+    // Always keep the block editable — operators can add a description after the questionnaire
     if (!briefEl) return;
-    const brief = ((state.current && state.current.brief) || '').trim();
-    briefEl.value = brief;
+    briefEl.value = ((state.current && state.current.brief) || '');
     if (hintEl) {
-      hintEl.textContent = brief
-        ? 'Editable · also in campaign.json for Cursor'
-        : 'Optional · edit here or in Cursor';
+      hintEl.textContent = (briefEl.value || '').trim()
+        ? 'Editable · saved on library ' + noun + ' meta.json'
+        : 'Add a description anytime · saved on library ' + noun + ' meta.json';
     }
   }
 
@@ -1379,30 +1521,46 @@
         <label class="en"><input type="checkbox" class="seed-en" ${s.enabled ? 'checked' : ''}>
           <span class="sid">${s.type || s.id || 'source'} · ${s.name || s.id || ''}</span></label>
         <div class="smeta">${s.why_chosen || s.tier || ''}</div>
-        ${(s.type === 'csv_ingest' || (s.config && s.config.csv_path))
+        ${(s.type === 'csv_ingest' || s.type === 'people_csv_ingest' || (s.config && s.config.csv_path))
           ? `<label style="margin-top:8px">CSV path<input class="seed-csv" type="text" value="${(s.config && s.config.csv_path) || ''}"></label>`
           : ''}
       </div>`).join('')
-      : '<p style="margin:0;font-size:.84rem;color:var(--ink-3)">No sources yet. Ask the IDE agent to draft <code>seed_sources.json</code> from directories / notes, or add a csv_ingest entry after save.</p>';
+      : `<p style="margin:0;font-size:.84rem;color:var(--ink-3)">No sources yet. ${isTalent
+        ? 'Add <code>people_csv_ingest</code> or <code>linkedin_people</code>, or place <code>people_seeds.csv</code> in the campaign folder.'
+        : 'Ask the IDE agent to draft <code>seed_sources.json</code> from directories / notes, or add a csv_ingest entry after save.'}</p>`;
     document.getElementById('seed-fields').innerHTML = `
-      <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">Primary path is <b>linkedin_companies</b> (ICP → company-search URLs → Apify) or <b>csv_ingest</b> ($0). LinkedIn jobs is blocked.</p>
+      <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">${isTalent
+        ? 'Talent path: <b>linkedin_people</b> (Apify people search) or <b>people_csv_ingest</b> ($0). Confirm/Start runs the gated talent funnel (smoke → approve).'
+        : 'Primary path is <b>linkedin_companies</b> (ICP → company-search URLs → Apify) or <b>csv_ingest</b> ($0). LinkedIn jobs is blocked.'}</p>
       ${cards}
       <div class="setup-actions" style="margin-top:4px">
-        <button type="button" class="btn" id="add-csv-seed">+ csv_ingest source</button>
+        <button type="button" class="btn" id="add-csv-seed">+ ${isTalent ? 'people_csv_ingest' : 'csv_ingest'} source</button>
       </div>`;
     const addBtn = document.getElementById('add-csv-seed');
     if (addBtn) addBtn.onclick = () => {
       const doc = state.seeds && typeof state.seeds === 'object' ? state.seeds : { sources: [] };
       if (!Array.isArray(doc.sources)) doc.sources = [];
-      doc.sources.push({
-        id: 'csv_ingest_' + (doc.sources.length + 1),
-        type: 'csv_ingest',
-        name: 'Curated CSV ingest',
-        why_chosen: 'Operator-curated seed list',
-        enabled: true,
-        tier: 'primary',
-        config: { csv_path: 'data/campaigns/' + state.current.campaign_id + '/seeds.csv' },
-      });
+      if (isTalent) {
+        doc.sources.push({
+          id: 'people_csv_ingest_' + (doc.sources.length + 1),
+          type: 'people_csv_ingest',
+          name: 'People CSV ingest',
+          why_chosen: 'Operator-curated person list',
+          enabled: true,
+          tier: 'primary',
+          config: { csv_path: 'data/campaigns/' + state.current.campaign_id + '/people_seeds.csv' },
+        });
+      } else {
+        doc.sources.push({
+          id: 'csv_ingest_' + (doc.sources.length + 1),
+          type: 'csv_ingest',
+          name: 'Curated CSV ingest',
+          why_chosen: 'Operator-curated seed list',
+          enabled: true,
+          tier: 'primary',
+          config: { csv_path: 'data/campaigns/' + state.current.campaign_id + '/seeds.csv' },
+        });
+      }
       state.seeds = doc;
       renderSetup();
     };
@@ -1451,8 +1609,8 @@
     const isTalent = p.campaign_type === 'talent_search';
     const locked = document.getElementById('board-type-locked');
     if (locked) {
-      locked.textContent = String(p.campaign_type || 'company_outreach').replace(/_/g, ' ')
-        + ' · locked at ICP creation';
+      locked.textContent = (TYPE_LABEL[p.campaign_type] || outreachLabel(p.campaign_type))
+        + ' · locked at ' + targetingLabel(p.campaign_type) + ' creation';
     }
     document.getElementById('save-hint').textContent = `PUT /builder/api/campaigns/${c.campaign_id}/plan · ${p.campaign_type}`;
     document.getElementById('save-status').textContent = state.dirty ? 'Unsaved changes' : (p.updated_at_utc ? 'Saved ' + p.updated_at_utc : 'Using defaults until save');
@@ -1521,9 +1679,9 @@
     const by = Object.fromEntries((e.line_items || []).map((x) => [x.module_id, x]));
     const steps = [
       ['1', 'fixed', 'Initial seed scrape', 'Apify LinkedIn people / jobs → person URLs', by.talent_seed],
-      ['2', 'fixed', 'Personal profile scrape', 'apimaestro · every seed', by.talent_profile],
-      ['3', 'locked', 'Deduplication', 'LinkedIn URL / ContactDedup', by.dedupe],
-      ['4', 'locked', 'ICP match', 'person ICP rules', by.icp_match],
+      ['2', 'locked', 'Deduplication', 'LinkedIn URL / ContactDedup', by.dedupe],
+      ['3', 'locked', 'ICP match', 'person ICP rules', by.icp_match],
+      ['4', 'fixed', 'Personal profile scrape', 'apimaestro · ICP survivors', by.talent_profile],
       ['5', 'fixed', 'Apollo email reveal', 'ICP survivors', by.apollo_email],
       ['6', 'toggle', 'Apollo phone reveal', 'async webhook · email successes', by.apollo_phone],
     ];
@@ -1561,7 +1719,8 @@
       <div class="line"><div><div>${x.label}</div><div class="lmeta">${x.basis}</div></div>
       <div class="amt">${money(x.line_usd)}</div></div>`).join('');
     const warns = (e.warnings || []).map((w) => {
-      const cls = w.includes('OFF') || w.includes('D3') ? 'danger' : (w.includes('webhook') || w.includes('profile spend') ? 'warn' : 'info');
+      const low = String(w).toLowerCase();
+      const cls = low.includes('off') || low.includes('d3') ? 'danger' : (low.includes('webhook') || low.includes('profile spend') ? 'warn' : 'info');
       return `<div class="w ${cls}">${w}</div>`;
     }).join('');
     let funnel = '';
@@ -1670,7 +1829,9 @@
     btn.addEventListener('click', () => {
       document.querySelectorAll('#create-type .segbtn').forEach((b) => b.classList.remove('on'));
       btn.classList.add('on');
+      syncCreateTypeLabels();
       updateFolderHint();
+      fillCreateIcpSource();
     });
   });
   document.getElementById('btn-edit-icp').addEventListener('click', () => {
@@ -1694,6 +1855,10 @@
     const id = state.current && state.current.campaign_id;
     if (!id) return;
     const brief = (document.getElementById('setup-brief-edit').value || '').trim();
+    const ctype = (state.plan && state.plan.campaign_type)
+      || (state.current && state.current.campaign_type)
+      || 'company_outreach';
+    const noun = targetingLabel(ctype);
     try {
       const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/meta', {
         method: 'PUT',
@@ -1703,7 +1868,7 @@
         }),
       });
       state.current.brief = (res.campaign && res.campaign.brief) || brief;
-      if (status) status.textContent = 'Brief saved';
+      if (status) status.textContent = noun + ' description saved';
     } catch (err) {
       if (status) status.textContent = errText(err);
       alert(errText(err));

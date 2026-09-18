@@ -402,7 +402,7 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
     phones = emails if phone_on else 0.0
 
     seed_scrape = seeds * rates["talent_seed_scrape_usd"]
-    profile = seeds * rates["talent_profile_usd"]
+    profile = survivors * rates["talent_profile_usd"]
     email_reveal = survivors * rates["apollo_credits_per_lead"] * rates["apollo_per_credit"]
     phone_reveal = phones * rates["apollo_per_credit"]
     total = seed_scrape + profile + email_reveal + phone_reveal
@@ -417,16 +417,16 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
             line_usd=seed_scrape,
             basis="seed_scrape_est",
         ),
+        _line("dedupe", "Deduplication", unit_usd=0, units=0, line_usd=0, basis="local"),
+        _line("icp_match", "ICP match", unit_usd=0, units=0, line_usd=0, basis="local"),
         _line(
             "talent_profile",
             "Personal profile scrape",
             unit_usd=rates["talent_profile_usd"],
-            units=seeds,
+            units=survivors,
             line_usd=profile,
-            basis="profile_every_seed",
+            basis="profile_icp_survivors",
         ),
-        _line("dedupe", "Deduplication", unit_usd=0, units=0, line_usd=0, basis="local"),
-        _line("icp_match", "ICP match", unit_usd=0, units=0, line_usd=0, basis="local"),
         _line(
             "apollo_email",
             "Apollo email reveal",
@@ -449,7 +449,7 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
         )
 
     warnings = [
-        "Elimination runs after profile spend — every seed pays for a profile scrape before dedupe and ICP.",
+        "Profile spend applies to ICP survivors, not every seed.",
         "Pre-run estimate — seed count × assumed pass rates. Confidence est.",
     ]
     if phone_on and not (os.environ.get("APOLLO_PHONE_WEBHOOK_URL") or "").strip():

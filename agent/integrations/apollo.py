@@ -449,6 +449,94 @@ def enrich_person_by_email(
     return contact
 
 
+def enrich_person_by_linkedin(
+    linkedin_url: str,
+    *,
+    reveal_personal_emails: bool = True,
+    first_name: str = "",
+    last_name: str = "",
+    organization_name: str = "",
+    domain: str = "",
+) -> Optional[Contact]:
+    """
+    People Enrichment by LinkedIn URL (talent T05).
+
+    Primary match: ``linkedin_url`` + ``reveal_personal_emails``.
+    Fallback when URL match returns no person: name + organization / domain.
+    Phone reveal is never requested here (talent phone is TS-8 / T06).
+
+    Credits are tracked via ``get_credits_used()`` / CostTracker.
+    Returned Contact may lack ``email`` — callers enforce the D3 personal-email gate.
+    """
+    url = (linkedin_url or "").strip()
+    if not url:
+        return None
+
+    params: list[tuple[str, Any]] = [
+        ("linkedin_url", url),
+        ("reveal_personal_emails", "true" if reveal_personal_emails else "false"),
+        ("reveal_phone_number", "false"),
+    ]
+    contact = _people_match_contact(params, label=f"linkedin={url}")
+    if contact:
+        return contact
+
+    # Fallback: name + company identity when LinkedIn URL is unknown to Apollo
+    fn = (first_name or "").strip()
+    ln = (last_name or "").strip()
+    org = (organization_name or "").strip()
+    dom = (domain or "").strip().lower()
+    if not (fn or ln) or not (org or dom):
+        return None
+
+    fallback: list[tuple[str, Any]] = [
+        ("reveal_personal_emails", "true" if reveal_personal_emails else "false"),
+        ("reveal_phone_number", "false"),
+    ]
+    if fn:
+        fallback.append(("first_name", fn))
+    if ln:
+        fallback.append(("last_name", ln))
+    if org:
+        fallback.append(("organization_name", org))
+    if dom:
+        fallback.append(("domain", dom))
+    # Keep LinkedIn URL in the request when present — Apollo may still use it as a hint
+    fallback.append(("linkedin_url", url))
+    return _people_match_contact(
+        fallback,
+        label=f"name={fn} {ln} org={org or dom}",
+    )
+
+
+def _people_match_contact(
+    params: list[tuple[str, Any]],
+    *,
+    label: str,
+) -> Optional[Contact]:
+    """POST people/match, record credits, map first person to Contact."""
+    try:
+        data = _post("people/match", params=params)
+    except Exception as e:
+        log.warning("Apollo people/match failed (%s): %s", label, e)
+        return None
+
+    credits = _record_apollo_credits(data)
+    match = _first_person_match(data)
+    if not match:
+        log.info("Apollo people/match: no person for %s (credits=%s)", label, credits)
+        return None
+    contact = _contact_from_match(match)
+    log.info(
+        "Apollo people/match: %s -> email=%s linkedin=%s (credits=%s)",
+        label,
+        "yes" if contact and contact.email else "no",
+        "yes" if contact and contact.linkedin_url else "no",
+        credits,
+    )
+    return contact
+
+
 def _person_location(person: dict) -> Optional[str]:
     """'Barcelona, Spain' from Apollo person fields (city/state/country)."""
     if not person:

@@ -21,7 +21,7 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
@@ -46,19 +46,23 @@ from agent.utils.list_run import (
 )
 from agent.utils.client_store import (
     client_campaign_dir,
+    client_dir,
     ensure_client,
     extract_icp_from_campaign,
-    icp_dir,
+    find_icp_dir,
     icp_summary,
+    library_folder,
     list_client_icps,
+    load_client_meta,
     load_icp_doc,
     load_icp_meta,
+    list_clients,
+    profile_folder,
     resolve_campaign_dir,
     save_icp,
     set_campaign_display_name,
     snapshot_icp_into_campaign,
     sync_campaign_config_to_client,
-    unique_id as unique_store_id,
     _try_junction,
     _write_json,
 )
@@ -189,6 +193,31 @@ def _slug_part(value: str, *, fallback: str = "list") -> str:
     return (raw[:40] or fallback)
 
 
+@router.get("/api/create-prefill")
+async def builder_create_prefill(
+    client: str = Query(""),
+    icp: str = Query(""),
+    type: str = Query(""),
+    _: None = Depends(_check_access),
+):
+    """Resolve Generate-campaign form prefill for any client (incl. ICP-only)."""
+    from agent.utils.create_prefill import resolve_create_prefill
+
+    return resolve_create_prefill(
+        _data_root(),
+        client_id=(client or "").strip(),
+        icp_id=(icp or "").strip(),
+        campaign_type=(type or "").strip(),
+    )
+
+
+@router.get("/api/clients")
+async def builder_list_clients(_: None = Depends(_check_access)):
+    """Clients on disk (including ICP-only — not derived from campaigns)."""
+    items = list_clients(_data_root())
+    return {"clients": items, "count": len(items)}
+
+
 @router.get("/api/clients/{client_id}/icps")
 async def builder_list_client_icps(
     client_id: str,
@@ -228,9 +257,83 @@ async def builder_get_client_icp(
     }
 
 
+class ClientPut(BaseModel):
+    client_name: str = ""
+    brief: Optional[str] = None
+
+
 class IcpMetaPut(BaseModel):
     display_name: str = ""
     brief: Optional[str] = None
+
+
+@router.put("/api/clients/{client_id}")
+async def builder_put_client(
+    client_id: str,
+    body: ClientPut,
+    _: None = Depends(_check_access),
+):
+    """Create/update client.json (name + optional brief for new-client intake)."""
+    cid = (client_id or "").strip()
+    if not _CLIENT_ID_RE.match(cid):
+        raise HTTPException(status_code=400, detail="Invalid client id")
+    name = (body.client_name or "").strip()
+    ensure_client(_data_root(), cid, name, brief=body.brief)
+    try:
+        from agent.utils.cost_dashboard import load_and_sync_dashboard_index
+
+        load_and_sync_dashboard_index(_data_root())
+    except Exception:
+        pass
+    return {"ok": True, "client": load_client_meta(_data_root(), cid)}
+
+
+@router.post("/api/clients/from-source")
+async def builder_client_from_source(
+    client_name: str = Form(...),
+    notes: str = Form(""),
+    source_url: str = Form(""),
+    file: Optional[UploadFile] = File(None),
+    _: None = Depends(_check_access),
+):
+    """Create a client profile from an uploaded doc and/or public URL (no paid LLM)."""
+    from agent.utils.client_intake import create_client_from_source
+    from agent.utils.cost_dashboard import load_and_sync_dashboard_index
+
+    name = (client_name or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="client_name is required")
+    url = (source_url or "").strip()
+    upload_bytes: Optional[bytes] = None
+    upload_name = ""
+    if file is not None and (file.filename or "").strip():
+        upload_name = Path(file.filename).name
+        upload_bytes = await file.read()
+        if not upload_bytes:
+            raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    if not upload_bytes and not url and not (notes or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Provide a file, a URL, or notes to create a client profile",
+        )
+    try:
+        result = create_client_from_source(
+            _data_root(),
+            client_name=name,
+            upload_bytes=upload_bytes,
+            upload_filename=upload_name,
+            source_url=url,
+            notes=notes or "",
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Intake failed: {exc}") from exc
+    try:
+        load_and_sync_dashboard_index(_data_root())
+    except Exception:
+        pass
+    return {"ok": True, **result}
 
 
 @router.put("/api/clients/{client_id}/icps/{icp_id}/meta")
@@ -244,8 +347,8 @@ async def builder_put_client_icp_meta(
     iid = (icp_id or "").strip()
     if not _CLIENT_ID_RE.match(cid) or not _CAMPAIGN_ID_RE.match(iid):
         raise HTTPException(status_code=400, detail="Invalid client or icp id")
-    path = icp_dir(_data_root(), cid, iid)
-    if not path.is_dir():
+    path = find_icp_dir(_data_root(), cid, iid)
+    if path is None or not path.is_dir():
         raise HTTPException(status_code=404, detail=f"ICP not found: {iid}")
     name = (body.display_name or "").strip()
     if not name:
@@ -310,6 +413,10 @@ async def builder_create_campaign(
     ensure_client(data_root, client_id, client_name)
     (_campaigns_root()).mkdir(parents=True, exist_ok=True)
 
+    # Prefer request brief; fall back to client.json brief when creating a new ICP
+    if not (brief or "").strip():
+        brief = str(load_client_meta(data_root, client_id).get("brief") or "")
+
     explicit = (body.campaign_id or "").strip()
     if explicit:
         if not _CAMPAIGN_ID_RE.match(explicit):
@@ -328,8 +435,8 @@ async def builder_create_campaign(
             preferred = f"{_slug_part(client_id)}_{suffix}"
         campaign_id = _unique_campaign_id(preferred)
 
-    # Canonical home: data/clients/{client}/campaigns/{campaign}
-    path = client_campaign_dir(data_root, client_id, campaign_id)
+    # Canonical home: data/clients/{client}/{profile}/campaigns/{campaign}
+    path = client_campaign_dir(data_root, client_id, campaign_id, campaign_type=ctype)
     if path.exists():
         raise HTTPException(status_code=409, detail=f"Campaign already exists: {campaign_id}")
     path.mkdir(parents=True, exist_ok=False)
@@ -339,7 +446,7 @@ async def builder_create_campaign(
     from agent.utils.brief_icp import parse_brief_to_icp
 
     if existing_icp:
-        if not icp_dir(data_root, client_id, existing_icp).is_dir():
+        if find_icp_dir(data_root, client_id, existing_icp) is None:
             raise HTTPException(status_code=404, detail=f"ICP not found: {existing_icp}")
         from agent.utils.icp_readiness import assess_icp_depth
 
@@ -357,6 +464,8 @@ async def builder_create_campaign(
             )
         icp_id = existing_icp
         icp_stub = lib
+        if not (brief or "").strip():
+            brief = str(meta_icp.get("brief") or "")
     else:
         icp_stub = parse_brief_to_icp(
             brief,
@@ -372,7 +481,11 @@ async def builder_create_campaign(
             icp_stub.setdefault("company_size_max", None)
             icp_stub.setdefault("website_analysis_mode", "full")
         icp_preferred = _slug_part(label or display, fallback=campaign_id)
-        icp_id = unique_store_id(data_root / "clients" / client_id / "icps", icp_preferred)
+        from agent.utils.client_store import unique_icp_id
+
+        icp_id = unique_icp_id(
+            data_root, client_id, icp_preferred, campaign_type=ctype
+        )
         save_icp(
             data_root,
             client_id,
@@ -382,6 +495,7 @@ async def builder_create_campaign(
             brief=brief,
             campaign_type=ctype,
             client_name=client_name,
+            create_new=True,
         )
 
     campaign_meta = {
@@ -531,6 +645,15 @@ async def builder_put_campaign_meta(
     if body.brief is not None:
         meta["brief"] = body.brief
         dirty = True
+        # Keep library ICP/ITP meta.json description in sync
+        client_id = (meta.get("client_id") or "").strip()
+        icp_id = (meta.get("icp_id") or "").strip()
+        if client_id and icp_id:
+            lib = find_icp_dir(_data_root(), client_id, icp_id)
+            if lib is not None:
+                icp_meta = load_icp_meta(_data_root(), client_id, icp_id)
+                icp_meta["brief"] = body.brief
+                _write_json(lib / "meta.json", icp_meta)
     if body.list_build_status is not None:
         status = (body.list_build_status or "").strip().lower()
         if status and status not in ("pending", "approved", "deferred"):
@@ -591,11 +714,18 @@ async def builder_put_icp(
     else:
         _write_json_file(camp / "icp.json", data)
     sync_campaign_config_to_client(camp)
+    mirror = None
+    if client_id and icp_id:
+        ctype = str(meta.get("campaign_type") or "company_outreach")
+        mirror = (
+            f"clients/{client_id}/{profile_folder(ctype)}/"
+            f"{library_folder(ctype)}/{icp_id}/"
+        )
     return {
         "ok": True,
         "path": "icp.json",
         "icp_id": icp_id or None,
-        "client_mirror": f"clients/{client_id}/icps/{icp_id}/" if client_id and icp_id else None,
+        "client_mirror": mirror,
         "data": data,
     }
 
@@ -613,15 +743,14 @@ async def builder_get_seeds(campaign_id: str, _: None = Depends(_check_access)):
                 "csv_ingest",
                 "linkedin_companies",
                 "google_maps",
-                "linkedin_people (talent, planned)",
+                "people_csv_ingest (talent T01)",
+                "linkedin_people (talent T01; default harvestapi/linkedin-profile-search)",
             ],
             "operator_note": (
-                "Choose how seeds enter the funnel. csv_ingest is free and precise; "
-                "linkedin_companies builds company-search URLs from the ICP and scrapes "
-                "via Apify (preferred auto path — never LinkedIn jobs); "
-                "google_maps is an alternate company discovery path. "
-                "Identify sources with the IDE agent from "
-                "directories / notes — no in-app LLM."
+                "Company discovery: csv_ingest (free), linkedin_companies (ICP → company "
+                "search + Apify), or google_maps. Talent: people_csv_ingest or "
+                "linkedin_people → stages/T01_raw_people.csv. Confirm / Start in /builder "
+                "runs the gated talent funnel (T01→T05 smoke, then Approve for full batch)."
             ),
         },
     }
@@ -646,81 +775,193 @@ async def builder_put_seeds(
 async def builder_get_list_run(campaign_id: str, _: None = Depends(_check_access)):
     path = _campaign_dir(campaign_id)
     state = load_list_run(path, campaign_id)
+    # Detect talent vs company for preview hydration
+    ctype = "company_outreach"
+    try:
+        from agent.utils.talent_list_run import resolve_campaign_type
+
+        ctype = resolve_campaign_type(path, campaign_id)
+    except Exception:
+        meta = _read_json_file(path / "campaign.json", {})
+        if isinstance(meta, dict) and (meta.get("campaign_type") or "").strip():
+            ctype = str(meta["campaign_type"]).strip()
+
     # Backfill seed/smoke previews so dashboard shows list + smoke together
     if not state.get("seed_preview"):
         try:
-            from agent.utils.list_run import _seed_preview_rows
+            if ctype == "talent_search":
+                from agent.utils.talent_list_run import people_seed_preview
+                from agent.utils.talent_people import STAGE_T01_RAW_PEOPLE
 
-            preview = _seed_preview_rows(campaign_id)
-            if preview:
-                state["seed_preview"] = preview
-                counts = dict(state.get("counts") or {})
-                if "seeds" not in counts:
-                    # Full seed count from stage file when available
-                    stages = path / "stages" / "01_raw_seeds.csv"
-                    if stages.is_file():
-                        import csv as _csv
+                preview = people_seed_preview(path)
+                if preview:
+                    state["seed_preview"] = preview
+                    counts = dict(state.get("counts") or {})
+                    if "seeds" not in counts:
+                        t01 = path / "stages" / STAGE_T01_RAW_PEOPLE
+                        if t01.is_file():
+                            import csv as _csv
 
-                        with stages.open(encoding="utf-8-sig", newline="") as f:
-                            counts["seeds"] = sum(
-                                1 for r in _csv.DictReader(f)
-                                if (r.get("company_name") or "").strip()
-                            )
-                    else:
-                        counts["seeds"] = len(preview)
-                state["counts"] = counts
+                            with t01.open(encoding="utf-8-sig", newline="") as f:
+                                counts["seeds"] = sum(
+                                    1
+                                    for r in _csv.DictReader(f)
+                                    if (r.get("linkedin_url") or r.get("full_name") or "").strip()
+                                )
+                        else:
+                            counts["seeds"] = len(preview)
+                    state["counts"] = counts
+            else:
+                from agent.utils.list_run import _seed_preview_rows
+
+                preview = _seed_preview_rows(campaign_id)
+                if preview:
+                    state["seed_preview"] = preview
+                    counts = dict(state.get("counts") or {})
+                    if "seeds" not in counts:
+                        # Full seed count from stage file when available
+                        stages = path / "stages" / "01_raw_seeds.csv"
+                        if stages.is_file():
+                            import csv as _csv
+
+                            with stages.open(encoding="utf-8-sig", newline="") as f:
+                                counts["seeds"] = sum(
+                                    1 for r in _csv.DictReader(f)
+                                    if (r.get("company_name") or "").strip()
+                                )
+                        else:
+                            counts["seeds"] = len(preview)
+                    state["counts"] = counts
         except Exception:
             pass
-    if not state.get("smoke_preview") and state.get("smoke_run_id"):
+    if not state.get("smoke_preview"):
         try:
-            from agent.utils.list_run import _smoke_leads_preview
-
-            meta = _read_json_file(path / "campaign.json", {})
-            cid = (meta.get("client_id") if isinstance(meta, dict) else None) or ""
-            rid = state["smoke_run_id"]
-            candidates = [path / "stages" / "04_smoke_contactable.csv"]
-            if cid:
-                candidates.extend(
-                    [
-                        Path("data") / "clients" / cid / "smoke" / "runs" / f"{rid}.csv",
-                        Path("data") / "clients" / cid / "runs" / f"{rid}.csv",
-                        # Legacy mis-routed smoke client (…-smoketest)
-                        Path("data") / "clients" / f"{cid}-smoketest" / "runs" / f"{rid}.csv",
-                    ]
+            if ctype == "talent_search":
+                from agent.utils.talent_list_run import people_smoke_preview
+                from agent.utils.talent_people import (
+                    STAGE_T03_ICP_MATCHED,
+                    STAGE_T05_APOLLO_CONTACTABLE,
                 )
-            for cand in candidates:
-                if cand.is_file():
-                    state["smoke_preview"] = _smoke_leads_preview(cand)
-                    state["smoke_csv_path"] = str(cand)
-                    break
-            # Zero-contactable smoke: still surface smoked companies from deduped stage
-            if not state.get("smoke_preview"):
-                deduped = path / "stages" / "03_deduped.csv"
-                smoke_n = int(state.get("smoke_leads") or 0) or 2
-                if deduped.is_file():
-                    import csv as _csv
 
-                    rows: list[dict[str, str]] = []
-                    with deduped.open(encoding="utf-8-sig", newline="") as f:
-                        for r in _csv.DictReader(f):
-                            rows.append(
-                                {
-                                    "company_name": (r.get("company_name") or "").strip(),
-                                    "website": (r.get("website") or "").strip(),
-                                    "decision_maker_name": "",
-                                    "decision_maker_email": "(no email)",
-                                    "decision_maker_title": "",
-                                }
-                            )
-                            if len(rows) >= smoke_n:
-                                break
-                    if rows:
-                        state["smoke_preview"] = rows
-                        # Persist so dashboard/builder do not need backfill next time
-                        try:
-                            update_list_run(path, smoke_preview=rows)
-                        except Exception:
-                            pass
+                t05 = path / "stages" / STAGE_T05_APOLLO_CONTACTABLE
+                preview = people_smoke_preview(t05) if t05.is_file() else []
+                if not preview and (
+                    state.get("smoke_run_id") or state.get("phase") in (
+                        "awaiting_approval", "completed", "smoking"
+                    )
+                ):
+                    t03 = path / "stages" / STAGE_T03_ICP_MATCHED
+                    smoke_n = int(state.get("smoke_leads") or 0) or 2
+                    if t03.is_file():
+                        import csv as _csv
+
+                        rows: list[dict[str, str]] = []
+                        with t03.open(encoding="utf-8-sig", newline="") as f:
+                            for i, r in enumerate(_csv.DictReader(f)):
+                                if i >= smoke_n:
+                                    break
+                                rows.append(dict(r))
+                        preview = people_smoke_preview(rows)
+                if preview:
+                    state["smoke_preview"] = preview
+                    if t05.is_file():
+                        state["smoke_csv_path"] = str(t05)
+            else:
+                from agent.utils.list_run import (
+                    _smoke_leads_preview,
+                    _smoke_preview_from_run_log,
+                    find_latest_smoke_run_log,
+                )
+
+                meta = _read_json_file(path / "campaign.json", {})
+                cid = (meta.get("client_id") if isinstance(meta, dict) else None) or ""
+                rid = (state.get("smoke_run_id") or "").strip()
+                phase = (state.get("phase") or "").strip()
+                smoke_active = bool(rid) or phase in (
+                    "awaiting_approval",
+                    "error",
+                    "smoking",
+                )
+                if smoke_active:
+                    candidates = [path / "stages" / "04_smoke_contactable.csv"]
+                    if cid and rid:
+                        candidates.extend(
+                            [
+                                Path("data") / "clients" / cid / "smoke" / "runs" / f"{rid}.csv",
+                                Path("data") / "clients" / cid / "runs" / f"{rid}.csv",
+                                # Legacy mis-routed smoke client (…-smoketest)
+                                Path("data")
+                                / "clients"
+                                / f"{cid}-smoketest"
+                                / "runs"
+                                / f"{rid}.csv",
+                            ]
+                        )
+                    for cand in candidates:
+                        if cand.is_file():
+                            state["smoke_preview"] = _smoke_leads_preview(cand)
+                            state["smoke_csv_path"] = str(cand)
+                            break
+                    # Interrupted smoke (no CSV): recover Apollo Qualified/Rejected from log
+                    if not state.get("smoke_preview") and cid:
+                        import re as _re
+
+                        err = state.get("error") or ""
+                        msg = state.get("message") or ""
+                        m = _re.search(
+                            r"(run_\d{8}_\d{6}_[a-f0-9]+)", f"{err} {msg} {rid}"
+                        )
+                        log_rid = m.group(1) if m else rid
+                        # Only fall back to "latest log" when this campaign is in error/smoking
+                        allow_latest = phase in ("error", "smoking")
+                        log_path = find_latest_smoke_run_log(
+                            cid, run_id=log_rid if log_rid else ("" if not allow_latest else "")
+                        )
+                        if log_path is None and allow_latest and not log_rid:
+                            log_path = find_latest_smoke_run_log(cid)
+                        if log_path is not None:
+                            preview = _smoke_preview_from_run_log(log_path)
+                            if preview:
+                                state["smoke_preview"] = preview
+                                if not rid:
+                                    state["smoke_run_id"] = log_path.stem
+                                counts = dict(state.get("counts") or {})
+                                counts.setdefault("smoke_seeds", len(preview))
+                                counts.setdefault(
+                                    "smoke_contactable",
+                                    sum(
+                                        1
+                                        for r in preview
+                                        if (r.get("decision_maker_email") or "").strip()
+                                        and r.get("decision_maker_email") != "(no email)"
+                                    ),
+                                )
+                                state["counts"] = counts
+                    # Zero-contactable / no-log: still surface smoked companies from deduped
+                    if not state.get("smoke_preview"):
+                        deduped = path / "stages" / "03_deduped.csv"
+                        smoke_n = int(state.get("smoke_leads") or 0) or 2
+                        if deduped.is_file():
+                            import csv as _csv
+
+                            rows = []
+                            with deduped.open(encoding="utf-8-sig", newline="") as f:
+                                for r in _csv.DictReader(f):
+                                    rows.append(
+                                        {
+                                            "company_name": (
+                                                r.get("company_name") or ""
+                                            ).strip(),
+                                            "website": (r.get("website") or "").strip(),
+                                            "decision_maker_name": "",
+                                            "decision_maker_email": "(no email)",
+                                            "decision_maker_title": "",
+                                        }
+                                    )
+                                    if len(rows) >= smoke_n:
+                                        break
+                            if rows:
+                                state["smoke_preview"] = rows
         except Exception:
             pass
     return {"ok": True, "list_run": state}

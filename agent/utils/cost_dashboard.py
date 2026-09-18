@@ -478,6 +478,25 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
     }
 
 
+_CLIENT_ID_DISK_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$")
+
+
+def _iter_client_campaign_folder_names(client_dir: Path) -> list[str]:
+    """Campaign folder names under typed + legacy trees."""
+    names: set[str] = set()
+    for folder in (
+        client_dir / "company_outreach" / "campaigns",
+        client_dir / "talent_outreach" / "campaigns",
+        client_dir / "campaigns",
+    ):
+        if not folder.is_dir():
+            continue
+        for p in folder.iterdir():
+            if p.is_dir() and not p.name.startswith("."):
+                names.add(p.name)
+    return sorted(names)
+
+
 def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any]]) -> None:
     """Register clients that exist on disk (ICPs / campaigns) even with no spend yet."""
     clients_root = Path(data_root) / "clients"
@@ -491,6 +510,9 @@ def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any
         if cid.endswith("-smoketest"):
             by_client.pop(cid, None)
             continue
+        # Skip display-name folders (spaces, etc.) — portal ids are slug-only
+        if not _CLIENT_ID_DISK_RE.match(cid):
+            continue
         meta: dict[str, Any] = {}
         meta_path = client_dir / "client.json"
         if meta_path.is_file():
@@ -500,12 +522,19 @@ def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any
                     meta = loaded
             except (OSError, json.JSONDecodeError):
                 pass
-        camp_ids = []
-        camps = client_dir / "campaigns"
-        if camps.is_dir():
-            camp_ids = sorted(
-                p.name for p in camps.iterdir() if p.is_dir() and not p.name.startswith(".")
+        camp_ids = _iter_client_campaign_folder_names(client_dir)
+        # ICP/ITP-only clients (no campaigns yet) still belong on the ledger
+        has_library = any(
+            (client_dir / rel).is_dir()
+            and any(p.is_dir() and not p.name.startswith(".") for p in (client_dir / rel).iterdir())
+            for rel in (
+                Path("company_outreach") / "icps",
+                Path("talent_outreach") / "itps",
+                Path("icps"),
             )
+        )
+        if not meta_path.is_file() and not camp_ids and not has_library:
+            continue
         bucket = by_client.setdefault(
             cid,
             {
@@ -526,3 +555,69 @@ def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any
         for name in camp_ids:
             if name not in existing:
                 bucket.setdefault("campaign_ids", []).append(name)
+
+
+def sync_clients_into_index(
+    index: dict[str, Any],
+    data_root: Path,
+) -> tuple[dict[str, Any], bool]:
+    """
+    Cheap refresh of by_client from disk (no cost_runs rescan).
+
+    Returns (index, changed). Callers may persist when changed is True.
+    """
+    before = json.dumps(index.get("by_client") or {}, sort_keys=True, default=str)
+    by_client = dict(index.get("by_client") or {})
+    # Drop stale smoke / invalid keys that no longer belong
+    for cid in list(by_client.keys()):
+        if not _CLIENT_ID_DISK_RE.match(cid) or str(cid).endswith("-smoketest"):
+            by_client.pop(cid, None)
+    _merge_clients_from_disk(Path(data_root), by_client)
+    after = json.dumps(by_client, sort_keys=True, default=str)
+    changed = before != after
+    index["by_client"] = by_client
+    totals = dict(index.get("totals") or {})
+    totals["client_count"] = len(by_client)
+    index["totals"] = totals
+    return index, changed
+
+
+def persist_dashboard_index(data_root: Path, index: dict[str, Any]) -> Path:
+    path = Path(data_root) / "cost_dashboard_index.json"
+    path.write_text(json.dumps(index, indent=2, default=str), encoding="utf-8")
+    return path
+
+
+def load_and_sync_dashboard_index(data_root: Path) -> dict[str, Any]:
+    """Load cached index (or empty shell) and sync clients from disk."""
+    root = Path(data_root)
+    path = root / "cost_dashboard_index.json"
+    index: dict[str, Any]
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            index = loaded if isinstance(loaded, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            index = {}
+    else:
+        index = {}
+    if not index.get("by_client"):
+        index.setdefault("by_client", {})
+    if not index.get("campaigns"):
+        index.setdefault("campaigns", [])
+    if not index.get("runs"):
+        index.setdefault("runs", [])
+    if not index.get("totals"):
+        index["totals"] = {
+            "usd_total": 0.0,
+            "campaign_count": 0,
+            "tracked_campaign_count": 0,
+            "run_count": 0,
+            "client_count": 0,
+            "delivered_leads": 0,
+        }
+    index, changed = sync_clients_into_index(index, root)
+    if changed or not path.is_file():
+        persist_dashboard_index(root, index)
+    return index
+

@@ -1,9 +1,14 @@
 """
-Run a registered deterministic seed source into stages/01_raw_seeds.csv.
+Run a registered deterministic seed source.
+
+Company sources write stages/01_raw_seeds.csv.
+Talent sources (people_csv_ingest / linkedin_people) write stages/T01_raw_people.csv.
 
 Usage:
   python scripts/run_seed_source.py --campaign {campaign_id} --source csv_ingest --csv path/to/seeds.csv
   python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_companies
+  python scripts/run_seed_source.py --campaign {campaign_id} --source people_csv_ingest --csv people.csv
+  python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_people --url "…"
   python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_jobs --url "…"  # legacy
 """
 from __future__ import annotations
@@ -17,6 +22,8 @@ sys.path.insert(0, str(ROOT))
 
 from agent.utils.seed_sources import BLOCKED_APOLLO_SOURCES, list_sources, run_source
 
+TALENT_SEED_SOURCES = frozenset({"people_csv_ingest", "linkedin_people"})
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a deterministic campaign seed source")
@@ -26,9 +33,9 @@ def main() -> int:
         required=True,
         help=f"One of: {', '.join(list_sources())}",
     )
-    parser.add_argument("--csv", default="", help="Input CSV for csv_ingest")
-    parser.add_argument("--url", action="append", default=[], help="Legacy LinkedIn jobs URL")
-    parser.add_argument("--url-file", default="", help="File with LinkedIn jobs URLs (legacy)")
+    parser.add_argument("--csv", default="", help="Input CSV for csv_ingest / people_csv_ingest")
+    parser.add_argument("--url", action="append", default=[], help="LinkedIn search/people URL")
+    parser.add_argument("--url-file", default="", help="File with LinkedIn URLs")
     parser.add_argument("--count", type=int, default=100)
     parser.add_argument("--max-results", type=int, default=80)
     parser.add_argument("--actor", default="")
@@ -49,6 +56,15 @@ def main() -> int:
             print("ERROR: --csv is required for csv_ingest", file=sys.stderr)
             return 2
         kwargs["csv_path"] = args.csv
+    elif sid == "people_csv_ingest":
+        if args.csv:
+            kwargs["csv_path"] = args.csv
+    elif sid == "linkedin_people":
+        kwargs["urls"] = args.url or None
+        kwargs["url_file"] = args.url_file or ""
+        kwargs["max_results"] = args.max_results or args.count
+        if args.actor:
+            kwargs["actor"] = args.actor
     elif sid == "linkedin_companies":
         kwargs["max_results"] = args.max_results or args.count
         if args.actor:
@@ -74,7 +90,8 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print(f"Wrote {out}")
+    kind = "T01 people" if sid in TALENT_SEED_SOURCES else "raw seeds"
+    print(f"Wrote {kind} -> {out}")
     return 0
 
 

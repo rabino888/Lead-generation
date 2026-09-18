@@ -400,6 +400,169 @@ def run_linkedin_companies(
     return out
 
 
+def run_people_csv_ingest(
+    campaign: CampaignConfig,
+    *,
+    csv_path: str = "",
+) -> Path:
+    """Talent T01: person CSV with linkedin_url → stages/T01_raw_people.csv."""
+    from agent.utils.linkedin_people_seeds import load_people_from_csv, persist_t01
+
+    cfg = load_seed_sources(campaign)
+    entry = cfg.source_by_type("people_csv_ingest")
+    path = Path(csv_path) if csv_path else None
+    if path is None and entry:
+        path = Path((entry.config or {}).get("csv_path") or "")
+    if path is None or not str(path):
+        # Convention: people_seeds.csv in campaign folder
+        cand = campaign.campaign_dir / "people_seeds.csv"
+        path = cand if cand.is_file() else None
+    if path is None or not path.is_file():
+        raise ValueError(
+            "people_csv_ingest requires --csv path/to/people.csv "
+            "(columns: linkedin_url, optional full_name / title / location)"
+        )
+    seed_id = entry.id if entry else "people_csv_ingest"
+    rows = load_people_from_csv(
+        path,
+        seed_source_id=seed_id,
+        campaign_id=campaign.campaign_id,
+    )
+    if not rows:
+        raise RuntimeError(f"No parseable LinkedIn /in/ URLs in {path}")
+    out = persist_t01(campaign.campaign_dir, rows)
+    touch_seed_source_run(
+        campaign,
+        seed_id,
+        ref=str(out),
+        seeds_added=len(rows),
+        why_chosen="Operator-curated person CSV for talent_search T01",
+        source_type="people_csv_ingest",
+        config_update={"csv_path": str(path)},
+    )
+    return out
+
+
+def run_linkedin_people(
+    campaign: CampaignConfig,
+    *,
+    urls: list[str] | None = None,
+    url_file: str = "",
+    max_results: int = 100,
+    actor: str = "",
+    query: str = "",
+    title: str | list[str] = "",
+    location: str | list[str] = "",
+    profile_scraper_mode: str = "",
+) -> Path:
+    """Talent T01: Apify LinkedIn people search → stages/T01_raw_people.csv."""
+    from agent.utils.linkedin_people_seeds import (
+        items_from_apify_people,
+        persist_t01,
+        resolve_people_actor,
+        scrape_linkedin_people,
+    )
+
+    cfg = load_seed_sources(campaign)
+    entry = cfg.source_by_type("linkedin_people")
+    conf = (entry.config if entry else None) or {}
+    seed_id = entry.id if entry else "linkedin_people"
+    resolved_urls = list(urls or [])
+    if not resolved_urls and url_file:
+        p = Path(url_file)
+        if p.is_file():
+            resolved_urls = [
+                ln.strip()
+                for ln in p.read_text(encoding="utf-8").splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+    if not resolved_urls:
+        resolved_urls = [str(u).strip() for u in (conf.get("urls") or []) if str(u).strip()]
+
+    resolved_query = (query or conf.get("query") or conf.get("searchQuery") or "").strip()
+    resolved_title = title if title else (conf.get("title") or conf.get("titles") or "")
+    resolved_location = (
+        location
+        if location
+        else (conf.get("location") or conf.get("locations") or "")
+    )
+    max_results = int(
+        conf.get("max_results") or conf.get("target_count") or conf.get("count") or max_results
+    )
+    mode = (
+        profile_scraper_mode
+        or conf.get("profile_scraper_mode")
+        or conf.get("profileScraperMode")
+        or conf.get("scraper_mode")
+        or ""
+    )
+    actor_id = resolve_people_actor(
+        actor or conf.get("actor") or conf.get("actor_id") or ""
+    )
+
+    has_search = bool(
+        resolved_query
+        or (isinstance(resolved_title, str) and resolved_title.strip())
+        or (
+            isinstance(resolved_title, (list, tuple))
+            and any(str(t).strip() for t in resolved_title)
+        )
+        or (isinstance(resolved_location, str) and resolved_location.strip())
+        or (
+            isinstance(resolved_location, (list, tuple))
+            and any(str(loc).strip() for loc in resolved_location)
+        )
+    )
+    if not has_search and not resolved_urls:
+        raise ValueError(
+            "linkedin_people requires config.query / title / location "
+            "(HarvestAPI searchQuery / currentJobTitles / locations), "
+            "or LinkedIn people-search URL(s)."
+        )
+
+    items = scrape_linkedin_people(
+        max_results=max_results,
+        actor_id=actor_id,
+        query=resolved_query,
+        title=resolved_title,
+        location=resolved_location,
+        profile_scraper_mode=mode or "Short",
+        urls=resolved_urls or None,
+    )
+    raw_path = campaign.campaign_dir / "linkedin_people_raw.json"
+    raw_path.write_text(json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    rows = items_from_apify_people(
+        items,
+        seed_source_id=seed_id,
+        campaign_id=campaign.campaign_id,
+    )
+    if not rows:
+        raise RuntimeError(
+            f"Apify people actor returned {len(items)} item(s) but no parseable /in/ URLs"
+        )
+    out = persist_t01(campaign.campaign_dir, rows)
+    touch_seed_source_run(
+        campaign,
+        seed_id,
+        ref=str(out),
+        seeds_added=len(rows),
+        why_chosen="LinkedIn people search → talent T01 raw people",
+        source_type="linkedin_people",
+        config_update={
+            "query": resolved_query,
+            "title": resolved_title if not isinstance(resolved_title, list) else resolved_title,
+            "location": resolved_location
+            if not isinstance(resolved_location, list)
+            else resolved_location,
+            "urls": resolved_urls,
+            "max_results": max_results,
+            "actor": actor_id,
+            "profile_scraper_mode": mode or "Short",
+        },
+    )
+    return out
+
+
 def _blocked_apollo(**_kwargs: Any) -> Path:
     raise RuntimeError(
         "Apollo company search (mixed_companies/search) is not a registered seed source. "
@@ -413,6 +576,9 @@ REGISTRY: dict[str, Runner] = {
     "linkedin_companies": run_linkedin_companies,
     # linkedin_jobs kept for legacy CLI only — gated auto-seed never calls it
     "linkedin_jobs": run_linkedin_jobs,
+    # Talent search (SPEC-talent-search.md T01)
+    "people_csv_ingest": run_people_csv_ingest,
+    "linkedin_people": run_linkedin_people,
 }
 
 

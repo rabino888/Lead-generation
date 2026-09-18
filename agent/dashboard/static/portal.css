@@ -404,6 +404,47 @@ a { color: var(--accent-ink); }
 }
 .brief-box .hint { font-size: .78rem; color: var(--ink-3); margin-top: 6px; }
 
+.intake-panel { max-width: 40rem; }
+.intake-panel h2 {
+  font-family: var(--font-display);
+  font-size: 1.15rem;
+  margin: 0 0 8px;
+}
+.intake-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  margin-top: 14px;
+}
+.intake-form > label {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: .82rem;
+  color: var(--ink-2);
+  font-weight: 500;
+}
+.intake-form input[type="text"],
+.intake-form input[type="url"],
+.intake-form textarea {
+  font-family: var(--font-body);
+  font-size: .95rem;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--bg);
+  color: var(--ink);
+}
+.intake-form input[type="file"] {
+  font-size: .85rem;
+}
+.intake-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 4px;
+}
+
 .subsection { margin-top: 14px; }
 .subsection > h3 { margin-bottom: 8px; }
 .subsection > .note, .note { font-size: .82rem; color: var(--ink-3); max-width: 60ch; margin-bottom: 8px; }
@@ -437,15 +478,24 @@ a.icp-card:hover { background: color-mix(in srgb, var(--accent) 7%, var(--surfac
   box-sizing: border-box;
 }
 .icp-acc-item:last-child { border-bottom: 0; }
+.icp-acc-row {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  padding-right: 12px;
+  box-sizing: border-box;
+}
 .icp-acc-head {
   display: flex;
   flex-direction: row;
   align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
-  width: 100%;
+  flex: 1 1 auto;
+  min-width: 0;
+  width: auto;
   box-sizing: border-box;
-  padding: 14px 18px;
+  padding: 14px 8px 14px 18px;
   border: 0;
   margin: 0;
   background: transparent;
@@ -455,7 +505,7 @@ a.icp-card:hover { background: color-mix(in srgb, var(--accent) 7%, var(--surfac
   font: inherit;
 }
 .icp-acc-head:hover { background: color-mix(in srgb, var(--accent) 6%, var(--surface)); }
-.icp-acc-item.open > .icp-acc-head {
+.icp-acc-item.open > .icp-acc-row > .icp-acc-head {
   background: color-mix(in srgb, var(--accent) 8%, var(--surface));
   box-shadow: inset 3px 0 0 var(--accent);
 }
@@ -487,7 +537,21 @@ a.icp-card:hover { background: color-mix(in srgb, var(--accent) 7%, var(--surfac
   border: 1px solid var(--line); border-radius: 4px; background: var(--surface); color: var(--ink);
   max-width: 420px;
 }
-.icp-rename-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.icp-rename-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 10px; }
+.icp-acc-row .icp-gen-btn {
+  flex-shrink: 0;
+  align-self: center;
+  font-size: .78rem;
+  padding: 6px 10px;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.icp-acc-row .icp-gen-btn.disabled,
+.icp-acc-body .btn.disabled {
+  opacity: .45;
+  pointer-events: auto;
+  cursor: not-allowed;
+}
 .icp-acc-chevron {
   flex: 0 0 auto;
   margin-left: auto;

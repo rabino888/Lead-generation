@@ -201,10 +201,10 @@ def finalize_stage_cost(
     outcome: Optional[dict[str, Any]] = None,
     extra: Optional[dict[str, Any]] = None,
     apollo_extra: Optional[dict[str, Any]] = None,
-    rebuild_dashboard: bool = False,
+    rebuild_dashboard: bool = True,
 ) -> tuple[Path, Path]:
     """
-    Persist cost_log_{run_id}.json, append cost_runs.json, optionally rebuild dashboard.
+    Persist cost_log_{run_id}.json, append cost_runs.json, rebuild ledger by default.
     Returns (cost_log_path, manifest_path).
     """
     from agent.utils.apify_spend import persist_stage_cost_report
@@ -232,5 +232,26 @@ def finalize_stage_cost(
         campaign_id=campaign_id,
     )
     if rebuild_dashboard:
-        rebuild_cost_dashboard(campaign_id)
+        try:
+            rebuild_cost_dashboard(campaign_id)
+        except Exception:
+            pass
+        try:
+            from agent.dashboard.routes import rebuild_dashboard_files
+
+            # Prefer data/ next to campaigns/ when campaign lives under data/campaigns/
+            data_root = Path("data")
+            try:
+                resolved = Path(campaign_dir).resolve()
+                if resolved.parent.name == "campaigns":
+                    data_root = resolved.parent.parent
+                elif "clients" in resolved.parts:
+                    # .../data/clients/{id}/.../campaigns/{cid}
+                    idx = resolved.parts.index("clients")
+                    data_root = Path(*resolved.parts[:idx]) if idx else data_root
+            except Exception:
+                pass
+            rebuild_dashboard_files(data_root)
+        except Exception:
+            pass
     return report_path, manifest_path_written

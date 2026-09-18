@@ -105,8 +105,9 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--rebuild-cost-dashboard",
-        action="store_true",
-        help="Rebuild cost_dashboard.html after logging",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Rebuild cost ledger after logging (default: on)",
     )
     args = parser.parse_args()
 

@@ -231,12 +231,26 @@ def _first_nonempty(*values: Any) -> Any:
     return None
 
 
+def _first_field(row: dict[str, str], *keys: str) -> str:
+    for key in keys:
+        value = (row.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _read_csv(path: Path) -> tuple[list[dict[str, str]], list[str]]:
     with path.open("r", encoding="utf-8", newline="") as file:
         reader = csv.DictReader(file)
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
-    for column in ("decision_maker_direct_phone", "decision_maker_mobile_phone"):
+    # Company decision_maker_* + talent person-oriented phone columns.
+    for column in (
+        "decision_maker_direct_phone",
+        "decision_maker_mobile_phone",
+        "phone",
+        "mobile_phone",
+    ):
         if column not in fieldnames:
             fieldnames.append(column)
     return rows, fieldnames
@@ -270,14 +284,27 @@ def _apply_request_log_person_ids(
                 ids_by_row[str(event["csv_row"])] = person_id
 
     for index, row in enumerate(rows, start=2):
-        if row.get("decision_maker_apollo_person_id"):
+        if _first_field(row, "decision_maker_apollo_person_id", "apollo_person_id"):
             continue
-        person_id = ids_by_email.get(_clean(row.get("decision_maker_email"))) or ids_by_row.get(str(index))
+        person_id = ids_by_email.get(
+            _clean(_first_field(row, "decision_maker_email", "email"))
+        ) or ids_by_row.get(str(index))
         if person_id:
             row["decision_maker_apollo_person_id"] = person_id
+            # Talent rows use apollo_person_id without the decision_maker_ prefix.
+            if "apollo_person_id" in row or "person_id" in row or "email" in row:
+                if not (row.get("apollo_person_id") or "").strip():
+                    row["apollo_person_id"] = person_id
 
     if "decision_maker_apollo_person_id" not in fieldnames:
         fieldnames.insert(_person_id_column_index(fieldnames), "decision_maker_apollo_person_id")
+    if "apollo_person_id" not in fieldnames and any(
+        "email" in (fn or "") or fn == "person_id" for fn in fieldnames
+    ):
+        # Keep talent CSVs self-describing when backfilling from the request log.
+        if "email" in fieldnames or "person_id" in fieldnames:
+            if "apollo_person_id" not in fieldnames:
+                fieldnames.append("apollo_person_id")
     return rows, fieldnames
 
 
@@ -292,10 +319,12 @@ def _request_person_id(event: dict[str, Any]) -> str:
 
 
 def _person_id_column_index(fieldnames: list[str]) -> int:
-    try:
-        return fieldnames.index("decision_maker_name")
-    except ValueError:
-        return len(fieldnames)
+    for name in ("decision_maker_name", "full_name", "name"):
+        try:
+            return fieldnames.index(name)
+        except ValueError:
+            continue
+    return len(fieldnames)
 
 
 def _merge_phone_records(rows: list[dict[str, str]], records: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -306,18 +335,24 @@ def _merge_phone_records(rows: list[dict[str, str]], records: list[dict[str, str
             continue
         if match.get("direct_phone"):
             row["decision_maker_direct_phone"] = match["direct_phone"]
+            row["phone"] = match["direct_phone"]
         if match.get("mobile_phone"):
             row["decision_maker_mobile_phone"] = match["mobile_phone"]
+            row["mobile_phone"] = match["mobile_phone"]
         row["_phone_updated"] = "1"
     return rows
 
 
 def _match_record(row: dict[str, str], records: list[dict[str, str]]) -> dict[str, str] | None:
     row_keys = {
-        "apollo_person_id": _clean(row.get("decision_maker_apollo_person_id")),
-        "email": _clean(row.get("decision_maker_email")),
-        "linkedin_url": _clean_url(row.get("decision_maker_linkedin")),
-        "name": _clean(row.get("decision_maker_name")),
+        "apollo_person_id": _clean(
+            _first_field(row, "decision_maker_apollo_person_id", "apollo_person_id")
+        ),
+        "email": _clean(_first_field(row, "decision_maker_email", "email")),
+        "linkedin_url": _clean_url(
+            _first_field(row, "decision_maker_linkedin", "linkedin_url")
+        ),
+        "name": _clean(_first_field(row, "decision_maker_name", "full_name", "name")),
     }
     for record in records:
         if row_keys["apollo_person_id"] and row_keys["apollo_person_id"] == _clean(record.get("apollo_person_id")):

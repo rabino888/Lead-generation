@@ -447,6 +447,47 @@ def _profile_actor_input(profile_url: str, actor_id: str) -> dict:
     return {"profileUrls": [profile_url]}
 
 
+def _summarize_profile_sections(
+    items: object,
+    keys: tuple[str, ...],
+    *,
+    max_items: int = 5,
+) -> Optional[str]:
+    """Flatten experience/education lists into a short semicolon-separated summary."""
+    if not isinstance(items, list) or not items:
+        return None
+    lines: list[str] = []
+    for entry in items[:max_items]:
+        if not isinstance(entry, dict):
+            continue
+        parts: list[str] = []
+        seen: set[str] = set()
+        for key in keys:
+            raw = entry.get(key)
+            if isinstance(raw, dict):
+                raw = (
+                    raw.get("text")
+                    or raw.get("name")
+                    or raw.get("title")
+                    or raw.get("linkedinText")
+                    or ""
+                )
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            low = text.lower()
+            if low in seen:
+                continue
+            seen.add(low)
+            parts.append(text)
+        if parts:
+            lines.append(" · ".join(parts))
+    if not lines:
+        return None
+    summary = "; ".join(lines)
+    return summary[:2000]
+
+
 def _normalize_profile_item(item: dict, profile_url: str) -> dict:
     """Normalize person profile output across actors (harvestapi/apimaestro/automation-lab)."""
     if isinstance(item.get("element"), dict):  # harvestapi wraps results
@@ -478,6 +519,17 @@ def _normalize_profile_item(item: dict, profile_url: str) -> dict:
     ) or profile_url
     follower_count = item.get("followerCount") or basic.get("follower_count") or basic.get("followerCount")
 
+    experience = item.get("experience") or item.get("experiences") or basic.get("experience")
+    education = item.get("education") or item.get("educations") or basic.get("education")
+    experience_summary = _summarize_profile_sections(
+        experience,
+        ("title", "position", "jobTitle", "companyName", "company", "duration", "dateRange"),
+    )
+    education_summary = _summarize_profile_sections(
+        education,
+        ("school", "schoolName", "degree", "fieldOfStudy", "field", "dateRange"),
+    )
+
     return {
         "name": name or None,
         "linkedin_url": linkedin_url,
@@ -485,6 +537,8 @@ def _normalize_profile_item(item: dict, profile_url: str) -> dict:
         "about": about[:2000] if about else None,
         "location": location,
         "follower_count": follower_count,
+        "experience_summary": experience_summary,
+        "education_summary": education_summary,
     }
 
 
@@ -496,11 +550,13 @@ def get_linkedin_person_profile(profile_url: Optional[str]) -> dict:
     if not os.environ.get("APIFY_TOKEN"):
         return {}
 
-    actor_id = os.environ.get(
-        "APIFY_LINKEDIN_PROFILE_ACTOR",
+    actor_id = (
+        os.environ.get("APIFY_LINKEDIN_PERSON_ACTOR")
+        or os.environ.get("APIFY_LINKEDIN_PROFILE_ACTOR")
+        or
         # apimaestro ($5/1k) — harvestapi/linkedin-profile-scraper is cheaper ($4/1k)
         # but crashes under Apify restricted-run permissions (named KV store 403).
-        "apimaestro/linkedin-profile-detail",
+        "apimaestro/linkedin-profile-detail"
     )
     log.info("Apify LinkedIn profile (%s): %s", actor_id, profile_url)
     client = _get_client()

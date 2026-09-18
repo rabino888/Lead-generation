@@ -277,6 +277,25 @@ class SeedSourcesConfig(BaseModel):
                 return source
         return None
 
+    def source_by_type(
+        self,
+        source_type: str,
+        *,
+        enabled_only: bool = True,
+    ) -> SeedSourceConfig | None:
+        """First source whose ``type`` or ``id`` matches (SPEC allows custom ids)."""
+        want = (source_type or "").strip().lower()
+        if not want:
+            return None
+        for source in self.sources:
+            if enabled_only and not source.enabled:
+                continue
+            st = (source.type or "").strip().lower()
+            sid = (source.id or "").strip().lower()
+            if st == want or sid == want:
+                return source
+        return None
+
 
 class CampaignConfig(BaseModel):
     """

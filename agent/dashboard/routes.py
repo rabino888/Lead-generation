@@ -106,17 +106,21 @@ async def dashboard_api(
     refresh: int = Query(0),
     _: None = Depends(_check_dashboard_access),
 ):
+    from agent.utils.cost_dashboard import load_and_sync_dashboard_index
+
+    root = _data_root()
     path = _dashboard_index()
-    # Rebuild only when missing or explicitly requested (?refresh=1).
-    # Do not rebuild on every page load — that leaves the SPA blank for many seconds.
+    # Full rebuild only when missing or explicitly requested (?refresh=1).
+    # Always cheap-sync clients from disk so new clients appear without a 30s rebuild.
     if (not path.is_file()) or refresh:
-        rebuild_dashboard_files(_data_root())
+        rebuild_dashboard_files(root)
     if not path.is_file():
         raise HTTPException(
             status_code=404,
             detail="Dashboard index missing. Run: python scripts/build_cost_dashboard.py",
         )
-    return JSONResponse(json.loads(path.read_text(encoding="utf-8")))
+    index = load_and_sync_dashboard_index(root)
+    return JSONResponse(index)
 
 
 @router.get("/campaigns/{campaign_id}")

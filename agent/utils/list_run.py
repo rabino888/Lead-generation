@@ -213,6 +213,78 @@ def _smoke_leads_preview(csv_path: Path, *, limit: int = 20) -> list[dict[str, s
         return []
 
 
+def _smoke_preview_from_run_log(log_path: Path, *, limit: int = 20) -> list[dict[str, str]]:
+    """
+    Recover a partial smoke preview from a pipeline log when the worker died
+    before writing a contactable CSV (e.g. portal restart mid-run).
+
+    Parses Stage 4 Apollo lines:
+      Qualified: {company} ({email})
+      Rejected: {company} — {reason}
+    """
+    import re
+
+    if not log_path.is_file():
+        return []
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+
+    qualified_re = re.compile(
+        r"Qualified:\s*(.+?)\s*\(([^)]+@[^)]+)\)\s*$",
+        re.MULTILINE,
+    )
+    rejected_re = re.compile(
+        r"Rejected:\s*(.+?)\s*[—\-]\s*.+$",
+        re.MULTILINE,
+    )
+    by_company: dict[str, dict[str, str]] = {}
+    order: list[str] = []
+
+    def _add(name: str, email: str) -> None:
+        key = name.strip()
+        if not key or key in by_company:
+            return
+        by_company[key] = {
+            "company_name": key,
+            "website": "",
+            "decision_maker_name": "",
+            "decision_maker_title": "",
+            "decision_maker_email": email,
+        }
+        order.append(key)
+
+    for m in qualified_re.finditer(text):
+        _add(m.group(1), (m.group(2) or "").strip())
+    for m in rejected_re.finditer(text):
+        _add(m.group(1), "(no email)")
+
+    out = [by_company[k] for k in order[:limit]]
+    return out
+
+
+def find_latest_smoke_run_log(client_id: str, *, run_id: str = "") -> Optional[Path]:
+    """Prefer an explicit run_id log, else newest *.log under clients/{id}/smoke/runs/."""
+    if not (client_id or "").strip():
+        return None
+    from agent.utils.client_paths import client_runs_dir
+
+    runs = client_runs_dir(client_id.strip(), smoke=True)
+    if not runs.is_dir():
+        return None
+    if run_id:
+        cand = runs / f"{run_id}.log"
+        if cand.is_file():
+            return cand
+    logs = sorted(
+        (p for p in runs.glob("run_*.log") if p.is_file()),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return logs[0] if logs else None
+
+
 def _ensure_seeds(campaign_id: str) -> Path:
     from agent.utils.campaign_config import load_campaign
     from agent.utils.icp_rules import stage_path
@@ -563,7 +635,22 @@ def assert_can_start_smoke_gate(campaign_id: str) -> None:
         except (OSError, json.JSONDecodeError):
             meta = {}
     ctype = (meta.get("campaign_type") if isinstance(meta, dict) else None) or "company_outreach"
+    try:
+        from agent.utils.enrichment_plan import load_plan
+
+        plan = load_plan(campaign.campaign_dir, campaign_id)
+        plan_ctype = (plan.get("campaign_type") or "").strip()
+        if plan_ctype:
+            ctype = plan_ctype
+    except Exception:
+        pass
     assert_icp_ready_for_run(icp_data if isinstance(icp_data, dict) else {}, campaign_type=ctype)
+
+    if ctype == "talent_search":
+        from agent.utils.talent_list_run import assert_talent_seeds_ready
+
+        assert_talent_seeds_ready(campaign)
+        return
 
     raw = stage_path(campaign, "raw_seeds")
     if raw.is_file() and raw.stat().st_size > 32:
@@ -627,6 +714,16 @@ def start_smoke_gate(
     Synchronous gated run through paid smoke, then stop at awaiting_approval.
     Intended for BackgroundTasks / CLI.
     """
+    from agent.utils.talent_list_run import resolve_campaign_type, start_talent_smoke_gate
+
+    if resolve_campaign_type(campaign_dir, campaign_id) == "talent_search":
+        return start_talent_smoke_gate(
+            campaign_dir,
+            campaign_id,
+            smoke_leads=smoke_leads,
+            target_leads=target_leads,
+        )
+
     smoke_leads = max(1, min(int(smoke_leads or 2), 10))
     target_leads = max(smoke_leads, int(target_leads or 50))
 
@@ -932,6 +1029,11 @@ def _record_gated_run_cost(
 
 def approve_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
     """Run remaining deduped companies up to target_leads after smoke approval."""
+    from agent.utils.talent_list_run import approve_talent_full_batch, resolve_campaign_type
+
+    if resolve_campaign_type(campaign_dir, campaign_id) == "talent_search":
+        return approve_talent_full_batch(campaign_dir, campaign_id)
+
     state = load_list_run(campaign_dir, campaign_id)
     phase = state.get("phase")
     if phase == "completed":

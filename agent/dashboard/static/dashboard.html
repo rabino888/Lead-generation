@@ -8,6 +8,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/portal.css">
+  <script src="/static/create_prefill.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -31,9 +32,8 @@
   <footer>
     <p>Built from <code>data/clients/*/campaigns/</code> cost logs (legacy
     <code>data/campaigns/</code> junctions), stage CSVs, and ICP library
-    <code>data/clients/*/icps/</code>. Rebuild with
-    <code>python scripts/build_cost_dashboard.py</code>.
-    Plan enrichment from a client or campaign via <b>Build new campaign</b>.</p>
+    folders. Clients sync on every load; use <b>Refresh costs</b> for a full
+    spend rescan. Create a client via <b>New client</b> (PDF/URL).</p>
     <p id="stamp"></p>
   </footer>
 </div>
@@ -60,7 +60,9 @@
     ['enriched', 'Enriched'],
     ['scored', 'Scored']
   ];
-  const TYPE_LABEL = { company_outreach: 'company outreach', talent_search: 'talent search' };
+  function outreachLabel(ctype) { return ctype === 'talent_search' ? 'talent outreach' : 'company outreach'; }
+  function targetingLabel(ctype) { return ctype === 'talent_search' ? 'ITP' : 'ICP'; }
+  const TYPE_LABEL = { company_outreach: 'company outreach', talent_search: 'talent outreach' };
   const LEAD_COLS = [
     'company_name',
     'decision_maker_name',
@@ -231,7 +233,8 @@
     const meta = el('div', 'meta');
     meta.append(el('span', null, c.client_name || c.client_id || 'unknown client'));
     const ctype = campaignTypeOf(c);
-    meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'), ctype.replace(/_/g, ' ')));
+    meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
+      TYPE_LABEL[ctype] || outreachLabel(ctype)));
     const runBadge = listRunBadge(c);
     if (runBadge) meta.append(el('span', runBadge.cls, runBadge.text));
     const chip = basisChipFor(c);
@@ -651,7 +654,8 @@
       head.append(el('span', 'cid', c.campaign_id));
       const ctype = campaignTypeOf(c);
       head.append(document.createTextNode(' '));
-      head.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'), ctype.replace(/_/g, ' ')));
+      head.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
+        TYPE_LABEL[ctype] || outreachLabel(ctype)));
       card.append(head);
       const icp = c.icp || {};
       const titles = (icp.job_titles || []).slice(0, 4).join(' · ') || '—';
@@ -762,7 +766,7 @@
     const icp = (opts.icp != null ? opts.icp : (c && c.icp)) || {};
     const facts = el('dl', 'facts');
     const ctype = opts.campaignType || campaignTypeOf(c);
-    appendFact(facts, 'Campaign type', String(ctype).replace(/_/g, ' '));
+    appendFact(facts, 'Campaign type', TYPE_LABEL[ctype] || outreachLabel(ctype));
     appendFact(facts, 'Titles', icp.job_titles);
     appendFact(facts, 'Contact locations', icp.contact_locations);
     appendFact(facts, 'Geo', icp.primary_location || icp.location);
@@ -997,8 +1001,103 @@
       crumbs: [],
       showBrand: true,
       headerActions: [
+        { href: '#/new-client', label: 'New client' },
+        { href: '/dashboard?refresh=1', label: 'Refresh costs' },
         { href: '/builder?new=1', label: 'Build new campaign', primary: true }
       ],
+      view: view
+    };
+  }
+
+  function viewNewClient() {
+    const view = document.createDocumentFragment();
+    const panel = el('div', 'panel intake-panel');
+    panel.append(el('h2', null, 'Create client from brief'));
+    panel.append(el('p', 'note',
+      'Upload a PDF/TXT/MD or paste a public URL. We save the source under the client folder and build CLIENT.md — ICPs are still drafted in Cursor.'));
+
+    const form = document.createElement('form');
+    form.className = 'intake-form';
+    form.id = 'client-intake-form';
+
+    const nameLab = el('label', null, 'Client name');
+    const nameIn = document.createElement('input');
+    nameIn.type = 'text';
+    nameIn.name = 'client_name';
+    nameIn.required = true;
+    nameIn.placeholder = 'Vista Business Brain';
+    nameIn.autocomplete = 'organization';
+    nameLab.append(nameIn);
+    form.append(nameLab);
+
+    const fileLab = el('label', null, 'Document (optional)');
+    const fileIn = document.createElement('input');
+    fileIn.type = 'file';
+    fileIn.name = 'file';
+    fileIn.accept = '.pdf,.md,.txt,.markdown,.text,application/pdf,text/plain,text/markdown';
+    fileLab.append(fileIn);
+    form.append(fileLab);
+
+    const urlLab = el('label', null, 'URL (optional)');
+    const urlIn = document.createElement('input');
+    urlIn.type = 'url';
+    urlIn.name = 'source_url';
+    urlIn.placeholder = 'https://…';
+    urlLab.append(urlIn);
+    form.append(urlLab);
+
+    const notesLab = el('label', null, 'Notes (optional)');
+    const notesIn = document.createElement('textarea');
+    notesIn.name = 'notes';
+    notesIn.rows = 3;
+    notesIn.placeholder = 'Anything to pin on the client brief…';
+    notesLab.append(notesIn);
+    form.append(notesLab);
+
+    const row = el('div', 'intake-actions');
+    const submit = document.createElement('button');
+    submit.type = 'submit';
+    submit.className = 'btn primary';
+    submit.textContent = 'Create client';
+    const status = el('span', 'savehint', '');
+    status.id = 'intake-status';
+    row.append(submit, status);
+    form.append(row);
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      status.textContent = 'Creating…';
+      submit.disabled = true;
+      const fd = new FormData();
+      fd.append('client_name', nameIn.value.trim());
+      if (urlIn.value.trim()) fd.append('source_url', urlIn.value.trim());
+      if (notesIn.value.trim()) fd.append('notes', notesIn.value.trim());
+      if (fileIn.files && fileIn.files[0]) fd.append('file', fileIn.files[0]);
+      try {
+        const res = await fetch('/builder/api/clients/from-source', {
+          method: 'POST',
+          body: fd
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || data.message || ('HTTP ' + res.status));
+        const idx = await fetch('/dashboard/api').then((r) => r.json());
+        boot(idx);
+        navigate({ kind: 'client', id: data.client_id }, false);
+      } catch (err) {
+        status.textContent = err && err.message ? err.message : String(err);
+        submit.disabled = false;
+      }
+    });
+
+    panel.append(form);
+    view.append(panel);
+    return {
+      eyebrow: 'New client',
+      title: 'Create client',
+      sub: 'Profile only — source file + CLIENT.md. Draft ICPs afterward.',
+      crumbs: [['All clients', '#/']],
+      showBrand: false,
+      headerActions: [],
       view: view
     };
   }
@@ -1028,7 +1127,7 @@
     const typeLabel = el('label', null, 'New type');
     const typeSelect = document.createElement('select');
     typeSelect.append(new Option('Company outreach', 'company_outreach'));
-    typeSelect.append(new Option('Talent search', 'talent_search'));
+    typeSelect.append(new Option('Talent outreach', 'talent_search'));
     typeLabel.append(typeSelect);
     toolbar.append(typeLabel);
 
@@ -1048,14 +1147,23 @@
     view.append(toolbar);
 
     const executed = generatedLists(mine);
-    const campaignsPanel = listPanel(
-      executed.slice().sort((a, b) => (b.usd_total || 0) - (a.usd_total || 0)),
-      true
-    );
+    const companyExecuted = executed.filter((c) => campaignTypeOf(c) !== 'talent_search');
+    const talentExecuted = executed.filter((c) => campaignTypeOf(c) === 'talent_search');
     view.append(section(
-      'Campaigns (generated lists)',
-      'Executed lists and gated runs (in progress / awaiting approval). Saved-for-later drafts appear below.',
-      campaignsPanel
+      'Company outreach — campaigns',
+      'Executed company lists and gated runs. Saved-for-later drafts appear below.',
+      listPanel(
+        companyExecuted.slice().sort((a, b) => (b.usd_total || 0) - (a.usd_total || 0)),
+        true
+      )
+    ));
+    view.append(section(
+      'Talent outreach — campaigns',
+      'Executed talent lists and gated runs.',
+      listPanel(
+        talentExecuted.slice().sort((a, b) => (b.usd_total || 0) - (a.usd_total || 0)),
+        true
+      )
     ));
 
     const draftPanel = el('div', 'panel');
@@ -1090,6 +1198,9 @@
           id.append(el('span', 'name', c.display_name || c.campaign_id));
           const meta = el('div', 'meta');
           meta.append(el('span', 'mono', c.campaign_id));
+          const ctype = c.campaign_type || 'company_outreach';
+          meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
+            TYPE_LABEL[ctype] || outreachLabel(ctype)));
           const phase = (c.list_run && c.list_run.phase) || 'idle';
           const fake = {
             list_run_phase: phase,
@@ -1116,17 +1227,26 @@
         draftPanel.append(el('div', 'empty', 'Could not load saved campaigns.'));
       });
 
-    const icpPanel = el('div', 'panel icp-accordion');
-    icpPanel.append(el('div', 'empty', 'Loading ICPs…'));
+    const companyIcpPanel = el('div', 'panel icp-accordion');
+    companyIcpPanel.append(el('div', 'empty', 'Loading ICPs…'));
+    const talentIcpPanel = el('div', 'panel icp-accordion');
+    talentIcpPanel.append(el('div', 'empty', 'Loading ITPs…'));
 
     view.append(section(
-      'Existing ICPs',
-      'From data/clients/' + clientId + '/icps/ — one ICP can power multiple campaigns.',
-      icpPanel
+      'Company outreach — existing ICPs',
+      'From data/clients/' + clientId + '/company_outreach/icps/ (legacy flat icps/ still listed).',
+      companyIcpPanel
+    ));
+    view.append(section(
+      'Talent outreach — existing ITPs',
+      'From data/clients/' + clientId + '/talent_outreach/itps/.',
+      talentIcpPanel
     ));
 
     function syncBuilderLinks() {
       selectedType = typeSelect.value || 'company_outreach';
+      const noun = targetingLabel(selectedType);
+      buildIcp.textContent = 'Build new ' + noun;
       buildIcp.href = '/builder?client=' + encodeURIComponent(clientId)
         + '&new=1&type=' + encodeURIComponent(selectedType);
       createList.href = '/builder?client=' + encodeURIComponent(clientId)
@@ -1142,7 +1262,8 @@
           editPlan.href = '/builder?client=' + encodeURIComponent(clientId)
             + '&new=1&icp=' + encodeURIComponent(selectedIcp);
           editPlan.hidden = false;
-          editPlan.textContent = 'New campaign from ICP';
+          editPlan.textContent = 'New campaign from ' + targetingLabel(
+            (row && row.campaign_type) || selectedType);
         }
       } else {
         editPlan.hidden = true;
@@ -1160,6 +1281,7 @@
 
     function fillLibraryIcpBody(body, summary, fullIcp) {
       clear(body);
+      const noun = targetingLabel(summary.campaign_type || 'company_outreach');
       const fakeCampaign = {
         campaign_id: (summary.campaign_ids && summary.campaign_ids[0]) || summary.icp_id,
         display_name: summary.display_name,
@@ -1171,7 +1293,7 @@
         campaignType: summary.campaign_type || 'company_outreach',
       });
       if (!facts.children.length) {
-        body.append(el('div', 'empty', 'No ICP details saved yet.'));
+        body.append(el('div', 'empty', 'No ' + noun + ' details saved yet.'));
       } else {
         body.append(facts);
       }
@@ -1181,18 +1303,46 @@
         .filter(Boolean);
       body.append(associatedCampaignsList(linked));
 
-      body.append(el('p', 'note', 'Library path: data/clients/'
-        + clientId + '/icps/' + summary.icp_id + '/'));
+      const disk = summary.disk_path
+        || ('data/clients/' + clientId + '/'
+          + (summary.campaign_type === 'talent_search'
+            ? 'talent_outreach/itps/'
+            : 'company_outreach/icps/')
+          + summary.icp_id + '/');
+      body.append(el('p', 'note', 'Library path: ' + disk));
+
+      const genRow = el('div', 'icp-rename-actions');
+      const genBody = el('a', 'btn primary', 'Generate campaign');
+      const ctypeBody = summary.campaign_type || 'company_outreach';
+      genBody.href = (window.PortalCreatePrefill
+        ? window.PortalCreatePrefill.buildCampaignCreateUrl({
+          clientId: clientId,
+          icpId: summary.icp_id,
+          campaignType: ctypeBody,
+        })
+        : ('/builder?client=' + encodeURIComponent(clientId)
+          + '&new=1&type=' + encodeURIComponent(ctypeBody)
+          + '&icp=' + encodeURIComponent(summary.icp_id)));
+      if (summary.ready === false) {
+        genBody.classList.add('disabled');
+        genBody.href = '#';
+        genBody.addEventListener('click', (e) => {
+          e.preventDefault();
+          alert('This ' + noun + ' is incomplete. Finish targeting fields first.');
+        });
+      }
+      genRow.append(genBody);
+      body.append(genRow);
 
       const renameRow = el('div', 'icp-rename');
-      renameRow.append(el('label', null, 'ICP name'));
+      renameRow.append(el('label', null, noun + ' name'));
       const input = document.createElement('input');
       input.type = 'text';
       input.value = summary.display_name || summary.icp_id || '';
       input.placeholder = 'e.g. Headhunting US 1-50';
       renameRow.append(input);
       const actions = el('div', 'icp-rename-actions');
-      const saveBtn = el('button', 'btn', 'Rename ICP');
+      const saveBtn = el('button', 'btn', 'Rename ' + noun);
       saveBtn.type = 'button';
       const status = el('span', 'savehint', '');
       saveBtn.addEventListener('click', (e) => {
@@ -1224,16 +1374,16 @@
           });
       });
       actions.append(saveBtn, status);
-      const delBtn = el('button', 'btn danger', 'Delete ICP');
+      const delBtn = el('button', 'btn danger', 'Delete ' + noun);
       delBtn.type = 'button';
       delBtn.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
         const linked = (summary.campaign_ids || []).length;
         const msg = linked
-          ? ('Delete ICP "' + (summary.display_name || summary.icp_id) + '"?\n'
+          ? ('Delete ' + noun + ' "' + (summary.display_name || summary.icp_id) + '"?\n'
             + linked + ' campaign(s) still reference it. Continue with force delete?')
-          : ('Delete ICP "' + (summary.display_name || summary.icp_id) + '"? This cannot be undone.');
+          : ('Delete ' + noun + ' "' + (summary.display_name || summary.icp_id) + '"? This cannot be undone.');
         if (!window.confirm(msg)) return;
         status.textContent = 'Deleting…';
         const force = linked ? '1' : '0';
@@ -1260,10 +1410,10 @@
       body.append(renameRow);
     }
 
-    function toggleLibraryIcp(summary, item, head) {
+    function toggleLibraryIcp(summary, item, head, panel) {
       const id = summary.icp_id;
       const wasOpen = item.classList.contains('open');
-      icpPanel.querySelectorAll('.icp-acc-item').forEach(closeIcpItem);
+      panel.querySelectorAll('.icp-acc-item').forEach(closeIcpItem);
       if (wasOpen) {
         selectedIcp = '';
         syncBuilderLinks();
@@ -1274,7 +1424,7 @@
       selectedIcp = id;
       syncBuilderLinks();
       const body = el('div', 'icp-acc-body');
-      body.append(el('div', 'empty', 'Loading ICP…'));
+      body.append(el('div', 'empty', 'Loading ' + targetingLabel(summary.campaign_type) + '…'));
       item.append(body);
       fetch('/builder/api/clients/' + encodeURIComponent(clientId)
         + '/icps/' + encodeURIComponent(id))
@@ -1292,18 +1442,17 @@
         });
     }
 
-    function renderLibraryIcps(rows) {
-      clear(icpPanel);
-      window.__clientIcps = rows || [];
+    function renderIcpRowsInto(panel, rows, emptyMsg) {
+      clear(panel);
       if (!rows.length) {
-        icpPanel.append(el('div', 'empty',
-          'No ICPs in data/clients/' + clientId + '/icps/ yet. Use Build new ICP.'));
+        panel.append(el('div', 'empty', emptyMsg));
         return;
       }
       rows.forEach((summary) => {
         const item = el('div', 'icp-acc-item');
         item.dataset.id = summary.icp_id;
 
+        const row = el('div', 'icp-acc-row');
         const head = el('button', 'icp-acc-head');
         head.type = 'button';
         head.setAttribute('aria-expanded', 'false');
@@ -1314,7 +1463,7 @@
         titleRow.append(el('span', 'mono', summary.icp_id));
         const ctype = summary.campaign_type || 'company_outreach';
         titleRow.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
-          ctype.replace(/_/g, ' ')));
+          TYPE_LABEL[ctype] || outreachLabel(ctype)));
         if (summary.ready === false) {
           titleRow.append(el('span', 'ctype ts', 'incomplete'));
         }
@@ -1342,11 +1491,54 @@
         head.addEventListener('click', (e) => {
           e.preventDefault();
           e.stopPropagation();
-          toggleLibraryIcp(summary, item, head);
+          toggleLibraryIcp(summary, item, head, panel);
         });
-        item.append(head);
-        icpPanel.append(item);
+
+        const gen = el('a', 'btn primary icp-gen-btn', 'Generate campaign');
+        const ctypeForGen = summary.campaign_type || 'company_outreach';
+        gen.href = (window.PortalCreatePrefill
+          ? window.PortalCreatePrefill.buildCampaignCreateUrl({
+            clientId: clientId,
+            icpId: summary.icp_id,
+            campaignType: ctypeForGen,
+          })
+          : ('/builder?client=' + encodeURIComponent(clientId)
+            + '&new=1&type=' + encodeURIComponent(ctypeForGen)
+            + '&icp=' + encodeURIComponent(summary.icp_id)));
+        gen.title = summary.ready === false
+          ? ('Finish this ' + targetingLabel(ctypeForGen) + ' before generating a campaign')
+          : ('Create a new campaign from ' + (summary.display_name || summary.icp_id));
+        if (summary.ready === false) {
+          gen.classList.add('disabled');
+          gen.setAttribute('aria-disabled', 'true');
+          gen.addEventListener('click', (e) => {
+            e.preventDefault();
+            alert('This ' + targetingLabel(ctypeForGen)
+              + ' is incomplete. Finish targeting fields first, then generate a campaign.');
+          });
+        }
+
+        row.append(head);
+        row.append(gen);
+        item.append(row);
+        panel.append(item);
       });
+    }
+
+    function renderLibraryIcps(rows) {
+      window.__clientIcps = rows || [];
+      const companyRows = (rows || []).filter((r) => (r.campaign_type || 'company_outreach') !== 'talent_search');
+      const talentRows = (rows || []).filter((r) => r.campaign_type === 'talent_search');
+      renderIcpRowsInto(
+        companyIcpPanel,
+        companyRows,
+        'No ICPs in data/clients/' + clientId + '/company_outreach/icps/ yet. Use Build new ICP.'
+      );
+      renderIcpRowsInto(
+        talentIcpPanel,
+        talentRows,
+        'No ITPs in data/clients/' + clientId + '/talent_outreach/itps/ yet. Use Build new ITP.'
+      );
     }
 
     fetch('/builder/api/clients/' + encodeURIComponent(clientId) + '/icps')
@@ -1356,9 +1548,12 @@
       })
       .then((payload) => renderLibraryIcps(payload.icps || []))
       .catch(() => {
-        clear(icpPanel);
-        icpPanel.append(el('div', 'empty',
+        clear(companyIcpPanel);
+        clear(talentIcpPanel);
+        companyIcpPanel.append(el('div', 'empty',
           'Could not load ICP library. Is the portal server running with /builder routes?'));
+        talentIcpPanel.append(el('div', 'empty',
+          'Could not load ITP library. Is the portal server running with /builder routes?'));
       });
 
     typeSelect.addEventListener('change', syncBuilderLinks);
@@ -1447,7 +1642,7 @@
         }
 
         const smokeRows = lr.smoke_preview || [];
-        if (smokeRows.length || lr.smoke_run_id) {
+        if (smokeRows.length || lr.smoke_run_id || lr.phase === 'error') {
           gatePanel.append(el('h3', null, 'Smoke results'));
           if (smokeRows.length) {
             const sul = el('ul', 'seed-list');
@@ -1461,12 +1656,17 @@
               ));
             });
             gatePanel.append(sul);
+          } else if (lr.phase === 'error') {
+            gatePanel.append(el('p', 'note',
+              'Smoke did not finish writing a CSV (worker interrupted). See error below and the smoke log under clients/' + (c.client_id || '…') + '/smoke/runs/.'));
           }
-          gatePanel.append(el('p', 'note',
-            lr.smoke_csv_path
-              ? ('CSV: ' + lr.smoke_csv_path)
-              : ('Run ' + lr.smoke_run_id + ' under data/clients/' + (c.client_id || '…') + '/runs/')
-          ));
+          if (lr.smoke_csv_path || lr.smoke_run_id) {
+            gatePanel.append(el('p', 'note',
+              lr.smoke_csv_path
+                ? ('CSV: ' + lr.smoke_csv_path)
+                : ('Run ' + lr.smoke_run_id + ' under data/clients/' + (c.client_id || '…') + '/smoke/runs/')
+            ));
+          }
           if (lr.phase === 'awaiting_approval') {
             const approve = el('a', 'primary', 'Review & approve full batch in builder');
             approve.href = '/builder?campaign=' + encodeURIComponent(campaignId);
@@ -1702,6 +1902,7 @@
 
   function parseHash(hash) {
     const h = hash || '';
+    if (h === '#/new-client' || h === '#new-client') return { kind: 'new-client', id: null };
     let m = h.match(/^#\/campaign\/([^/]+)\/run\/(.+)$/);
     if (m) {
       return {
@@ -1718,6 +1919,7 @@
   }
 
   function routeResolves(r) {
+    if (r.kind === 'new-client') return true;
     if (r.kind === 'client') return !!(clientById(r.id) || campaignsOfClient(r.id).length);
     if (r.kind === 'campaign' || r.kind === 'leads') return !!campaignById(r.id);
     if (r.kind === 'run') return !!(campaignById(r.id) && findRun(r.id, r.runKey));
@@ -1725,6 +1927,7 @@
   }
 
   function resolve() {
+    if (route.kind === 'new-client') return viewNewClient();
     if (route.kind === 'client') {
       const page = viewClient(route.id);
       if (page) return page;
@@ -1745,7 +1948,9 @@
     route = next;
     if (!fromHash) {
       let target = '#/';
-      if (next.kind === 'client') {
+      if (next.kind === 'new-client') {
+        target = '#/new-client';
+      } else if (next.kind === 'client') {
         target = '#/client/' + encodeURIComponent(next.id);
       } else if (next.kind === 'campaign') {
         target = '#/campaign/' + encodeURIComponent(next.id);

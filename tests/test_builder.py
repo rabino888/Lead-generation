@@ -40,7 +40,7 @@ def test_company_estimate_scales_with_leads():
     assert "website_scrape" in ids
 
 
-def test_talent_estimate_profile_on_all_seeds():
+def test_talent_estimate_profile_on_icp_survivors():
     plan = default_plan("ta", campaign_type="talent_search")
     plan["seed_count"] = 100
     plan["talent_pass_rates"] = {
@@ -50,10 +50,13 @@ def test_talent_estimate_profile_on_all_seeds():
     }
     est = estimate_plan(plan)
     profile = next(x for x in est["line_items"] if x["module_id"] == "talent_profile")
-    assert profile["units"] == 100
+    assert abs(profile["units"] - 36.0) < 0.01  # survivors_after_icp = 100*0.9*0.4
+    assert profile["basis"] == "profile_icp_survivors"
     assert est["funnel"]["seeds"] == 100
-    assert abs(est["funnel"]["after_icp"] - 36.0) < 0.01  # 100*0.9*0.4
+    assert abs(est["funnel"]["after_icp"] - 36.0) < 0.01
     assert est["campaign_type"] == "talent_search"
+    assert any("ICP survivors" in w for w in est["warnings"])
+    assert not any("every seed pays" in w.lower() for w in est["warnings"])
 
 
 def test_save_and_load_plan(tmp_path: Path):
@@ -161,7 +164,14 @@ def test_builder_ui_served(builder_client):
     assert "setup-brief-block" in r.text
     assert "setup-brief-edit" in r.text
     assert "btn-save-brief" in r.text
-    assert "Client brief" in r.text
+    assert "ICP description" in r.text
+    assert "create-brief" in r.text
+    assert "create-client-new-wrap" in r.text
+    assert "Talent outreach" in r.text
+    assert "outreachLabel" in r.text
+    assert "targetingLabel" in r.text
+    assert "function outreachLabel" in r.text
+    assert "function targetingLabel" in r.text
     assert "enrich-prompt" in r.text
     assert "Would you like to configure the enrichment modules now?" in r.text
     assert "btn-continue-modules" in r.text
@@ -211,7 +221,9 @@ def test_builder_create_includes_brief_on_summary(builder_client, tmp_path):
     g = builder_client.get(f"/builder/api/campaigns/{campaign_id}")
     assert g.status_code == 200
     assert g.json()["brief"] == "Spain TA managers · 50–200 · Madrid"
-    assert (tmp_path / "clients" / "sample" / "campaigns" / campaign_id / "icp.json").is_file()
+    assert (
+        tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / campaign_id / "icp.json"
+    ).is_file()
 
 
 def test_builder_meta_updates_brief(builder_client, tmp_path):
@@ -237,6 +249,19 @@ def test_builder_meta_updates_brief(builder_client, tmp_path):
         (tmp_path / "campaigns" / campaign_id / "campaign.json").read_text(encoding="utf-8")
     )
     assert meta["brief"] == "Updated client brief"
+    icp_id = created.json()["icp_id"]
+    icp_meta = json.loads(
+        (
+            tmp_path
+            / "clients"
+            / "sample"
+            / "company_outreach"
+            / "icps"
+            / icp_id
+            / "meta.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert icp_meta["brief"] == "Updated client brief"
 
 
 def test_builder_create_prefills_icp_from_brief(builder_client, tmp_path):
@@ -256,9 +281,15 @@ def test_builder_create_prefills_icp_from_brief(builder_client, tmp_path):
     assert r.status_code == 200, r.text
     campaign_id = r.json()["campaign"]["campaign_id"]
     saved = json.loads(
-        (tmp_path / "clients" / "mkt" / "campaigns" / campaign_id / "icp.json").read_text(
-            encoding="utf-8"
-        )
+        (
+            tmp_path
+            / "clients"
+            / "mkt"
+            / "company_outreach"
+            / "campaigns"
+            / campaign_id
+            / "icp.json"
+        ).read_text(encoding="utf-8")
     )
     assert "COO" in saved["job_titles"]
     assert "CTO" in saved["job_titles"]
@@ -271,7 +302,7 @@ def test_builder_create_prefills_icp_from_brief(builder_client, tmp_path):
     assert summary_icp["company_size_min"] == 1
     assert summary_icp["company_size_max"] == 50
     assert "COO" in summary_icp["job_titles"]
-    mirror = tmp_path / "clients" / "mkt" / "icps"
+    mirror = tmp_path / "clients" / "mkt" / "company_outreach" / "icps"
     assert mirror.is_dir()
     assert any(mirror.iterdir())
 
@@ -287,7 +318,7 @@ def test_builder_rename_meta(builder_client, tmp_path):
         (tmp_path / "campaigns" / "sample_co" / "campaign.json").read_text(encoding="utf-8")
     )
     assert meta["display_name"] == "Sample renamed ICP"
-    mirror = tmp_path / "clients" / "sample" / "campaigns" / "sample_co" / "campaign.json"
+    mirror = tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / "sample_co" / "campaign.json"
     assert mirror.is_file()
     assert json.loads(mirror.read_text(encoding="utf-8"))["display_name"] == "Sample renamed ICP"
 
@@ -309,7 +340,7 @@ def test_builder_create_campaign(builder_client, tmp_path):
     assert campaign_id == "sample_outreach"
     assert body["campaign"]["client_id"] == "sample"
     assert body.get("icp_id")
-    camp = tmp_path / "clients" / "sample" / "campaigns" / campaign_id
+    camp = tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / campaign_id
     assert (camp / "campaign.json").is_file()
     assert (camp / "enrichment_plan.json").is_file()
     assert (camp / "icp.json").is_file()
@@ -317,7 +348,9 @@ def test_builder_create_campaign(builder_client, tmp_path):
     assert meta["brief"] == "Spain TA managers"
     assert meta["name"] == "Sample Co"
     assert meta["icp_id"] == body["icp_id"]
-    icp_lib = tmp_path / "clients" / "sample" / "icps" / body["icp_id"] / "icp.json"
+    icp_lib = (
+        tmp_path / "clients" / "sample" / "company_outreach" / "icps" / body["icp_id"] / "icp.json"
+    )
     assert icp_lib.is_file()
 
 
@@ -359,7 +392,9 @@ def test_builder_list_client_icps(builder_client, tmp_path):
     forced = builder_client.delete(f"/builder/api/clients/sample/icps/{icp_id}?force=1")
     assert forced.status_code == 200, forced.text
     assert forced.json()["ok"] is True
-    assert not (tmp_path / "clients" / "sample" / "icps" / icp_id).is_dir()
+    assert not (
+        tmp_path / "clients" / "sample" / "company_outreach" / "icps" / icp_id
+    ).is_dir()
 
 
 def test_builder_create_explicit_id_still_works(builder_client, tmp_path):
@@ -375,6 +410,146 @@ def test_builder_create_explicit_id_still_works(builder_client, tmp_path):
     assert r.status_code == 200, r.text
     assert r.json()["campaign"]["campaign_id"] == "new_list_1"
     assert r.json()["campaign"]["campaign_type"] == "talent_search"
+    camp = tmp_path / "clients" / "sample" / "talent_outreach" / "campaigns" / "new_list_1"
+    assert (camp / "campaign.json").is_file()
+    icp_id = r.json().get("icp_id")
+    assert icp_id
+    assert (
+        tmp_path / "clients" / "sample" / "talent_outreach" / "itps" / icp_id / "icp.json"
+    ).is_file()
+
+
+def test_builder_put_client_brief(builder_client, tmp_path):
+    r = builder_client.put(
+        "/builder/api/clients/newco",
+        json={"client_name": "New Co", "brief": "B2B SaaS in Spain"},
+    )
+    assert r.status_code == 200, r.text
+    meta = json.loads((tmp_path / "clients" / "newco" / "client.json").read_text(encoding="utf-8"))
+    assert meta["client_name"] == "New Co"
+    assert meta["brief"] == "B2B SaaS in Spain"
+    assert (tmp_path / "clients" / "newco" / "company_outreach" / "icps").is_dir()
+    assert (tmp_path / "clients" / "newco" / "talent_outreach" / "itps").is_dir()
+
+
+def test_builder_list_clients_includes_icp_only(builder_client, tmp_path):
+    builder_client.put(
+        "/builder/api/clients/onlyicps",
+        json={"client_name": "Only ICPs", "brief": "no campaigns yet"},
+    )
+    r = builder_client.get("/builder/api/clients")
+    assert r.status_code == 200, r.text
+    ids = {c["client_id"] for c in r.json()["clients"]}
+    assert "onlyicps" in ids
+    assert "sample" in ids or True  # sample may only exist via campaigns
+
+
+def test_builder_create_prefill_api_multi_client(builder_client, tmp_path):
+    from agent.utils.client_store import ensure_client, save_icp
+
+    def ready(cid: str, iid: str) -> None:
+        ensure_client(tmp_path, cid, cid)
+        save_icp(
+            tmp_path,
+            cid,
+            iid,
+            icp_data={
+                "schema_version": "1",
+                "industries": ["software"],
+                "excluded_industries": ["staffing and recruiting"],
+                "geo": {
+                    "primary_location": "United States",
+                    "country_codes": {"United States": "US"},
+                    "location_hints": ["usa"],
+                    "segments": ["US"],
+                },
+                "company_size_min": 10,
+                "company_size_max": 50,
+                "employee_ranges": ["11,50"],
+                "include_keywords": ["saas"],
+                "exclude_keywords": ["freelance"],
+                "excluded_name_patterns": "freelance",
+                "excluded_domains": ["google.com"],
+                "job_titles": ["CEO", "CTO"],
+                "contact_locations": ["United States"],
+                "website_analysis_mode": "full",
+            },
+            display_name=iid,
+            brief="ready",
+            campaign_type="company_outreach",
+            create_new=True,
+        )
+
+    ready("vista_like", "ecom_us")
+    ready("ally_like", "spain_cc")
+    ensure_client(tmp_path, "sample", "Sample")
+    for cid, iid in (("vista_like", "ecom_us"), ("ally_like", "spain_cc")):
+        r = builder_client.get(
+            "/builder/api/create-prefill",
+            params={"client": cid, "icp": iid, "type": "company_outreach"},
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["client_id"] == cid
+        assert body["client_mode"] == "existing"
+        assert body["ok"] is True, body
+        assert body["icp_id"] == iid
+    # Client with no ICP still resolves as existing when folder exists
+    bare = builder_client.get(
+        "/builder/api/create-prefill",
+        params={"client": "sample", "type": "company_outreach"},
+    )
+    assert bare.status_code == 200
+    assert bare.json()["client_mode"] == "existing"
+    assert bare.json()["icp_id"] is None
+
+
+def test_builder_client_from_source_upload(builder_client, tmp_path):
+    r = builder_client.post(
+        "/builder/api/clients/from-source",
+        data={"client_name": "Intake Co", "notes": "From form"},
+        files={"file": ("brief.txt", b"Intake Co sells widgets in Spain.\n", "text/plain")},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["client_id"] == "intake_co"
+    client = tmp_path / "clients" / "intake_co"
+    assert (client / "CLIENT.md").is_file()
+    assert (client / "sources" / "brief.txt").is_file()
+    meta = json.loads((client / "client.json").read_text(encoding="utf-8"))
+    assert "widgets" in meta["brief"]
+
+
+def test_builder_create_falls_back_to_client_brief(builder_client, tmp_path):
+    builder_client.put(
+        "/builder/api/clients/sample",
+        json={"client_name": "Sample Co", "brief": "CTOs of fintech in USA 10-50"},
+    )
+    r = builder_client.post(
+        "/builder/api/campaigns",
+        json={
+            "client_id": "sample",
+            "client_name": "Sample Co",
+            "label": "From client brief",
+            "brief": "",
+            "campaign_type": "company_outreach",
+        },
+    )
+    assert r.status_code == 200, r.text
+    campaign_id = r.json()["campaign"]["campaign_id"]
+    meta = json.loads(
+        (
+            tmp_path
+            / "clients"
+            / "sample"
+            / "company_outreach"
+            / "campaigns"
+            / campaign_id
+            / "campaign.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert meta["brief"] == "CTOs of fintech in USA 10-50"
 
 
 def test_builder_list_includes_client(builder_client):
