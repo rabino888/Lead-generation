@@ -79,13 +79,11 @@ def _skip_linkedin_posts() -> bool:
 
 def _skip_linkedin_jobs() -> bool:
     """
-    Company open-jobs scrape. Default SKIP until a cheap actor is approved.
-    Set APIFY_SKIP_LINKEDIN_JOBS=0 and APIFY_LINKEDIN_JOBS_ACTOR=gtgyani206/linkedin-company-scraper
-    after smoke_company_jobs.py passes cost gates.
+    Company open-jobs scrape. Independent of DM-post skipping.
+
+    Default SKIP until the enrichment plan turns the module on
+    (APIFY_SKIP_LINKEDIN_JOBS=0). Do not use afanasenko/linkedin-jobs-scraper.
     """
-    if _skip_linkedin_posts():
-        return True
-    # Default "1" — opt-in only (afanasenko incident 2026-08-25).
     return os.environ.get("APIFY_SKIP_LINKEDIN_JOBS", "1").lower() in ("1", "true", "yes")
 
 
@@ -442,7 +440,10 @@ def _profile_actor_input(profile_url: str, actor_id: str) -> dict:
         return {"queries": [profile_url]}
     if "apimaestro" in actor_id:
         # apimaestro/linkedin-profile-detail takes the public identifier only.
-        username = profile_url.rstrip("/").rsplit("/", 1)[-1]
+        # Percent-encoded slugs (andrés → andr%c3%a9s) break the actor — decode first.
+        from urllib.parse import unquote
+
+        username = unquote(profile_url.rstrip("/").rsplit("/", 1)[-1])
         return {"username": username}
     return {"profileUrls": [profile_url]}
 
@@ -488,6 +489,68 @@ def _summarize_profile_sections(
     return summary[:2000]
 
 
+_EXPERIENCE_KEYS = (
+    "title",
+    "position",
+    "jobTitle",
+    "companyName",
+    "company",
+    "duration",
+    "dateRange",
+)
+_EDUCATION_KEYS = (
+    "school",
+    "schoolName",
+    "degree",
+    "fieldOfStudy",
+    "field",
+    "dateRange",
+)
+
+
+def _entry_field(entry: dict, *keys: str) -> str:
+    for key in keys:
+        raw = entry.get(key)
+        if isinstance(raw, dict):
+            raw = (
+                raw.get("text")
+                or raw.get("name")
+                or raw.get("title")
+                or raw.get("linkedinText")
+                or ""
+            )
+        text = str(raw or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def current_position_from_experience(
+    experience: object,
+    *,
+    headline: str = "",
+    title: str = "",
+) -> Optional[str]:
+    """Best-effort current role: first experience title + company, else headline/title."""
+    if isinstance(experience, list):
+        for entry in experience:
+            if not isinstance(entry, dict):
+                continue
+            role = _entry_field(entry, "title", "position", "jobTitle")
+            company = _entry_field(entry, "companyName", "company", "company_name")
+            if role and company:
+                return f"{role} @ {company}"[:300]
+            if role:
+                return role[:300]
+            if company:
+                return f"@ {company}"[:300]
+    for fallback in (headline, title):
+        text = str(fallback or "").strip()
+        if text:
+            return text[:300]
+    return None
+
+
 def _normalize_profile_item(item: dict, profile_url: str) -> dict:
     """Normalize person profile output across actors (harvestapi/apimaestro/automation-lab)."""
     if isinstance(item.get("element"), dict):  # harvestapi wraps results
@@ -513,21 +576,30 @@ def _normalize_profile_item(item: dict, profile_url: str) -> dict:
             location.get("linkedinText"), location.get("full"),
             location.get("city"), location.get("country"),
         ) or None
+    public_id = _first_str(item.get("publicIdentifier"), basic.get("publicIdentifier"))
+    vanity = ""
+    if public_id and not public_id.startswith("http"):
+        vanity = f"https://www.linkedin.com/in/{public_id}"
     linkedin_url = _first_str(
+        vanity,
         item.get("linkedinUrl"), item.get("url"), item.get("profileUrl"),
-        basic.get("profile_url"), basic.get("profileUrl"),
+        basic.get("profile_url"), basic.get("profileUrl"), basic.get("linkedin_url"),
     ) or profile_url
+    linkedin_url = _normalize_linkedin_url(linkedin_url) or linkedin_url or profile_url
     follower_count = item.get("followerCount") or basic.get("follower_count") or basic.get("followerCount")
 
     experience = item.get("experience") or item.get("experiences") or basic.get("experience")
     education = item.get("education") or item.get("educations") or basic.get("education")
-    experience_summary = _summarize_profile_sections(
-        experience,
-        ("title", "position", "jobTitle", "companyName", "company", "duration", "dateRange"),
+    experience_summary = _summarize_profile_sections(experience, _EXPERIENCE_KEYS)
+    education_summary = _summarize_profile_sections(education, _EDUCATION_KEYS)
+    current_position = current_position_from_experience(
+        experience, headline=headline or "", title=""
     )
-    education_summary = _summarize_profile_sections(
-        education,
-        ("school", "schoolName", "degree", "fieldOfStudy", "field", "dateRange"),
+    languages = (
+        item.get("languages")
+        or item.get("language")
+        or basic.get("languages")
+        or basic.get("language")
     )
 
     return {
@@ -539,11 +611,13 @@ def _normalize_profile_item(item: dict, profile_url: str) -> dict:
         "follower_count": follower_count,
         "experience_summary": experience_summary,
         "education_summary": education_summary,
+        "current_position": current_position,
+        "languages": languages,
     }
 
 
-def get_linkedin_person_profile(profile_url: Optional[str]) -> dict:
-    """Fetch public LinkedIn person profile: about, headline, location."""
+def get_linkedin_person_profile_apify(profile_url: Optional[str]) -> dict:
+    """Apify-only person profile (no treg routing). Used as enrich fallback."""
     profile_url = _normalize_linkedin_url(profile_url)
     if not profile_url:
         return {}
@@ -582,8 +656,27 @@ def get_linkedin_person_profile(profile_url: Optional[str]) -> dict:
     return {}
 
 
+def get_linkedin_person_profile(profile_url: Optional[str]) -> dict:
+    """Fetch public LinkedIn person profile: about, headline, experience, location."""
+    from agent.integrations.treg import linkedin_enrich_provider
+
+    if linkedin_enrich_provider() == "treg":
+        from agent.integrations import treg as treg_li
+
+        return treg_li.get_linkedin_person_profile(profile_url)
+
+    return get_linkedin_person_profile_apify(profile_url)
+
+
 def get_linkedin_company_profile(company_linkedin_url: Optional[str]) -> dict:
     """Fetch public LinkedIn company profile: description, size, industry."""
+    from agent.integrations.treg import linkedin_enrich_provider
+
+    if linkedin_enrich_provider() == "treg":
+        from agent.integrations import treg as treg_li
+
+        return treg_li.get_linkedin_company_profile(company_linkedin_url)
+
     company_linkedin_url = _normalize_linkedin_url(company_linkedin_url)
     if not company_linkedin_url:
         return {}
@@ -684,10 +777,14 @@ def get_linkedin_company_jobs_batch(
     *,
     max_jobs: int = 5,
     actor_id: Optional[str] = None,
+    websites_by_linkedin: Optional[dict[str, str]] = None,
+    names_by_linkedin: Optional[dict[str, str]] = None,
 ) -> dict[str, dict]:
     """
-    Batch fetch open jobs for up to 100 company LinkedIn URLs in one Apify run.
-    Returns dict keyed by normalized company URL.
+    Fetch open jobs for company LinkedIn URLs.
+
+    treg path (``LINKEDIN_ENRICH_PROVIDER=treg``): per-company catalog calls.
+    Else: one Apify jobs-actor run (up to 100 URLs).
     """
     normalized: list[str] = []
     key_map: dict[str, str] = {}
@@ -708,6 +805,31 @@ def get_linkedin_company_jobs_batch(
         return {}
     if _skip_linkedin_jobs():
         return {u: dict(empty) for u in normalized}
+
+    from agent.integrations.treg import (
+        get_company_open_jobs,
+        linkedin_enrich_provider,
+        treg_configured,
+    )
+
+    if linkedin_enrich_provider() == "treg" and treg_configured():
+        websites_by_linkedin = websites_by_linkedin or {}
+        names_by_linkedin = names_by_linkedin or {}
+        results_treg: dict[str, dict] = {}
+        for url in normalized:
+            results_treg[url] = get_company_open_jobs(
+                company_linkedin_url=url,
+                website=websites_by_linkedin.get(url),
+                company_name=names_by_linkedin.get(url),
+                max_jobs=max_jobs,
+            )
+        log.info(
+            "treg company jobs: titles for %d/%d companies",
+            sum(1 for b in results_treg.values() if b.get("job_titles")),
+            len(normalized),
+        )
+        return results_treg
+
     if not os.environ.get("APIFY_TOKEN"):
         return {u: dict(empty) for u in normalized}
 
@@ -785,7 +907,10 @@ def get_linkedin_company_jobs_batch(
 def _website_crawler_type() -> str:
     """cheerio is cheaper; playwright renders JS CTAs better for careers pages."""
     raw = (os.environ.get("APIFY_WEBSITE_CRAWLER_TYPE") or "cheerio").strip().lower()
-    if raw in ("cheerio", "playwright", "playwright:firefox", "playwright:chrome"):
+    # Apify rejects a bare "playwright" value; firefox is the documented JS renderer.
+    if raw == "playwright":
+        return "playwright:firefox"
+    if raw in ("cheerio", "playwright:adaptive", "playwright:firefox", "playwright:chrome", "jsdom"):
         return raw
     return "cheerio"
 
@@ -894,6 +1019,14 @@ def scrape_website_urls_apify(
 
 def enrich_decision_maker_linkedin(profile_url: Optional[str], max_posts: Optional[int] = None) -> dict:
     """Combined person enrichment: profile about, posts, and hiring signals from posts."""
+    from agent.integrations.treg import linkedin_enrich_provider
+
+    if linkedin_enrich_provider() == "treg":
+        from agent.integrations import treg as treg_li
+
+        log.info("LinkedIn person enrich via treg (%s)", profile_url)
+        return treg_li.enrich_decision_maker_linkedin(profile_url, max_posts=max_posts)
+
     if max_posts is None:
         max_posts = _default_max_posts()
     if _skip_person_profile():
@@ -941,11 +1074,21 @@ def enrich_company_linkedin(
     jobs: dict = {}
     if linkedin_url and fetch_open_jobs and not _skip_linkedin_jobs():
         jobs = get_linkedin_company_jobs(linkedin_url, company_name=company_name, max_jobs=max_jobs)
+    website_out = profile.get("website") or website
+    if not website_out and company_name:
+        try:
+            from agent.integrations.apollo import enrich_company
+
+            org = enrich_company(company_name, website)
+            website_out = org.get("website_url") or org.get("primary_domain") or ""
+        except Exception:
+            website_out = ""
     return {
         "linkedin_url": profile.get("linkedin_url") or linkedin_url,
         "description": profile.get("description"),
         "industry": profile.get("industry"),
         "employee_count": profile.get("employee_count"),
+        "website": website_out or None,
         "is_hiring": jobs.get("is_hiring"),
         "open_jobs_count": jobs.get("open_jobs_count", 0),
         "open_jobs_summary": jobs.get("summary"),
@@ -962,6 +1105,14 @@ def get_linkedin_profile_posts(profile_url: Optional[str], max_posts: Optional[i
     if _skip_linkedin_posts():
         log.info("LinkedIn posts skipped — APIFY_SKIP_LINKEDIN_POSTS is set")
         return {"posts": [], "interests": [], "summary": None}
+
+    from agent.integrations.treg import linkedin_enrich_provider
+
+    if linkedin_enrich_provider() == "treg":
+        from agent.integrations import treg as treg_li
+
+        return treg_li.get_linkedin_profile_posts(profile_url, max_posts=max_posts)
+
     if not profile_url:
         return {"posts": [], "interests": [], "summary": None}
     if not os.environ.get("APIFY_TOKEN"):

@@ -5,12 +5,14 @@ Deep-crawls company websites and extracts structured analysis.
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
 from agent.integrations.careers import (
     careers_index_needs_portal_hop,
     find_careers_page,
+    open_roles_from_ats,
     pick_careers_portal_hop,
 )
 from agent.integrations.firecrawl import (
@@ -28,6 +30,7 @@ from agent.utils.logger import get_run_logger
 from agent.utils.website_markdown_cache import load_markdown, save_markdown
 from agent.utils.website_outreach import (
     DEFAULT_OUTREACH_MAX_PAGES,
+    augment_mapped_with_content_hubs,
     extract_decision_maker_mentions,
     extract_social_links,
     merge_mentions,
@@ -133,6 +136,7 @@ def run(
             careers_url: Optional[str] = None
             careers_markdown: Optional[str] = None
             combined = ""
+            structured_roles: list[str] = []
 
             if not firecrawl and campaign_dir:
                 cached = load_markdown(campaign_dir, company.website or "")
@@ -158,6 +162,9 @@ def run(
                 )
                 log.info("Mapping site URLs: %s", company.website)
                 sitemap_urls = map_website_urls(company.website, limit=100)
+                sitemap_urls = augment_mapped_with_content_hubs(
+                    sitemap_urls, company.website
+                )
                 plan = select_outreach_urls(
                     sitemap_urls, company.website, max_pages=max_pages
                 )
@@ -191,10 +198,21 @@ def run(
                     markdown,
                     sitemap_urls=sitemap_urls,
                 )
+                ats = open_roles_from_ats(careers_url) if careers_url else None
+                if ats:
+                    careers_url = ats["careers_url"]
+                    careers_markdown = ats["markdown"]
+                    structured_roles = list(ats["open_roles"])
+                    log.info(
+                        "ATS open roles for %s: %d from %s",
+                        company.company_name,
+                        len(structured_roles),
+                        careers_url,
+                    )
                 already_scraped = bool(
                     careers_url and markdown and careers_url.rstrip("/") in markdown
                 )
-                if careers_url and not already_scraped:
+                if careers_url and not structured_roles and not already_scraped:
                     careers_markdown = scrape_page(careers_url)
                     if not careers_markdown:
                         from agent.integrations.apify import scrape_website_apify
@@ -216,8 +234,12 @@ def run(
                             careers_body = section
                             break
                 hop_source = careers_body or markdown or ""
-                if careers_url and careers_index_needs_portal_hop(
-                    hop_source, careers_url=careers_url
+                if (
+                    careers_url
+                    and not structured_roles
+                    and careers_index_needs_portal_hop(
+                        hop_source, careers_url=careers_url
+                    )
                 ):
                     hop_url = pick_careers_portal_hop(
                         hop_source,
@@ -231,16 +253,28 @@ def run(
                             careers_url,
                             hop_url,
                         )
-                        hop_md = scrape_page(hop_url)
-                        if not hop_md:
-                            from agent.integrations.apify import scrape_website_apify
-
-                            hop_md = scrape_website_apify(
-                                hop_url, max_pages=1, max_depth=0
+                        ats = open_roles_from_ats(hop_url)
+                        if ats:
+                            careers_url = ats["careers_url"]
+                            careers_markdown = ats["markdown"]
+                            structured_roles = list(ats["open_roles"])
+                            log.info(
+                                "ATS open roles for %s: %d from %s",
+                                company.company_name,
+                                len(structured_roles),
+                                careers_url,
                             )
-                        if hop_md:
-                            careers_url = hop_url
-                            careers_markdown = hop_md
+                        else:
+                            hop_md = scrape_page(hop_url)
+                            if not hop_md:
+                                from agent.integrations.apify import scrape_website_apify
+
+                                hop_md = scrape_website_apify(
+                                    hop_url, max_pages=1, max_depth=0
+                                )
+                            if hop_md:
+                                careers_url = hop_url
+                                careers_markdown = hop_md
 
                 combined = markdown or ""
                 if careers_markdown and careers_url:
@@ -273,6 +307,12 @@ def run(
                 careers_markdown=careers_markdown,
                 hiring_first=hiring_first,
             )
+            if structured_roles:
+                hiring = {
+                    "is_hiring": "yes",
+                    "open_roles": list(structured_roles),
+                    "careers_url": careers_url,
+                }
 
             dm_name = _decision_maker_name(company)
             analysis = None
@@ -297,9 +337,38 @@ def run(
                 dm_name=dm_name,
             )
 
+        def _enrich_with_social() -> Optional[WebsiteAnalysis]:
+            analysis = _enrich()
+            if analysis is None:
+                return None
+            fb_on = os.environ.get("FACEBOOK_COMPANY_POSTS", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            ig_on = os.environ.get("INSTAGRAM_COMPANY_POSTS", "").lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            if fb_on or ig_on:
+                try:
+                    from agent.utils.company_social_posts import enrich_website_social_posts
+
+                    enrich_website_social_posts(
+                        analysis, facebook=fb_on, instagram=ig_on
+                    )
+                except Exception as exc:
+                    log.info(
+                        "Social posts enrich skipped for %s: %s",
+                        company.company_name,
+                        exc,
+                    )
+            return analysis
+
         if isinstance(company, Lead) and tracker:
             with tracker.lead_context(company.lead_id, company.company_name):
-                analysis = _enrich()
+                analysis = _enrich_with_social()
                 record = tracker.accumulate_lead_cost(
                     company.lead_id,
                     company.company_name,
@@ -307,7 +376,7 @@ def run(
                 )
                 company.enrichment_cost_usd = record["total_usd"]
         else:
-            analysis = _enrich()
+            analysis = _enrich_with_social()
 
         return company.company_name, analysis
 

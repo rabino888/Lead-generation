@@ -57,11 +57,12 @@ def run(
     wa_map = website_analyses or {}
 
     def _process(company: RawCompany) -> tuple[Lead, bool]:
-        decision_maker, generic_email = enrich_contacts(
+        decision_maker, generic_email, apollo_detail = enrich_contacts(
             company_name=company.company_name,
             website=company.website,
             job_titles=job_titles,
             contact_locations=contact_locations,
+            logger=log,
         )
         company_linkedin_url = company.company_linkedin_url
         if not company_linkedin_url and company.website:
@@ -89,6 +90,8 @@ def run(
             website_analysis=wa_map.get(company.company_name),
         )
         contactable, reject_reason = apollo_contactable(decision_maker)
+        if not contactable and apollo_detail:
+            reject_reason = apollo_detail
         if contactable:
             lead.enrichment_status = EnrichmentStatus.COMPLETE
             tracker = get_cost_tracker()
@@ -174,8 +177,29 @@ def enrich_linkedin_for_leads(
         )
         for batch in batches:
             urls = batch.linkedin_company_urls()
-            if urls:
-                jobs_by_url.update(get_linkedin_company_jobs_batch(urls))
+            if not urls:
+                continue
+            websites_by_li: dict[str, str] = {}
+            names_by_li: dict[str, str] = {}
+            for lead in unique_leads.values():
+                li = (lead.company_linkedin_url or "").strip()
+                if not li:
+                    continue
+                from agent.integrations.apify import _normalize_linkedin_url
+
+                key = _normalize_linkedin_url(li) or li
+                if key.endswith("/jobs"):
+                    key = key[: -len("/jobs")]
+                if lead.website:
+                    websites_by_li[key] = lead.website
+                names_by_li[key] = lead.company_name
+            jobs_by_url.update(
+                get_linkedin_company_jobs_batch(
+                    urls,
+                    websites_by_linkedin=websites_by_li,
+                    names_by_linkedin=names_by_li,
+                )
+            )
 
     def _fetch_company(lead: Lead) -> None:
         """Enrich one unique company; runs in the pool, one lead per key."""

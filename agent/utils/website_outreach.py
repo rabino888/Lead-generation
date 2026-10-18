@@ -26,14 +26,41 @@ _CAREERS_INDEX = re.compile(
     re.I,
 )
 _BLOG_SEGMENT = (
-    r"blog|news|insights|noticias|actualidad|press|resources|articles|"
-    r"journal|media|updates"
+    r"blog|news|insights|noticias|actualidad|press|prensa|presse|"
+    r"newsroom|resources|articles|journal|media|updates"
 )
 _BLOG_INDEX_ONLY = re.compile(
     r"/(blog|insights|articles|resources|journal|media|updates)/?$", re.I
 )
-_NEWS_INDEX_ONLY = re.compile(r"/(news|noticias|actualidad|press)/?$", re.I)
+# News/press hubs — exact index paths plus common compounds (newsroom, press-releases).
+_NEWS_INDEX_ONLY = re.compile(
+    r"/(?:news|noticias|actualidad|press|prensa|presse|newsroom)"
+    r"(?:[-_]?(?:releases?|room|centre|center|and[-_]?media))?/?$",
+    re.I,
+)
 _BLOG_ARTICLE = re.compile(rf"/({_BLOG_SEGMENT})/.+", re.I)
+# When sitemap/map misses hubs, probe these paths (cheap HTTP) before selection.
+_CONTENT_HUB_PATHS = (
+    "/blog",
+    "/news",
+    "/press",
+    "/newsroom",
+    "/press-releases",
+    "/press-release",
+    "/insights",
+    "/noticias",
+    "/actualidad",
+    "/prensa",
+    "/media",
+    "/articles",
+    "/resources",
+    "/en/news",
+    "/en/press",
+    "/en/blog",
+    "/es/noticias",
+    "/es/prensa",
+    "/es/blog",
+)
 _SERVICES = re.compile(
     r"/(services|what-we-do|solutions|capabilities|expertise|servicios|"
     r"soluciones|que-hacemos|offerings)(/|$)",
@@ -95,6 +122,8 @@ WEBSITE_CSV_FIELDS = [
     "social_instagram",
     "social_tiktok",
     "social_x",
+    "facebook_post_summary",
+    "instagram_post_summary",
     "decision_maker_mentions",
     "website_summary",
 ]
@@ -193,6 +222,109 @@ def _pick_unique(candidates: list[str], seen: set[str], limit: int) -> list[str]
     return picked
 
 
+def _site_base(website: str) -> str:
+    home = (website or "").strip()
+    if not home:
+        return ""
+    if "://" not in home:
+        home = f"https://{home}"
+    parsed = urlparse(home)
+    return urlunparse((parsed.scheme or "https", parsed.netloc, "", "", "", "")).rstrip("/")
+
+
+def _probe_live_url(url: str) -> Optional[str]:
+    """Return final URL if the path resolves to a live HTML-ish page."""
+    try:
+        import httpx
+    except ImportError:
+        return None
+    try:
+        with httpx.Client(
+            follow_redirects=True,
+            timeout=6,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; LeadGenBot/1.0)"},
+        ) as client:
+            resp = client.get(url)
+    except Exception:
+        return None
+    if resp.status_code >= 400:
+        return None
+    final = str(resp.url).rstrip("/")
+    # Soft-404 / homepage bounce: reject when we left the content-hub path.
+    if not (_is_blog_index(final) or _is_news_index(final) or _is_blog_article(final)):
+        ctype = (resp.headers.get("content-type") or "").lower()
+        if "html" not in ctype and "text/" not in ctype:
+            return None
+        # Accept only if final path still looks like a hub we asked for.
+        if not (_is_blog_index(url) or _is_news_index(url)):
+            return None
+        if _norm_url(final) == _norm_url(_site_base(url)):
+            return None
+    return final
+
+
+def augment_mapped_with_content_hubs(
+    mapped: list[str],
+    website: str,
+    *,
+    probe: bool = True,
+) -> list[str]:
+    """
+    Ensure blog/news/press hubs are candidates even when sitemap/map omits them.
+
+    When neither a blog nor news index is already in ``mapped``, probe common
+    paths and append any that resolve. Always a no-op when hubs are already
+    present (avoids extra HTTP).
+    """
+    usable = [u for u in (mapped or []) if u and not _is_asset(u)]
+    has_blog = any(_is_blog_index(u) for u in usable)
+    has_news = any(_is_news_index(u) for u in usable)
+    if has_blog and has_news:
+        return list(mapped or [])
+
+    base = _site_base(website)
+    if not base:
+        return list(mapped or [])
+
+    seen = {_norm_url(u) for u in usable}
+    out = list(mapped or [])
+    candidates = [f"{base}{path}" for path in _CONTENT_HUB_PATHS]
+    # Prefer probing missing class only (news when no news, blog when no blog).
+    for cand in candidates:
+        key = _norm_url(cand)
+        if not key or key in seen:
+            continue
+        want_news = _is_news_index(cand) and not has_news
+        want_blog = _is_blog_index(cand) and not has_blog
+        if not (want_news or want_blog):
+            continue
+        if not probe:
+            out.append(cand)
+            seen.add(key)
+            if want_news:
+                has_news = True
+            if want_blog:
+                has_blog = True
+            if has_blog and has_news:
+                break
+            continue
+        live = _probe_live_url(cand)
+        if not live:
+            continue
+        live_key = _norm_url(live)
+        if live_key in seen:
+            continue
+        out.append(live)
+        seen.add(live_key)
+        if _is_news_index(live):
+            has_news = True
+        if _is_blog_index(live):
+            has_blog = True
+        if has_blog and has_news:
+            break
+    return out
+
+
 def select_outreach_urls(
     mapped: list[str],
     website: str,
@@ -201,7 +333,11 @@ def select_outreach_urls(
 ) -> OutreachPagePlan:
     """
     Choose which mapped URLs to scrape for outreach intel.
-    Homepage is always first. Remaining slots follow careers → blog/news/services → about/team.
+    Homepage is always first. Remaining slots follow careers → blog/news →
+    articles → services → about/team.
+
+    News/press indexes are first-class with blog: when a site has /news or
+    /press but no /blog, those hubs still get a scrape slot.
     """
     max_pages = max(1, min(int(max_pages), 12))
     home = website.strip() if website else ""
@@ -215,7 +351,11 @@ def select_outreach_urls(
     blog_indexes.sort(key=len)
     news_indexes = [u for u in usable if _is_news_index(u)]
     news_indexes.sort(key=len)
-    articles = [u for u in usable if _is_blog_article(u) and not _is_blog_index(u)]
+    articles = [
+        u
+        for u in usable
+        if _is_blog_article(u) and not _is_blog_index(u) and not _is_news_index(u)
+    ]
     articles = [
         u for _, u in sorted(
             (( _article_rank(u, i), u) for i, u in enumerate(articles)),
@@ -241,8 +381,9 @@ def select_outreach_urls(
 
     blog_picked = _pick_unique(blog_indexes, seen, min(1, remaining()))
     urls.extend(blog_picked)
-    news_picked = []
-    if remaining() > 0:
+    # News/press is first-class with blog — always take a slot when present.
+    news_picked: list[str] = []
+    if remaining() > 0 and news_indexes:
         news_picked = _pick_unique(news_indexes, seen, 1)
         urls.extend(news_picked)
 
@@ -257,6 +398,52 @@ def select_outreach_urls(
         news_url=news_picked[0] if news_picked else None,
         careers_url=careers_picked[0] if careers_picked else None,
     )
+
+
+def prefer_brief_relevant_urls(
+    mapped: list[str],
+    website: str,
+    brief_terms: list[str],
+    *,
+    base_urls: list[str] | None = None,
+    max_pages: int = DEFAULT_OUTREACH_MAX_PAGES,
+    max_brief_slots: int = 4,
+) -> list[str]:
+    """
+    Merge outreach plan URLs with sitemap pages whose path matches brief terms.
+
+    Brief terms come from CLIENT.md / ICP keywords (e.g. property, alquiler).
+    Homepage and existing plan URLs stay first; brief-matching pages fill remaining slots.
+    """
+    max_pages = max(1, min(int(max_pages), 12))
+    plan = select_outreach_urls(mapped, website, max_pages=max_pages)
+    ordered = list(base_urls or plan.urls)
+    seen = {_norm_url(u) for u in ordered}
+    terms = [t.strip().lower() for t in (brief_terms or []) if t and len(t.strip()) >= 3]
+    if not terms:
+        return ordered[:max_pages]
+
+    scored: list[tuple[int, str]] = []
+    for url in mapped or []:
+        if not url or _is_asset(url):
+            continue
+        key = _norm_url(url)
+        if not key or key in seen:
+            continue
+        path = _path(url).lower()
+        hits = sum(1 for t in terms if t.replace(" ", "-") in path or t.replace(" ", "") in path or t in path)
+        if hits:
+            scored.append((hits, url))
+    scored.sort(key=lambda pair: (-pair[0], len(pair[1])))
+    for _, url in scored[: max(0, int(max_brief_slots))]:
+        if len(ordered) >= max_pages:
+            break
+        key = _norm_url(url)
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(url)
+    return ordered[:max_pages]
 
 
 def extract_social_links(markdown: str) -> dict[str, Optional[str]]:
@@ -388,6 +575,8 @@ def website_analysis_to_csv(wa: Optional[WebsiteAnalysis]) -> dict[str, str]:
         "social_instagram": wa.social_instagram or "",
         "social_tiktok": wa.social_tiktok or "",
         "social_x": wa.social_x or "",
+        "facebook_post_summary": wa.facebook_post_summary or "",
+        "instagram_post_summary": wa.instagram_post_summary or "",
     }
     has_blog = ""
     if wa.has_blog is not None:
@@ -454,6 +643,8 @@ def website_analysis_from_csv(row: dict) -> Optional[WebsiteAnalysis]:
         social_instagram=(row.get("social_instagram") or "").strip() or None,
         social_tiktok=(row.get("social_tiktok") or "").strip() or None,
         social_x=(row.get("social_x") or "").strip() or None,
+        facebook_post_summary=(row.get("facebook_post_summary") or "").strip() or None,
+        instagram_post_summary=(row.get("instagram_post_summary") or "").strip() or None,
         decision_maker_mentions=_split(row.get("decision_maker_mentions")),
         website_summary=(row.get("website_summary") or "").strip() or None,
         website_is_hiring=(row.get("website_is_hiring") or "").strip() or None,

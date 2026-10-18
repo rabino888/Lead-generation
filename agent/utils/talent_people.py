@@ -55,8 +55,13 @@ T01_FIELDS = [
 # SPEC §6.2 — appended after profile scrape (T04)
 T04_PROFILE_FIELDS = [
     "about",
+    "current_position",
     "experience_summary",
     "education_summary",
+    "outreach_language",
+    "linkedin_post_summary",
+    "linkedin_interests",
+    "linkedin_recent_posts",
     "profile_raw_chars",
     "profile_scraped_at_utc",
     "profile_status",

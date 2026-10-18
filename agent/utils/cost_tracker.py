@@ -54,6 +54,7 @@ def _empty_breakdown() -> dict[str, Any]:
     "firecrawl_pages": 0,
     "firecrawl_usd": 0.0,
     "apify_usd": 0.0,
+    "treg_usd": 0.0,
     "llm_tokens": 0,
     "llm_usd": 0.0,
   }
@@ -112,6 +113,7 @@ class CostTracker:
     firecrawl_pages: int = 0,
     llm_tokens: int = 0,
     apify_usd: float = 0.0,
+    treg_usd: float = 0.0,
   ) -> None:
     """Record usage against the run and the current thread's lead (if any)."""
     delta = {
@@ -120,6 +122,7 @@ class CostTracker:
       "firecrawl_pages": firecrawl_pages,
       "firecrawl_usd": round(firecrawl_pages * self.firecrawl_per_page, 4),
       "apify_usd": round(apify_usd, 4),
+      "treg_usd": round(treg_usd, 4),
       "llm_tokens": llm_tokens,
       "llm_usd": round((llm_tokens / 1000) * self.llm_per_1k_tokens, 4),
     }
@@ -266,6 +269,7 @@ def _breakdown_total(breakdown: dict[str, Any]) -> float:
     breakdown["apollo_usd"]
     + breakdown["firecrawl_usd"]
     + breakdown["apify_usd"]
+    + float(breakdown.get("treg_usd") or 0)
     + breakdown["llm_usd"],
     4,
   )
@@ -278,6 +282,9 @@ def _merge_breakdown(existing: dict[str, Any], delta: dict[str, Any]) -> dict[st
     "firecrawl_pages": existing["firecrawl_pages"] + delta["firecrawl_pages"],
     "firecrawl_usd": round(existing["firecrawl_usd"] + delta["firecrawl_usd"], 4),
     "apify_usd": round(existing["apify_usd"] + delta["apify_usd"], 4),
+    "treg_usd": round(
+      float(existing.get("treg_usd") or 0) + float(delta.get("treg_usd") or 0), 4
+    ),
     "llm_tokens": existing["llm_tokens"] + delta["llm_tokens"],
     "llm_usd": round(existing["llm_usd"] + delta["llm_usd"], 4),
   }

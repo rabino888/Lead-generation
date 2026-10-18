@@ -176,6 +176,8 @@ class WebsiteAnalysis(BaseModel):
     social_instagram: Optional[str] = None
     social_tiktok: Optional[str] = None
     social_x: Optional[str] = None
+    facebook_post_summary: Optional[str] = None
+    instagram_post_summary: Optional[str] = None
     decision_maker_mentions: list[str] = Field(default_factory=list)
     website_summary: Optional[str] = None
     raw_markdown_length: Optional[int] = None

@@ -197,12 +197,11 @@
         <div class="panel confirm-panel">
           <div class="panel-head">
             <h3>Confirm list build</h3>
-            <span class="hint">Gated: seeds → ICP/dedupe → paid smoke → approve → full batch</span>
+            <span class="hint">Gated: seeds → ICP/dedupe → smoke (email + Core enrich) → approve → full batch</span>
           </div>
-          <p class="setup-note" style="margin-top:0">
+          <p class="setup-note" style="margin-top:0" id="confirm-flow-note">
             Starting runs seeds → ICP match → dedupe, then a small paid smoke through your modules.
-            If there is no seeds.csv, the dashboard auto-builds LinkedIn company-search URLs from the ICP
-            and scrapes companies via Apify (paid, never jobs), then continues. After smoke, approve the full batch.
+            After smoke, approve the full batch.
           </p>
           <dl class="facts" id="confirm-facts"></dl>
           <div class="confirm-estimate" id="confirm-estimate"></div>
@@ -228,6 +227,7 @@
           <div id="confirm-run-previews" class="run-previews hidden"></div>
           <div class="setup-actions" style="margin-top:16px">
             <button type="button" class="btn primary" id="btn-confirm-yes">Start seed + smoke gate</button>
+            <button type="button" class="btn hidden" id="btn-confirm-resmoke">Re-run smoke</button>
             <button type="button" class="btn primary hidden" id="btn-confirm-approve">Approve full batch</button>
             <button type="button" class="btn" id="btn-confirm-no">Save for later</button>
             <button type="button" class="btn ghost" id="btn-confirm-back">← Back to modules</button>
@@ -273,22 +273,26 @@
     ['icp_match', 'ICP match', 'Local', 'Essential'],
     ['dedupe', 'Deduplication', 'Local + Sheets', 'Essential'],
     ['apollo_email', 'Email reveal', 'Apollo', 'Core'],
-    ['apify_dm_profile', 'LinkedIn DM profile', 'Apify', 'Core'],
-    ['apify_dm_posts', 'LinkedIn DM recent posts', 'Apify', 'Core'],
+    ['linkedin_dm_profile', 'LinkedIn DM profile', 'treg', 'Core'],
+    ['linkedin_dm_posts', 'LinkedIn DM recent posts', 'treg', 'Core'],
     ['website_scrape', 'Website scrape', 'Apify / Firecrawl', 'Core'],
-    ['apify_company_profile', 'LinkedIn company profile', 'Apify', 'Optional'],
-    ['apify_company_jobs', 'LinkedIn company open jobs', 'Apify', 'Optional'],
+    ['linkedin_company_profile', 'LinkedIn company profile', 'treg/Apify', 'Optional'],
+    ['linkedin_company_jobs', 'Company open jobs', 'treg', 'Core'],
+    ['facebook_company_posts', 'Facebook recent posts', 'treg', 'Optional'],
+    ['instagram_company_posts', 'Instagram recent posts', 'treg', 'Optional'],
     ['apollo_phone', 'Decision-maker phone reveal', 'Apollo', 'Optional'],
   ];
   const KNOB = {
     icp_match: 'always on — match_campaign_icp',
     dedupe: 'always on — stage_dedupe',
     apollo_email: 'off → LinkedIn-only mode',
-    apify_dm_profile: 'off → APIFY_SKIP_PERSON_PROFILE=1',
-    apify_dm_posts: 'off → APIFY_SKIP_LINKEDIN_POSTS=1',
-    website_scrape: 'WEBSITE_CRAWLER · off → skip website stage',
-    apify_company_profile: 'off → skip company-profile branch',
-    apify_company_jobs: 'off → APIFY_SKIP_LINKEDIN_JOBS=1',
+    linkedin_dm_profile: 'off → skip DM profile enrich',
+    linkedin_dm_posts: 'off → skip LinkedIn posts',
+    website_scrape: 'talent: brief-driven employer site · company: prospect site',
+    linkedin_company_profile: 'talent: campaign-relevant employer · company: company page',
+    linkedin_company_jobs: 'off → skip open-jobs enrich',
+    facebook_company_posts: 'needs social URL from website scrape · soft-fail',
+    instagram_company_posts: 'needs IG handle from website scrape · soft-fail',
     apollo_phone: 'off → APOLLO_SKIP_PHONE=1',
   };
 
@@ -853,14 +857,31 @@
     const c = state.current || {};
     const p = state.plan || {};
     const e = state.estimate || {};
+    const ctype = p.campaign_type || c.campaign_type || 'company_outreach';
+    const flowNote = document.getElementById('confirm-flow-note');
+    if (flowNote) {
+          if (ctype === 'talent_search') {
+        flowNote.textContent = 'Smoke gate: people seeds → dedupe → person ICP → vanity LinkedIn resolve '
+          + '(treg SERP for opaque ACw ids) → Apollo email on a small slice. '
+          + 'Core enrichment (DM profile / recent posts) runs on contactables when those modules are on. '
+          + 'Phone is skipped on smoke. After review, Approve runs the same pipeline for the full target.';
+      } else {
+        flowNote.textContent = 'Smoke gate: seeds → ICP match → dedupe → paid Apollo (+ Core modules) on a small slice. '
+          + 'If there is no seeds.csv, the dashboard auto-builds LinkedIn company-search URLs from the ICP '
+          + 'and scrapes companies via Apify (paid, never jobs), then continues. After smoke, Approve runs the full batch.';
+      }
+    }
     const mods = (p.modules) || {};
-    const onMods = Object.keys(mods).filter((k) => mods[k]).map((k) => k.replace(/_/g, ' '));
+    const modLabel = Object.fromEntries(META.map(([id, label]) => [id, label]));
+    const onMods = META
+      .filter(([id]) => !!mods[id])
+      .map(([id]) => modLabel[id] || id.replace(/_/g, ' '));
     facts.innerHTML = [
       appendFactHtml('Client', c.client_name || state.clientName || state.clientId),
       appendFactHtml('Campaign', c.display_name || c.campaign_id),
-      appendFactHtml('ICP id', c.icp_id || '—'),
-      appendFactHtml('Type', String(p.campaign_type || c.campaign_type || '').replace(/_/g, ' ')),
-      appendFactHtml('Modules on', onMods),
+      appendFactHtml(ctype === 'talent_search' ? 'ITP id' : 'ICP id', c.icp_id || '—'),
+      appendFactHtml('Type', String(ctype).replace(/_/g, ' ')),
+      appendFactHtml('Modules on', onMods.length ? onMods : ['(none — check Core toggles on modules board)']),
     ].join('');
     const usd = e.usd_total != null ? money(e.usd_total) : '—';
     const per = e.usd_per_lead != null ? money(e.usd_per_lead)
@@ -936,12 +957,13 @@
     const box = document.getElementById('confirm-run-previews');
     if (!box) return;
     box.innerHTML = '';
-    if (!lr || !lr.phase || lr.phase === 'idle') {
+    if (!lr || !lr.phase) {
       box.classList.add('hidden');
       return;
     }
     const seeds = lr.seed_preview || [];
     const smokeRows = lr.smoke_preview || [];
+    // Keep seed/smoke previews visible after a run settles (idle) when rows exist
     const show = seeds.length || smokeRows.length || lr.phase === 'awaiting_approval'
       || lr.phase === 'smoking' || lr.phase === 'matching' || lr.phase === 'seeding'
       || lr.phase === 'error';
@@ -960,15 +982,26 @@
       ul.className = 'seed-list';
       seeds.slice(0, 25).forEach((s) => {
         const li = document.createElement('li');
-        li.textContent = (s.company_name || '')
-          + (s.website ? (' — ' + s.website) : '')
-          + (s.location ? (' · ' + s.location) : '');
+        if (s.full_name || s.title || s.linkedin_url) {
+          // Talent people preview
+          const bits = [];
+          if (s.full_name) bits.push(s.full_name);
+          if (s.title) bits.push(s.title);
+          if (s.company_name) bits.push('@ ' + s.company_name);
+          if (s.location) bits.push(s.location);
+          li.textContent = bits.join(' · ');
+        } else {
+          // Company outreach preview
+          li.textContent = (s.company_name || '')
+            + (s.website ? (' — ' + s.website) : '')
+            + (s.location ? (' · ' + s.location) : '');
+        }
         ul.appendChild(li);
       });
       if ((counts.seeds || seeds.length) > 25) {
         const more = document.createElement('li');
         more.className = 'note';
-        more.textContent = '… full list in stages/01_raw_seeds.csv';
+        more.textContent = '… full list in stages/T01_raw_people.csv (talent) or stages/01_raw_seeds.csv';
         ul.appendChild(more);
       }
       box.appendChild(ul);
@@ -978,7 +1011,10 @@
       p.textContent = 'Seed list will appear here when scraping finishes…';
       box.appendChild(p);
     }
-    if (smokeRows.length || lr.smoke_run_id || lr.phase === 'awaiting_approval' || lr.phase === 'error') {
+    const smokeRan = !!(lr.smoke_run_id || smokeRows.length
+      || (counts.smoke_seeds != null) || (counts.smoke_contactable != null));
+    if (smokeRows.length || lr.smoke_run_id || lr.phase === 'error'
+      || (lr.phase === 'awaiting_approval' && smokeRan)) {
       const h2 = document.createElement('h4');
       h2.textContent = 'Smoke results'
         + (counts.smoke_contactable != null
@@ -990,10 +1026,18 @@
         sul.className = 'seed-list';
         smokeRows.forEach((s) => {
           const li = document.createElement('li');
-          li.textContent = (s.company_name || '')
-            + (s.decision_maker_name ? (' — ' + s.decision_maker_name) : '')
-            + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
-            + ' · ' + (s.decision_maker_email || '(no email)');
+          if (s.full_name || s.email || s.linkedin_url) {
+            // Talent people smoke — person first, employer is context only
+            li.textContent = (s.full_name || '')
+              + (s.title ? (' — ' + s.title) : '')
+              + (s.company_name ? (' @ ' + s.company_name) : '')
+              + ' · ' + (s.email || s.decision_maker_email || '(no email)');
+          } else {
+            li.textContent = (s.decision_maker_name || s.company_name || '')
+              + (s.decision_maker_name && s.company_name ? (' @ ' + s.company_name) : '')
+              + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
+              + ' · ' + (s.decision_maker_email || s.email || '(no email)');
+          }
           sul.appendChild(li);
         });
         box.appendChild(sul);
@@ -1001,7 +1045,7 @@
         const p = document.createElement('p');
         p.className = 'setup-note';
         p.textContent = 'Smoke finished with no contactable emails (Apollo reject). '
-          + 'Seed list above is still reviewable — re-smoke or approve with caution.';
+          + 'Seed list above is still reviewable — use Re-run smoke or approve with caution.';
         box.appendChild(p);
       } else if (lr.phase === 'error') {
         const p = document.createElement('p');
@@ -1027,16 +1071,22 @@
     const el = document.getElementById('confirm-run-status');
     const hint = document.getElementById('confirm-status');
     const startBtn = document.getElementById('btn-confirm-yes');
+    const resmokeBtn = document.getElementById('btn-confirm-resmoke');
     const approveBtn = document.getElementById('btn-confirm-approve');
     if (!el) return;
+    const smokeRan = !!(lr && (lr.smoke_run_id
+      || (lr.smoke_preview || []).length
+      || (lr.counts && (lr.counts.smoke_seeds != null || lr.counts.smoke_contactable != null))));
     if (!lr || !lr.phase || lr.phase === 'idle') {
       el.textContent = '';
-      renderRunPreviews(null);
+      renderRunPreviews(lr && (lr.seed_preview || []).length ? lr : null);
       if (hint && (hint.textContent || '').indexOf('Running') === 0) hint.textContent = '';
       if (startBtn) {
         startBtn.disabled = false;
         startBtn.classList.remove('hidden');
+        startBtn.textContent = 'Start seed + smoke gate';
       }
+      if (resmokeBtn) resmokeBtn.classList.add('hidden');
       if (approveBtn) approveBtn.classList.add('hidden');
       return;
     }
@@ -1054,8 +1104,10 @@
     renderRunPreviews(lr);
     const active = ['seeding', 'matching', 'smoking', 'running_full'].indexOf(lr.phase) >= 0;
     if (hint) {
-      if (lr.phase === 'awaiting_approval') {
-        hint.textContent = 'Smoke done — review seed list + smoke below, then Approve full batch';
+      if (lr.phase === 'awaiting_approval' && smokeRan) {
+        hint.textContent = 'Smoke done — review people + emails below, then Approve or Re-run smoke';
+      } else if (lr.phase === 'awaiting_approval' && !smokeRan) {
+        hint.textContent = 'Seeds ready — smoke has not run yet. Start seed + smoke gate.';
       } else if (lr.phase === 'completed') {
         hint.textContent = 'Full batch finished';
       } else if (lr.phase === 'error') {
@@ -1064,12 +1116,28 @@
         hint.textContent = 'Running — stay on this page (Apify/Apollo may take several minutes)…';
       }
     }
+    // False awaiting_approval (seeds only, no smoke yet) → show Start, not Approve
+    const canApprove = (lr.phase === 'awaiting_approval' && smokeRan)
+      || (lr.phase === 'completed' && !(lr.counts && (lr.counts.full_contactable || lr.counts.smoke_contactable)));
+    const canResmoke = (lr.phase === 'awaiting_approval' && smokeRan)
+      || lr.phase === 'error'
+      || (lr.phase === 'completed' && !(lr.counts && (lr.counts.full_contactable || lr.counts.smoke_contactable)));
     if (startBtn) {
       startBtn.disabled = active;
-      startBtn.classList.toggle('hidden', lr.phase === 'awaiting_approval');
+      startBtn.classList.toggle('hidden', canApprove || (lr.phase === 'awaiting_approval' && smokeRan));
+      // When awaiting without a real smoke, keep Start visible
+      if (lr.phase === 'awaiting_approval' && !smokeRan) {
+        startBtn.classList.remove('hidden');
+        startBtn.disabled = false;
+        startBtn.textContent = 'Start seed + smoke gate';
+      }
+    }
+    if (resmokeBtn) {
+      resmokeBtn.classList.toggle('hidden', !canResmoke || active);
+      resmokeBtn.disabled = active;
     }
     if (approveBtn) {
-      approveBtn.classList.toggle('hidden', lr.phase !== 'awaiting_approval');
+      approveBtn.classList.toggle('hidden', !canApprove);
       approveBtn.disabled = false;
     }
   }
@@ -1516,17 +1584,40 @@
 
     const seeds = state.seeds || { sources: [] };
     const sources = Array.isArray(seeds.sources) ? seeds.sources : [];
-    const cards = sources.length ? sources.map((s, i) => `
+    function escAttr(v) {
+      return String(v == null ? '' : v)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/</g, '&lt;');
+    }
+    const cards = sources.length ? sources.map((s, i) => {
+      const cfg = s.config || {};
+      const isPeopleCsv = s.type === 'people_csv_ingest' || s.type === 'csv_ingest' || cfg.csv_path;
+      const isLiPeople = s.type === 'linkedin_people' || (s.id || '').startsWith('linkedin_people');
+      const titleVal = Array.isArray(cfg.title || cfg.titles)
+        ? (cfg.title || cfg.titles).join(', ')
+        : (cfg.title || cfg.titles || '');
+      const locVal = Array.isArray(cfg.locations || cfg.location)
+        ? (cfg.locations || cfg.location).join(', ')
+        : (cfg.location || '');
+      return `
       <div class="seed-card" data-i="${i}">
         <label class="en"><input type="checkbox" class="seed-en" ${s.enabled ? 'checked' : ''}>
           <span class="sid">${s.type || s.id || 'source'} · ${s.name || s.id || ''}</span></label>
         <div class="smeta">${s.why_chosen || s.tier || ''}</div>
-        ${(s.type === 'csv_ingest' || s.type === 'people_csv_ingest' || (s.config && s.config.csv_path))
-          ? `<label style="margin-top:8px">CSV path<input class="seed-csv" type="text" value="${(s.config && s.config.csv_path) || ''}"></label>`
+        ${isPeopleCsv
+          ? `<label style="margin-top:8px">CSV path<input class="seed-csv" type="text" value="${escAttr(cfg.csv_path || '')}"></label>`
           : ''}
-      </div>`).join('')
+        ${isLiPeople
+          ? `<label style="margin-top:8px">Search query<input class="seed-query" type="text" value="${escAttr(cfg.query || cfg.searchQuery || '')}" placeholder="Property Manager Marbella"></label>
+             <label style="margin-top:8px">Job titles (comma-separated)<input class="seed-titles" type="text" value="${escAttr(titleVal)}" placeholder="Property Manager, Administrador de Fincas"></label>
+             <label style="margin-top:8px">Locations (comma-separated)<input class="seed-locations" type="text" value="${escAttr(locVal)}" placeholder="Marbella, Costa del Sol, Spain"></label>
+             <label style="margin-top:8px">Max results<input class="seed-max" type="number" min="1" max="5000" value="${escAttr(cfg.max_results || 50)}"></label>`
+          : ''}
+      </div>`;
+    }).join('')
       : `<p style="margin:0;font-size:.84rem;color:var(--ink-3)">No sources yet. ${isTalent
-        ? 'Add <code>people_csv_ingest</code> or <code>linkedin_people</code>, or place <code>people_seeds.csv</code> in the campaign folder.'
+        ? 'Add <code>linkedin_people</code> (Apify search) or <code>people_csv_ingest</code>, or place <code>people_seeds.csv</code> in the campaign folder.'
         : 'Ask the IDE agent to draft <code>seed_sources.json</code> from directories / notes, or add a csv_ingest entry after save.'}</p>`;
     document.getElementById('seed-fields').innerHTML = `
       <p style="margin:0 0 10px;font-size:.8rem;color:var(--ink-2)">${isTalent
@@ -1534,10 +1625,13 @@
         : 'Primary path is <b>linkedin_companies</b> (ICP → company-search URLs → Apify) or <b>csv_ingest</b> ($0). LinkedIn jobs is blocked.'}</p>
       ${cards}
       <div class="setup-actions" style="margin-top:4px">
-        <button type="button" class="btn" id="add-csv-seed">+ ${isTalent ? 'people_csv_ingest' : 'csv_ingest'} source</button>
+        ${isTalent
+          ? `<button type="button" class="btn" id="add-li-people-seed">+ linkedin_people</button>
+             <button type="button" class="btn" id="add-csv-seed">+ people_csv_ingest</button>`
+          : `<button type="button" class="btn" id="add-csv-seed">+ csv_ingest source</button>`}
       </div>`;
-    const addBtn = document.getElementById('add-csv-seed');
-    if (addBtn) addBtn.onclick = () => {
+    const addCsvBtn = document.getElementById('add-csv-seed');
+    if (addCsvBtn) addCsvBtn.onclick = () => {
       const doc = state.seeds && typeof state.seeds === 'object' ? state.seeds : { sources: [] };
       if (!Array.isArray(doc.sources)) doc.sources = [];
       if (isTalent) {
@@ -1564,6 +1658,28 @@
       state.seeds = doc;
       renderSetup();
     };
+    const addLiBtn = document.getElementById('add-li-people-seed');
+    if (addLiBtn) addLiBtn.onclick = () => {
+      const doc = state.seeds && typeof state.seeds === 'object' ? state.seeds : { sources: [] };
+      if (!Array.isArray(doc.sources)) doc.sources = [];
+      doc.sources.push({
+        id: 'linkedin_people_' + (doc.sources.length + 1),
+        type: 'linkedin_people',
+        name: 'LinkedIn people search',
+        why_chosen: 'Apify harvestapi/linkedin-profile-search',
+        enabled: true,
+        tier: 'primary',
+        config: {
+          actor: 'harvestapi/linkedin-profile-search',
+          query: '',
+          title: '',
+          locations: [],
+          max_results: Number((state.plan && state.plan.seed_count) || 50) || 50,
+        },
+      });
+      state.seeds = doc;
+      renderSetup();
+    };
   }
 
   function collectIcpFromForm() {
@@ -1581,10 +1697,26 @@
       if (!doc.sources[i]) return;
       const en = card.querySelector('.seed-en');
       doc.sources[i].enabled = !!(en && en.checked);
+      const cfg = Object.assign({}, doc.sources[i].config || {});
       const csv = card.querySelector('.seed-csv');
-      if (csv) {
-        doc.sources[i].config = Object.assign({}, doc.sources[i].config || {}, { csv_path: csv.value.trim() });
+      if (csv) cfg.csv_path = csv.value.trim();
+      const q = card.querySelector('.seed-query');
+      if (q) cfg.query = q.value.trim();
+      const titles = card.querySelector('.seed-titles');
+      if (titles) {
+        const parts = titles.value.split(',').map((x) => x.trim()).filter(Boolean);
+        cfg.title = parts.length === 1 ? parts[0] : parts;
       }
+      const locs = card.querySelector('.seed-locations');
+      if (locs) {
+        cfg.locations = locs.value.split(',').map((x) => x.trim()).filter(Boolean);
+      }
+      const mx = card.querySelector('.seed-max');
+      if (mx) {
+        const n = parseInt(mx.value, 10);
+        if (Number.isFinite(n) && n > 0) cfg.max_results = n;
+      }
+      doc.sources[i].config = cfg;
     });
     doc.campaign_id = state.current.campaign_id;
     return doc;
@@ -1653,7 +1785,7 @@
       </div>`;
     }).join('');
     return `
-      <div class="panel-head"><h3>Module board</h3><span class="hint">9 modules</span></div>
+      <div class="panel-head"><h3>Module board</h3><span class="hint">11 modules</span></div>
       <div class="vol">
         <div style="display:flex;gap:18px;flex-wrap:wrap;align-items:flex-end">
           <div><div class="field-label" style="font-size:.7rem;color:var(--ink-3)">Target contactable leads</div>
@@ -1675,32 +1807,49 @@
     const p = state.plan;
     const pr = p.talent_pass_rates || { after_dedupe: 0.9, after_icp: 0.4, email_success: 0.7 };
     const phone = !!p.modules.apollo_phone;
+    const workHist = p.modules.linkedin_dm_profile !== false;
+    const posts = p.modules.linkedin_dm_posts !== false;
+    const employer = !!p.modules.linkedin_company_profile;
+    const website = !!p.modules.website_scrape;
     const e = state.estimate || {};
     const by = Object.fromEntries((e.line_items || []).map((x) => [x.module_id, x]));
-    const steps = [
-      ['1', 'fixed', 'Initial seed scrape', 'Apify LinkedIn people / jobs → person URLs', by.talent_seed],
+    const coreSteps = [
+      ['1', 'fixed', 'Initial seed scrape', 'Apify LinkedIn people → person URLs', by.talent_seed],
       ['2', 'locked', 'Deduplication', 'LinkedIn URL / ContactDedup', by.dedupe],
       ['3', 'locked', 'ICP match', 'person ICP rules', by.icp_match],
-      ['4', 'fixed', 'Personal profile scrape', 'apimaestro · ICP survivors', by.talent_profile],
       ['5', 'fixed', 'Apollo email reveal', 'ICP survivors', by.apollo_email],
-      ['6', 'toggle', 'Apollo phone reveal', 'async webhook · email successes', by.apollo_phone],
+      ['4', 'toggle', 'LinkedIn DM profile', 'Core · post-email · anyapi/Apify', by.talent_profile],
+      ['posts', 'toggle', 'LinkedIn DM recent posts', 'Core · post-email · treg', by.linkedin_dm_posts],
     ];
-    const rows = steps.map(([n, kind, label, sub, line]) => {
+    const optionalSteps = [
+      ['employer', 'toggle', 'Employer company profile', 'Optional · ICP-picks campaign-relevant company · treg/Apify', by.linkedin_company_profile],
+      ['website', 'toggle', 'Employer website (brief-driven)', 'Optional · crawl + CLIENT.md/ICP findings (e.g. advertised properties)', by.website_scrape],
+      ['6', 'toggle', 'Apollo phone reveal', 'Optional · async webhook · email successes', by.apollo_phone],
+    ];
+    function stepRow([n, kind, label, sub, line], on) {
       const locked = kind === 'locked';
-      const isPhone = n === '6';
-      const on = isPhone ? phone : true;
-      const amt = (!on && isPhone) ? '—' : (line ? money(line.line_usd) : (locked ? '$0 · local' : '—'));
+      const isToggle = kind === 'toggle';
+      const amt = (!on && isToggle) ? '—' : (line ? money(line.line_usd) : (locked ? '$0 · local' : '—'));
       const ctl = locked ? '<span class="lockpill">Locked</span>'
-        : isPhone ? toggleHtml(phone, false)
+        : isToggle ? toggleHtml(!!on, false)
         : `<span class="ctype" style="font-size:.56rem">Fixed</span>`;
-      return `<div class="srow" data-step="${n}" style="opacity:${(!on && isPhone) ? 0.5 : 1}">
+      const numLabel = n === 'posts' ? '4b' : (n === 'employer' ? '4c' : (n === 'website' ? '4d' : n));
+      return `<div class="srow" data-step="${n}" style="opacity:${(!on && isToggle) ? 0.5 : 1}">
         <div>${ctl}</div>
-        <div><div class="mrow-label">${n}. ${label}</div><div class="mrow-sub"><span>${sub}</span></div></div>
+        <div><div class="mrow-label">${numLabel}. ${label}</div><div class="mrow-sub"><span>${sub}</span></div></div>
         <div class="amt">${amt}</div>
       </div>`;
+    }
+    const coreRows = coreSteps.map((s) => {
+      const on = s[0] === '4' ? workHist : (s[0] === 'posts' ? posts : true);
+      return stepRow(s, on);
+    }).join('');
+    const optionalRows = optionalSteps.map((s) => {
+      const on = s[0] === 'employer' ? employer : (s[0] === 'website' ? website : phone);
+      return stepRow(s, on);
     }).join('');
     return `
-      <div class="panel-head"><h3>Talent pipeline</h3><span class="hint">6 fixed steps · phone optional</span></div>
+      <div class="panel-head"><h3>Talent pipeline</h3><span class="hint">core on by default · optional offable</span></div>
       <div class="inputs">
         <div class="field"><span>Expected seed volume</span>
           <input class="num" id="seed-count" type="number" min="0" value="${p.seed_count || 0}"></div>
@@ -1710,7 +1859,10 @@
           <label>Email success %<input id="r-email" type="number" min="0" max="100" value="${Math.round(pr.email_success * 100)}"></label>
         </div>
       </div>
-      ${rows}`;
+      <div class="mod-legend" style="margin-top:10px"><span><b>Core</b> on by default · can turn off</span></div>
+      ${coreRows}
+      <div class="mod-legend" style="margin-top:14px"><span><b>Optional</b> employer company · website · phone</span></div>
+      ${optionalRows}`;
   }
 
   function estimateRight(isTalent) {
@@ -1784,6 +1936,29 @@
       setRate(document.getElementById('r-dedupe'), 'after_dedupe');
       setRate(document.getElementById('r-icp'), 'after_icp');
       setRate(document.getElementById('r-email'), 'email_success');
+      const workRow = document.querySelector('.srow[data-step="4"] .toggle');
+      if (workRow) workRow.onclick = () => {
+        state.plan.modules.linkedin_dm_profile = !state.plan.modules.linkedin_dm_profile;
+        bump();
+      };
+      const postsRow = document.querySelector('.srow[data-step="posts"] .toggle');
+      if (postsRow) postsRow.onclick = () => {
+        state.plan.modules.linkedin_dm_posts = !state.plan.modules.linkedin_dm_posts;
+        bump();
+      };
+      const employerRow = document.querySelector('.srow[data-step="employer"] .toggle');
+      if (employerRow) employerRow.onclick = () => {
+        state.plan.modules.linkedin_company_profile = !state.plan.modules.linkedin_company_profile;
+        bump();
+      };
+      const websiteRow = document.querySelector('.srow[data-step="website"] .toggle');
+      if (websiteRow) websiteRow.onclick = () => {
+        state.plan.modules.website_scrape = !state.plan.modules.website_scrape;
+        if (state.plan.modules.website_scrape && !state.plan.website_crawler) {
+          state.plan.website_crawler = 'apify';
+        }
+        bump();
+      };
       const phoneRow = document.querySelector('.srow[data-step="6"] .toggle');
       if (phoneRow) phoneRow.onclick = () => {
         state.plan.modules.apollo_phone = !state.plan.modules.apollo_phone;
@@ -1972,6 +2147,7 @@
   });
   document.getElementById('btn-confirm-back').addEventListener('click', () => {
     setModulesVisible(true);
+    renderBoard();
     const plan = document.getElementById('plan-modules');
     if (plan) plan.scrollIntoView({ behavior: 'smooth', block: 'start' });
   });
@@ -1995,40 +2171,54 @@
       }
     });
   });
+  async function startSmokeGateFromConfirm() {
+    const hint = document.getElementById('confirm-status');
+    const id = state.current && state.current.campaign_id;
+    if (!id) throw new Error('No campaign selected');
+    if (state.dirty || !(state.current && state.current.has_saved_plan)) {
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/plan', {
+        method: 'PUT',
+        body: JSON.stringify({ plan: state.plan }),
+      });
+      state.plan = res.plan;
+      state.dirty = false;
+      state.current.has_saved_plan = true;
+      state.current.plan = res.plan;
+    }
+    const smoke = Math.max(1, Math.min(10, parseInt(
+      (document.getElementById('confirm-smoke-leads') || {}).value, 10
+    ) || 2));
+    const target = Math.max(smoke, Math.min(500, parseInt(
+      (document.getElementById('confirm-target-leads') || {}).value, 10
+    ) || 50));
+    if (hint) hint.textContent = 'Starting gated run…';
+    const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/run', {
+      method: 'POST',
+      body: JSON.stringify({ smoke_leads: smoke, target_leads: target }),
+    });
+    state.listRun = res.list_run;
+    if (state.current) {
+      state.current.list_run = res.list_run;
+      if (res.campaign) Object.assign(state.current, res.campaign);
+    }
+    if (hint) hint.textContent = 'Running — smoke will call Apollo/Apify. Stay on this page.';
+    renderListRunStatus(res.list_run);
+    startListRunPolling();
+  }
+
   document.getElementById('btn-confirm-yes').addEventListener('click', async () => {
     const hint = document.getElementById('confirm-status');
     try {
-      const id = state.current && state.current.campaign_id;
-      if (!id) throw new Error('No campaign selected');
-      if (state.dirty || !(state.current && state.current.has_saved_plan)) {
-        const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/plan', {
-          method: 'PUT',
-          body: JSON.stringify({ plan: state.plan }),
-        });
-        state.plan = res.plan;
-        state.dirty = false;
-        state.current.has_saved_plan = true;
-        state.current.plan = res.plan;
-      }
-      const smoke = Math.max(1, Math.min(10, parseInt(
-        (document.getElementById('confirm-smoke-leads') || {}).value, 10
-      ) || 2));
-      const target = Math.max(smoke, Math.min(500, parseInt(
-        (document.getElementById('confirm-target-leads') || {}).value, 10
-      ) || 50));
-      if (hint) hint.textContent = 'Starting gated run…';
-      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/run', {
-        method: 'POST',
-        body: JSON.stringify({ smoke_leads: smoke, target_leads: target }),
-      });
-      state.listRun = res.list_run;
-      if (state.current) {
-        state.current.list_run = res.list_run;
-        if (res.campaign) Object.assign(state.current, res.campaign);
-      }
-      if (hint) hint.textContent = 'Running — smoke will call Apollo/Apify. Stay on this page.';
-      renderListRunStatus(res.list_run);
-      startListRunPolling();
+      await startSmokeGateFromConfirm();
+    } catch (err) {
+      if (hint) hint.textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-confirm-resmoke').addEventListener('click', async () => {
+    const hint = document.getElementById('confirm-status');
+    try {
+      await startSmokeGateFromConfirm();
     } catch (err) {
       if (hint) hint.textContent = errText(err);
       alert(errText(err));

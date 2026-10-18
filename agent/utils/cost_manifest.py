@@ -41,7 +41,13 @@ def _manifest_stage(phase: str) -> str:
     p = (phase or "").strip().lower()
     if "apollo" in p or p == "backfill_dm_linkedin":
         return "apollo_contact"
-    if "enrich" in p or "linkedin" in p:
+    if (
+        "enrich" in p
+        or "linkedin" in p
+        or "profile" in p
+        or "vanity" in p
+        or "talent_profile" in p
+    ):
         return "enrichment"
     if "seed" in p:
         return "seeding"
@@ -51,6 +57,7 @@ def _manifest_stage(phase: str) -> str:
 def _flat_tracker(run_totals: dict[str, Any]) -> dict[str, Any]:
     return {
         "apify_usd": run_totals.get("apify_usd"),
+        "treg_usd": run_totals.get("treg_usd"),
         "firecrawl_usd": run_totals.get("firecrawl_usd"),
         "firecrawl_pages": run_totals.get("firecrawl_pages"),
         "firecrawl_credits": run_totals.get("firecrawl_credits"),
@@ -139,6 +146,13 @@ def build_manifest_entry_from_report(
             "basis": "llm_flat_rate_est",
             "source": "CostTracker flat rate",
         }
+        treg_usd = float(run_totals.get("treg_usd") or 0)
+        if treg_usd:
+            entry["treg"] = {
+                "usd": treg_usd,
+                "basis": "treg_catalog",
+                "source": "CostTracker (vanity SERP / LinkedIn catalog)",
+            }
         entry["cost_tracker"] = _flat_tracker(run_totals)
     else:
         if run_totals:

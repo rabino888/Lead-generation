@@ -81,11 +81,14 @@ def _join(values: list[str] | None) -> str:
 
 def lead_to_stage_row(lead: Lead) -> dict[str, Any]:
     """Persist contact + LinkedIn + website enrichment fields for stage CSVs."""
+    from agent.utils.company_name import humanize_company_name
+
     dm = lead.decision_maker
     wa = lead.website_analysis
     return {
         "lead_id": lead.lead_id,
         "company_name": lead.company_name,
+        "company_name_humanized": humanize_company_name(lead.company_name),
         "website": lead.website or "",
         "industry": lead.industry or "",
         "location": lead.location or "",

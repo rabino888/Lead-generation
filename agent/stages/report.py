@@ -14,6 +14,7 @@ from typing import Optional
 from agent.integrations.sheets import write_leads_to_sheet
 from agent.models import ClientProfile, Lead, RunState
 from agent.utils.campaign_handoff import build_outreach_handoff, write_outreach_handoff
+from agent.utils.company_name import humanize_company_name
 from agent.utils.logger import get_run_logger
 from agent.utils.website_outreach import WEBSITE_CSV_FIELDS, website_analysis_to_csv
 
@@ -94,7 +95,7 @@ def _write_csv(
 
     fieldnames = [
         "campaign_id", "run_id",
-        "lead_id", "company_name", "website", "industry", "location",
+        "lead_id", "company_name", "company_name_humanized", "website", "industry", "location",
         "company_size", "founded_year", "company_linkedin",
         "decision_maker_apollo_person_id",
         "decision_maker_name", "decision_maker_title", "decision_maker_email",
@@ -124,6 +125,7 @@ def _write_csv(
             "run_id": run_id,
             "lead_id": lead.lead_id,
             "company_name": lead.company_name,
+            "company_name_humanized": humanize_company_name(lead.company_name),
             "website": lead.website or "",
             "industry": lead.industry or "",
             "location": lead.location or "",

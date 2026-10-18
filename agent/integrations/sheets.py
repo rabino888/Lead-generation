@@ -16,6 +16,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 from agent.models import ClientProfile, ICPProfile, Lead, EnrichmentStatus
+from agent.utils.company_name import humanize_company_name
 from agent.utils.logger import log
 from agent.utils.website_outreach import WEBSITE_CSV_FIELDS, website_csv_row
 
@@ -254,6 +255,41 @@ def add_seen_contacts(client_id: str, entries: list[dict]) -> None:
 
 # ── Lead Output Sheet ─────────────────────────────────────────────────────────
 
+def append_csv_leads_to_sheet(sheet_url: str, rows: list[dict]) -> int:
+    """Append lead dicts whose email is not already on the Leads tab. Returns rows added."""
+    import re
+
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", sheet_url or "")
+    if not match or not rows:
+        return 0
+    gc = _get_gspread_client()
+    spreadsheet = gc.open_by_key(match.group(1))
+    try:
+        ws = spreadsheet.worksheet("Leads")
+    except Exception:
+        ws = spreadsheet.sheet1
+    header = ws.row_values(1)
+    if not header or "decision_maker_email" not in header:
+        return 0
+    email_idx = header.index("decision_maker_email")
+    existing = {
+        (value or "").strip().lower()
+        for value in ws.col_values(email_idx + 1)[1:]
+        if (value or "").strip()
+    }
+    to_add: list[list] = []
+    for row in rows:
+        email = (row.get("decision_maker_email") or "").strip().lower()
+        if not email or email in existing:
+            continue
+        existing.add(email)
+        to_add.append([row.get(col, "") for col in header])
+    if to_add:
+        ws.append_rows(to_add, value_input_option="USER_ENTERED")
+        log.info("Sheets: appended %d smoke leads to %s", len(to_add), sheet_url)
+    return len(to_add)
+
+
 def write_leads_to_sheet(
     sheet_name: str,
     qualified_leads: list[Lead],
@@ -283,7 +319,7 @@ def write_leads_to_sheet(
     ws.update_title("Leads")
 
     headers = [
-        "lead_id", "company_name", "website", "industry", "location",
+        "lead_id", "company_name", "company_name_humanized", "website", "industry", "location",
         "company_size", "founded_year", "company_linkedin",
         "decision_maker_apollo_person_id",
         "decision_maker_name", "decision_maker_title", "decision_maker_email",
@@ -355,7 +391,7 @@ def replace_leads_on_sheet(
             pass
 
     headers = [
-        "lead_id", "company_name", "website", "industry", "location",
+        "lead_id", "company_name", "company_name_humanized", "website", "industry", "location",
         "company_size", "founded_year", "company_linkedin",
         "decision_maker_apollo_person_id",
         "decision_maker_name", "decision_maker_title", "decision_maker_email",
@@ -405,6 +441,7 @@ def _lead_to_row(lead: Lead) -> list:
     return [
         lead.lead_id,
         lead.company_name,
+        humanize_company_name(lead.company_name),
         lead.website or "",
         lead.industry or "",
         lead.location or "",

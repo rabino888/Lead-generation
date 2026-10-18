@@ -1,14 +1,15 @@
 """
-Talent T04 — Personal LinkedIn profile scrape on ICP survivors.
+Talent T04 — Vanity resolve opaque LinkedIn URLs, write T04 for Apollo.
 
-Reads stages/T03_icp_matched.csv by default. Writes T04_profiles.csv (ok) and
-T04_profile_failed.csv. Always sets APIFY_SKIP_LINKEDIN_POSTS=1 for the run.
-Appends cost_runs.json via finalize_stage_cost (same pattern as stage_linkedin_enrich).
+By default does NOT scrape profiles (no thin treg.linkedin.user.profile).
+Full work history runs post-Apollo on contactables via anyapi.full → Apify.
+Pass ``--scrape`` only for the legacy pre-Apollo profile scrape.
 
 Usage:
   python scripts/stage_talent_profile.py --campaign {campaign_id}
   python scripts/stage_talent_profile.py --campaign {id} --input path/to/T03.csv
   python scripts/stage_talent_profile.py --campaign {id} --limit 10
+  python scripts/stage_talent_profile.py --campaign {id} --scrape
 """
 from __future__ import annotations
 
@@ -37,7 +38,7 @@ from agent.utils.talent_profile import run_talent_profile_stage
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Talent T04: LinkedIn personal profile → T04_profiles.csv / T04_profile_failed.csv"
+        description="Talent T04: vanity resolve → T04_profiles.csv (optional --scrape)"
     )
     parser.add_argument("--campaign", required=True)
     parser.add_argument(
@@ -50,7 +51,12 @@ def main() -> int:
         "--limit",
         type=int,
         default=None,
-        help="Max ICP survivor rows to scrape (default: all)",
+        help="Max ICP survivor rows (default: all)",
+    )
+    parser.add_argument(
+        "--scrape",
+        action="store_true",
+        help="Legacy: scrape LinkedIn profiles at T04 (default: vanity + passthrough only)",
     )
     parser.add_argument(
         "--rebuild-cost-dashboard",
@@ -61,7 +67,6 @@ def main() -> int:
     args = parser.parse_args()
 
     log = get_logger("stage_talent_profile")
-    # Talent T04 never scrapes posts — keep spend on profile actor only.
     os.environ["APIFY_SKIP_LINKEDIN_POSTS"] = "1"
 
     campaign = campaign_arg_load(args.campaign)
@@ -78,10 +83,10 @@ def main() -> int:
     run_id = run_state.run_id
     init_cost_tracker(run_id, client.client_id)
     log.info(
-        "Talent T04 profile run_id=%s campaign=%s skip_posts=%s",
+        "Talent T04 run_id=%s campaign=%s scrape_profile=%s",
         run_id,
         campaign.campaign_id,
-        os.environ.get("APIFY_SKIP_LINKEDIN_POSTS"),
+        args.scrape,
     )
 
     try:
@@ -90,6 +95,7 @@ def main() -> int:
             input_path=input_path,
             limit=args.limit,
             skip_posts=True,
+            scrape_profile=bool(args.scrape),
         )
     except FileNotFoundError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -98,7 +104,6 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    # Re-assert for cost window / any nested helpers.
     os.environ["APIFY_SKIP_LINKEDIN_POSTS"] = "1"
 
     tracker = get_cost_tracker()
@@ -111,14 +116,20 @@ def main() -> int:
         phase="talent_linkedin_profile",
         started_at=started,
         tracker_summary=summary,
-        label=f"Talent profile ({n_ok} ok / {n_fail} failed)",
+        label=(
+            f"Talent T04 vanity"
+            f"{' + scrape' if args.scrape else ''} ({n_ok} ok / {n_fail} failed)"
+        ),
         outcome={"profiles_ok": n_ok, "profiles_failed": n_fail},
         extra={
-            "input": str(input_path or (campaign.campaign_dir / "stages" / STAGE_T03_ICP_MATCHED)),
+            "input": str(
+                input_path or (campaign.campaign_dir / "stages" / STAGE_T03_ICP_MATCHED)
+            ),
             "ok": n_ok,
             "failed": n_fail,
             "output_ok": str(ok_path),
             "output_failed": str(failed_path),
+            "scrape_profile": bool(args.scrape),
             "apify_skip_linkedin_posts": "1",
         },
         rebuild_dashboard=args.rebuild_cost_dashboard,
@@ -132,7 +143,7 @@ def main() -> int:
     print(f"Profiles failed: {n_fail} -> {failed_path}")
     print(
         f"CostTracker: ${totals.get('total_usd', 0):.4f} "
-        f"(apify=${totals.get('apify_usd', 0):.4f})"
+        f"(apify=${totals.get('apify_usd', 0):.4f} treg=${totals.get('treg_usd', 0):.4f})"
     )
     print(f"Apify API truth (window): ${report.get('apify_truth_usd', 0):.4f}")
     if report.get("warning"):

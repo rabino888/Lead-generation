@@ -480,7 +480,15 @@ def run_linkedin_people(
         resolved_urls = [str(u).strip() for u in (conf.get("urls") or []) if str(u).strip()]
 
     resolved_query = (query or conf.get("query") or conf.get("searchQuery") or "").strip()
-    resolved_title = title if title else (conf.get("title") or conf.get("titles") or "")
+    if not resolved_query:
+        kws = conf.get("keywords") or conf.get("keyword") or ""
+        if isinstance(kws, (list, tuple)):
+            resolved_query = " ".join(str(k).strip() for k in kws if str(k).strip())
+        elif isinstance(kws, str):
+            resolved_query = kws.strip()
+    resolved_title = title if title else (
+        conf.get("title") or conf.get("titles") or conf.get("currentJobTitles") or ""
+    )
     resolved_location = (
         location
         if location
@@ -538,7 +546,11 @@ def run_linkedin_people(
     )
     if not rows:
         raise RuntimeError(
-            f"Apify people actor returned {len(items)} item(s) but no parseable /in/ URLs"
+            f"Apify people actor returned {len(items)} item(s) but no parseable /in/ URLs. "
+            "Check seed locations match LinkedIn autocomplete (e.g. "
+            "'Marbella, Andalusia, Spain' — not neighborhood aliases like 'puerto banus'). "
+            f"Actor={actor_id} query={resolved_query!r} titles={resolved_title!r} "
+            f"locations={resolved_location!r}."
         )
     out = persist_t01(campaign.campaign_dir, rows)
     touch_seed_source_run(

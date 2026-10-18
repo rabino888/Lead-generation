@@ -44,6 +44,26 @@ from agent.utils.list_run import (
     start_smoke_gate,
     update_list_run,
 )
+from agent.utils.logger import log
+import threading
+from dotenv import load_dotenv
+
+
+def _spawn_background(name: str, fn, *args, **kwargs) -> None:
+    """
+    Long talent/company gates call Apify/Apollo for minutes — FastAPI BackgroundTasks
+    are unreliable for that. Use a daemon thread and reload .env so TREG_TOKEN etc. apply.
+    """
+
+    def _runner() -> None:
+        try:
+            load_dotenv(override=True)
+            fn(*args, **kwargs)
+        except Exception:
+            log.exception("Background list-run task failed (%s)", name)
+
+    threading.Thread(target=_runner, name=name, daemon=True).start()
+
 from agent.utils.client_store import (
     client_campaign_dir,
     client_dir,
@@ -57,7 +77,6 @@ from agent.utils.client_store import (
     load_icp_doc,
     load_icp_meta,
     list_clients,
-    profile_folder,
     resolve_campaign_dir,
     save_icp,
     set_campaign_display_name,
@@ -384,6 +403,82 @@ async def builder_delete_client_icp(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+def _default_talent_seed_sources(campaign_id: str, icp: dict[str, Any]) -> dict[str, Any]:
+    """Starter linkedin_people source so Confirm/Start does not fail on empty seeds."""
+    titles = icp.get("job_titles") or []
+    if isinstance(titles, str):
+        titles = [titles]
+    titles = [str(t).strip() for t in titles if str(t).strip()][:6]
+
+    geo = icp.get("geo") if isinstance(icp.get("geo"), dict) else {}
+    # HarvestAPI locations must match LinkedIn autocomplete suggestions.
+    # Do NOT pass ICP location_hints (neighborhood aliases) — they 404 the actor.
+    locations: list[str] = []
+    primary = (geo.get("primary_location") or "").strip()
+    if primary:
+        locations.append(primary)
+    for seg in geo.get("segments") or []:
+        s = str(seg or "").strip()
+        if s:
+            locations.append(s)
+    for loc in icp.get("contact_locations") or []:
+        s = str(loc or "").strip()
+        if s:
+            locations.append(s)
+    # Prefer a concrete city when primary is only a country
+    if primary.lower() in {"spain", "españa", "espana"} and not any(
+        "marbella" in x.lower() or "málaga" in x.lower() or "malaga" in x.lower() for x in locations
+    ):
+        # Soft default only when segments mention Costa / Marbella in display names
+        blob = " ".join(locations).lower()
+        if "marbella" in blob or "costa" in blob:
+            locations.insert(0, "Marbella, Andalusia, Spain")
+        elif "málaga" in blob or "malaga" in blob:
+            locations.insert(0, "Málaga, Andalusia, Spain")
+
+    seen: set[str] = set()
+    locs: list[str] = []
+    for loc in locations:
+        key = loc.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        locs.append(loc)
+    locs = locs[:3] or ["Spain"]
+
+    query_bits: list[str] = []
+    if titles:
+        query_bits.append(titles[0])
+    # Put a city/region word in the query when we have one beyond country
+    for loc in locs:
+        head = loc.split(",")[0].strip()
+        if head and head.lower() not in {"spain", "españa", "espana"}:
+            query_bits.append(head)
+            break
+    query = " ".join(query_bits).strip() or "talent search"
+    return {
+        "campaign_id": campaign_id,
+        "sources": [
+            {
+                "id": "linkedin_people_1",
+                "type": "linkedin_people",
+                "name": "LinkedIn people search",
+                "enabled": True,
+                "tier": "primary",
+                "why_chosen": "Default talent seed from ITP titles / LinkedIn-valid geo",
+                "config": {
+                    "actor": "harvestapi/linkedin-profile-search",
+                    "max_results": 50,
+                    "query": query,
+                    "title": titles,
+                    "locations": locs,
+                    "urls": [],
+                },
+            }
+        ],
+    }
+
+
 @router.get("/api/campaigns")
 async def builder_list_campaigns(_: None = Depends(_check_access)):
     items = [campaign_summary(p) for p in list_campaign_dirs(_campaigns_root())]
@@ -435,7 +530,7 @@ async def builder_create_campaign(
             preferred = f"{_slug_part(client_id)}_{suffix}"
         campaign_id = _unique_campaign_id(preferred)
 
-    # Canonical home: data/clients/{client}/{profile}/campaigns/{campaign}
+    # Canonical home: data/clients/{client}/campaigns/in_progress/{campaign}
     path = client_campaign_dir(data_root, client_id, campaign_id, campaign_type=ctype)
     if path.exists():
         raise HTTPException(status_code=409, detail=f"Campaign already exists: {campaign_id}")
@@ -514,7 +609,13 @@ async def builder_create_campaign(
     }
     _write_json_file(path / "campaign.json", campaign_meta)
     snapshot_icp_into_campaign(data_root, client_id, icp_id, path)
-    _write_json_file(path / "seed_sources.json", {"campaign_id": campaign_id, "sources": []})
+    if ctype == "talent_search":
+        seeds_doc = _default_talent_seed_sources(
+            campaign_id, icp_stub if isinstance(icp_stub, dict) else {}
+        )
+    else:
+        seeds_doc = {"campaign_id": campaign_id, "sources": []}
+    _write_json_file(path / "seed_sources.json", seeds_doc)
     plan = default_plan(campaign_id, campaign_type=ctype)
     save_plan(path, plan)
 
@@ -522,6 +623,14 @@ async def builder_create_campaign(
     legacy = _campaigns_root() / campaign_id
     if not legacy.exists():
         _try_junction(legacy, path)
+
+    # Paid stages (talent T04+ / company Apollo) need sender+icp via run_payload.json
+    try:
+        from agent.utils.list_run import ensure_run_payload
+
+        ensure_run_payload(campaign_id)
+    except Exception:
+        pass
 
     try:
         from agent.dashboard.routes import rebuild_dashboard_files
@@ -717,10 +826,7 @@ async def builder_put_icp(
     mirror = None
     if client_id and icp_id:
         ctype = str(meta.get("campaign_type") or "company_outreach")
-        mirror = (
-            f"clients/{client_id}/{profile_folder(ctype)}/"
-            f"{library_folder(ctype)}/{icp_id}/"
-        )
+        mirror = f"clients/{client_id}/{library_folder(ctype)}/{icp_id}/"
     return {
         "ok": True,
         "path": "icp.json",
@@ -971,7 +1077,6 @@ async def builder_get_list_run(campaign_id: str, _: None = Depends(_check_access
 async def builder_start_list_run(
     campaign_id: str,
     body: ListRunStartRequest,
-    background_tasks: BackgroundTasks,
     _: None = Depends(_check_access),
 ):
     """Start gated run: seeds → ICP/dedupe → paid smoke → awaiting_approval."""
@@ -1012,7 +1117,8 @@ async def builder_start_list_run(
         full_run_id="",
     )
 
-    background_tasks.add_task(
+    _spawn_background(
+        f"smoke-gate-{campaign_id}",
         start_smoke_gate,
         path,
         campaign_id,
@@ -1030,7 +1136,6 @@ async def builder_start_list_run(
 @router.post("/api/campaigns/{campaign_id}/run/approve")
 async def builder_approve_full_batch(
     campaign_id: str,
-    background_tasks: BackgroundTasks,
     body: ListRunApproveRequest = ListRunApproveRequest(),
     _: None = Depends(_check_access),
 ):
@@ -1040,7 +1145,16 @@ async def builder_approve_full_batch(
     path = _campaign_dir(campaign_id)
     state = load_list_run(path, campaign_id)
     phase = state.get("phase")
-    if phase not in ("awaiting_approval",):
+    counts = state.get("counts") or {}
+    contactable = int(counts.get("full_contactable") or counts.get("smoke_contactable") or 0)
+    # Allow retry when smoke finished, or after a failed/empty full batch / stuck run
+    allowed = {"awaiting_approval", "error"}
+    if phase == "completed" and contactable <= 0:
+        allowed.add("completed")
+    if phase == "running_full":
+        # Stuck approve (no progress) — allow re-queue
+        allowed.add("running_full")
+    if phase not in allowed:
         raise HTTPException(
             status_code=409,
             detail=(
@@ -1048,7 +1162,7 @@ async def builder_approve_full_batch(
                 "Start the gated run first and wait for awaiting_approval."
             ),
         )
-    if state.get("phase") in ACTIVE_PHASES:
+    if phase in ACTIVE_PHASES and phase != "running_full":
         raise HTTPException(status_code=409, detail="Run already in progress")
 
     update_list_run(
@@ -1057,7 +1171,12 @@ async def builder_approve_full_batch(
         message="Queued — starting full batch…",
         error="",
     )
-    background_tasks.add_task(approve_full_batch, path, campaign_id)
+    _spawn_background(
+        f"approve-full-{campaign_id}",
+        approve_full_batch,
+        path,
+        campaign_id,
+    )
     return {
         "ok": True,
         "started": True,

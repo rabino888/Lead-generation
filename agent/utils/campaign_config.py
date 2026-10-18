@@ -26,7 +26,7 @@ CAMPAIGNS_ROOT = ROOT / "data" / "campaigns"
 DEFAULT_MEGA_OUTSOURCER_NAME_PATTERN = (
     r"teleperformance|concentrix|foundever|ttec|alorica|cognizant|genpact|accenture|"
     r"convergys|sykes|wipro|infosys|tata consultancy|hcl\b|tech mahindra|capgemini|"
-    r"ibm\b|huawei|softtek|cience|belkins"
+    r"ibm\b|huawei|softtek|\bcience\b|belkins"
 )
 DEFAULT_MEGA_OUTSOURCER_DOMAINS = [
     "teleperformance.com", "concentrix.com", "foundever.com", "ttec.com",
@@ -212,6 +212,9 @@ class CampaignIcpConfig(BaseModel):
     website_analysis_mode: str = "full"
     # None = auto (on when ICP is location-bound). Explicit true/false overrides.
     require_location_match: bool | None = None
+    # None = allow recruiter/staffing names only when target industries include them.
+    # True forces allow. False keeps the gate even if staffing is a target industry.
+    allow_recruiter_companies: bool | None = None
 
     def merged_excluded_name_pattern(self) -> str:
         parts = [self.excluded_name_patterns]

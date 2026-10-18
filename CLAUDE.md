@@ -31,6 +31,7 @@ Compat: `data/campaigns/{id}/` may be a junction into the client campaign folder
 - Google Sheets output and the "Dedup" tab are still used.
 - LLM for website stage only: **Gemini Flash → OpenAI mini** (`WEBSITE_PROVIDERS`; auto-discovered via `llm_models.py`). No LLM company prefilter or LLM qualify.
 - Apollo email reveal is the contactability gate. Delivered leads require a revealed personal email.
+- **Apollo is the better first source for decision-maker email and LinkedIn** (Vista staffing comparison, 2026-10-14). Apollo title search returned the ICP person plus `linkedin_url`. treg `people.search` by domain alone often returned a different employee and no LinkedIn URL. treg can find an email and, separately, resolve a profile URL (`icypeas.people.profile.url`), but it is not the initial contact source. Keep Apollo for the first email + LinkedIn pass.
 - Post-enrichment score: **keyword overlap** vs `sender.services` / `target_pain_points`; hiring boost when `website_analysis_mode: hiring_first`.
 - **Pre-Apollo hard gate** runs in `stage_dedupe.py` (default) — size/mega/recruiter + skip re-attempted domains.
 - **04_apollo_contactable.csv:** `write_apollo_contactable_csv` merges by email; never email-only rows.

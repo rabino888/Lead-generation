@@ -38,12 +38,13 @@ _SKIP_MARKERS = (".bak", "_partial", "_prefill", "_rejected", "_dropped")
 # Matches the `_batch3` / `_batch4` suffix a batched stage run leaves behind.
 _BATCH_SUFFIX = re.compile(r"^_batch\d+$")
 
-_COMPANY_KEY = ("website", "company_name", "seed_id")
-_PERSON_KEY = ("decision_maker_email", "lead_id")
+_COMPANY_KEY = ("website", "company_name", "seed_id", "person_id", "linkedin_url")
+_PERSON_KEY = ("decision_maker_email", "email", "lead_id", "person_id", "linkedin_url")
 
 _LEGACY_SOURCE_KEYS = {
     "apify_usd": "apify",
     "apollo_usd": "apollo",
+    "treg_usd": "treg",
     "firecrawl_usd": "firecrawl",
     "llm_usd": "llm",
 }
@@ -108,6 +109,39 @@ def campaign_lead_counts(campaign_dir: Path) -> dict[str, int]:
         found = [p for p in sorted(stages.glob(pattern)) if _is_live_stage_csv(p)]
         return _canonical_or_batches(found, stem, merged=merged)
 
+    # Talent funnel: T01 seed → T02 dedupe → T03 ITP → T04 profile → T05 email
+    # (company is 01 → 02 ICP → 03 dedupe → 04 apollo — different order)
+    talent = stages.is_dir() and (
+        (stages / "T01_raw_people.csv").is_file()
+        or (stages / "T02_deduped.csv").is_file()
+        or (stages / "T03_icp_matched.csv").is_file()
+    )
+    if talent:
+        contactable_paths = pick(
+            "T05_apollo_contactable*.csv", "T05_apollo_contactable", merged=True
+        )
+        contactable_n = _count_unique_csv(contactable_paths, _PERSON_KEY)
+        enriched_n = _count_talent_enriched(contactable_paths) or _count_unique_csv(
+            pick("T04_profiles*.csv", "T04_profiles", merged=True), _PERSON_KEY
+        )
+        return {
+            "seeds": _count_unique_csv(
+                pick("T01_raw_people*.csv", "T01_raw_people")
+                + pick("T01_raw_seeds*.csv", "T01_raw_seeds"),
+                _PERSON_KEY,
+            ),
+            # Keep keys used by the SPA; talent display reorders them.
+            "deduped": _count_unique_csv(
+                pick("T02_deduped*.csv", "T02_deduped"), _PERSON_KEY
+            ),
+            "icp_matched": _count_unique_csv(
+                pick("T03_icp_matched*.csv", "T03_icp_matched"), _PERSON_KEY
+            ),
+            "contactable": contactable_n,
+            "enriched": enriched_n,
+            "scored": 0,
+        }
+
     seed_paths = pick("01_raw_seeds*.csv", "01_raw_seeds")
     if not seed_paths:
         # Campaigns predating the stage-CSV funnel keep seeds at the campaign root.
@@ -118,14 +152,48 @@ def campaign_lead_counts(campaign_dir: Path) -> dict[str, int]:
 
     return {
         "seeds": _count_unique_csv(seed_paths, _COMPANY_KEY),
-        "icp_matched": _count_unique_csv(pick("02_icp_matched*.csv", "02_icp_matched"), _COMPANY_KEY),
-        "deduped": _count_unique_csv(pick("03_deduped*.csv", "03_deduped"), _COMPANY_KEY),
-        "contactable": _count_unique_csv(
-            pick("04_apollo_contactable*.csv", "04_apollo_contactable", merged=True), _PERSON_KEY
+        "icp_matched": _count_unique_csv(
+            pick("02_icp_matched*.csv", "02_icp_matched"), _COMPANY_KEY
         ),
-        "enriched": _count_unique_csv(pick("05_enriched*.csv", "05_enriched", merged=True), _PERSON_KEY),
+        "deduped": _count_unique_csv(
+            pick("03_deduped*.csv", "03_deduped"), _COMPANY_KEY
+        ),
+        "contactable": _count_unique_csv(
+            pick("04_apollo_contactable*.csv", "04_apollo_contactable", merged=True),
+            _PERSON_KEY,
+        ),
+        "enriched": _count_unique_csv(
+            pick("05_enriched*.csv", "05_enriched", merged=True), _PERSON_KEY
+        ),
         "scored": _count_unique_csv(pick("06_scored*.csv", "06_scored", merged=True), _PERSON_KEY),
     }
+
+
+def _count_talent_enriched(paths: list[Path]) -> int:
+    """Contactable rows that have work-history enrichment filled."""
+    seen: set[str] = set()
+    keyless = 0
+    for path in paths:
+        try:
+            with path.open(encoding="utf-8", errors="replace", newline="") as fh:
+                for row in csv.DictReader(fh):
+                    exp = (row.get("experience_summary") or "").strip()
+                    pos = (row.get("current_position") or "").strip()
+                    if not exp and not pos:
+                        continue
+                    key = ""
+                    for field in _PERSON_KEY:
+                        value = (row.get(field) or "").strip().lower()
+                        if value:
+                            key = value
+                            break
+                    if key:
+                        seen.add(key)
+                    else:
+                        keyless += 1
+        except (OSError, csv.Error):
+            continue
+    return len(seen) + keyless
 
 
 def legacy_campaign_rollup(campaign_dir: Path) -> Optional[dict[str, Any]]:
@@ -195,6 +263,49 @@ def legacy_campaign_rollup(campaign_dir: Path) -> Optional[dict[str, Any]]:
         "by_run": runs,
         "cost_basis": "legacy_cost_log",
     }
+
+
+def _list_date_from_campaign_dir(campaign_dir: Path) -> Optional[str]:
+    """Latest pipeline date from cost_runs / legacy cost logs (no Apify calls)."""
+    if not campaign_dir or not Path(campaign_dir).is_dir():
+        return None
+    campaign_dir = Path(campaign_dir)
+    dates: set[str] = set()
+
+    cr = campaign_dir / "cost_runs.json"
+    if cr.is_file():
+        try:
+            data = json.loads(cr.read_text(encoding="utf-8"))
+            for entry in data.get("runs") or []:
+                if not isinstance(entry, dict):
+                    continue
+                raw = entry.get("started_at_utc") or entry.get("ended_at_utc") or entry.get("run_date")
+                if raw:
+                    dates.add(str(raw)[:10])
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            pass
+
+    for log_path in campaign_dir.glob("cost_log_run_*.json"):
+        try:
+            entry = json.loads(log_path.read_text(encoding="utf-8"))
+            window = entry.get("window_utc") or {}
+            raw = window.get("start") or window.get("end") or entry.get("run_date")
+            if raw:
+                dates.add(str(raw)[:10])
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError, TypeError):
+            continue
+
+    # Filename fallback: cost_log_run_20260719_150513_b2c108.json
+    for log_path in campaign_dir.glob("cost_log_run_*.json"):
+        stem = log_path.stem  # cost_log_run_20260719_...
+        parts = stem.split("_")
+        for part in parts:
+            if len(part) == 8 and part.isdigit():
+                dates.add(f"{part[:4]}-{part[4:6]}-{part[6:8]}")
+                break
+
+    valid = sorted(d for d in dates if d and d[0].isdigit())
+    return valid[-1] if valid else None
 
 
 def _icp_summary(context: dict[str, Any]) -> dict[str, Any]:
@@ -273,26 +384,49 @@ def _apply_campaign_meta(entry: dict[str, Any], campaign_dir: Path) -> dict[str,
         entry["display_name"] = display
     else:
         entry.setdefault("display_name", entry.get("campaign_id"))
+
+    sheet_meta = campaign_dir / "campaign_sheet.json"
+    if sheet_meta.is_file():
+        try:
+            sm = json.loads(sheet_meta.read_text(encoding="utf-8-sig"))
+            url = (sm.get("sheet_url") or "").strip()
+            if url:
+                entry["sheet_url"] = url
+        except (OSError, json.JSONDecodeError):
+            pass
+    if not entry.get("sheet_url"):
+        lr_path = campaign_dir / "list_run.json"
+        if lr_path.is_file():
+            try:
+                lr = json.loads(lr_path.read_text(encoding="utf-8-sig"))
+                url = (lr.get("sheet_url") or "").strip()
+                if url:
+                    entry["sheet_url"] = url
+            except (OSError, json.JSONDecodeError):
+                pass
     return entry
 
 
 def _v4_campaign_entry(
-    campaign_id: str, campaigns_root: Path
+    campaign_id: str, data_root: Path
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """Build one v4 campaign entry plus its run rows, or an error entry."""
+    from agent.utils.client_store import resolve_campaign_dir
+
+    camp_dir = resolve_campaign_dir(data_root, campaign_id) or (data_root / "campaigns" / campaign_id)
     try:
-        report = build_campaign_report(campaign_id, root=campaigns_root.parent)
+        report = build_campaign_report(campaign_id, root=data_root)
     except Exception as exc:  # noqa: BLE001 - one bad campaign must not sink the page
         return (
             {
                 "campaign_id": campaign_id,
                 "client_id": None,
                 "client_name": campaign_id,
-                "campaign_type": _campaign_type_for(campaigns_root / campaign_id),
+                "campaign_type": _campaign_type_for(camp_dir),
                 "usd_total": 0.0,
                 "contactable_leads": 0,
                 "by_source": {},
-                "plan": _plan_summary(campaigns_root / campaign_id),
+                "plan": _plan_summary(camp_dir),
                 "cost_basis": "error",
                 "error": str(exc),
             },
@@ -304,7 +438,7 @@ def _v4_campaign_entry(
     sender = context.get("sender") or {}
     cid = report.get("client_id") or sender.get("client_id") or "unknown"
     cname = report.get("client_name") or sender.get("company") or cid
-    ctype = _campaign_type_for(campaigns_root / campaign_id)
+    ctype = _campaign_type_for(camp_dir)
 
     entry = {
         "campaign_id": campaign_id,
@@ -321,7 +455,7 @@ def _v4_campaign_entry(
         "firecrawl_plan": report.get("firecrawl_plan") or {},
         "note": report.get("note"),
         "icp": _icp_summary(context),
-        "plan": _plan_summary(campaigns_root / campaign_id),
+        "plan": _plan_summary(camp_dir),
         "cost_basis": "cost_runs",
     }
 
@@ -356,7 +490,7 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
         sender = context.get("sender") or {}
 
         if (campaign_dir / "cost_runs.json").exists():
-            entry, runs = _v4_campaign_entry(campaign_id, campaigns_root)
+            entry, runs = _v4_campaign_entry(campaign_id, data_root)
             # Prefer resolved dir for plan/type when nested under clients
             entry["campaign_type"] = _campaign_type_for(campaign_dir)
             entry["plan"] = _plan_summary(campaign_dir)
@@ -428,6 +562,18 @@ def build_dashboard_index(campaigns_root: Optional[Path] = None) -> dict[str, An
         c["delivered_leads"] = delivered
         usd = float(c.get("usd_total") or 0)
         c["per_lead_usd"] = _round_usd(usd / delivered) if delivered and usd else None
+
+        # Stable list date from pipeline activity (not dashboard rebuild time)
+        run_dates = sorted(
+            {
+                (r.get("run_date") or "")[:10]
+                for r in all_runs
+                if r.get("campaign_id") == c.get("campaign_id") and r.get("run_date")
+            }
+        )
+        c["list_date"] = run_dates[-1] if run_dates else _list_date_from_campaign_dir(
+            Path(camp_path) if camp_path else Path()
+        )
 
         # Gated-run status for dashboard "in progress / awaiting approval" badges
         try:
@@ -531,6 +677,7 @@ def _merge_clients_from_disk(data_root: Path, by_client: dict[str, dict[str, Any
                 Path("company_outreach") / "icps",
                 Path("talent_outreach") / "itps",
                 Path("icps"),
+                Path("itps"),
             )
         )
         if not meta_path.is_file() and not camp_ids and not has_library:

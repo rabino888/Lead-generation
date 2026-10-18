@@ -1,7 +1,7 @@
 """
 Apollo.io API integration.
 - search_companies()   → list[RawCompany]   (Stage 1)
-- enrich_contacts()    → Contact + generic email  (Stage 4)
+- enrich_contacts()    → Contact + generic email + reject reason  (Stage 4)
 
 Apollo basic plan (5,000 credits/month):
   - Company/people search: available
@@ -20,7 +20,6 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from agent.models import ApolloSignals, Contact, ICPProfile, RawCompany, LeadSource
 from agent.utils.job_titles import (
     primary_title,
-    seniorities_from_job_titles,
     title_matches_icp,
     title_priority,
 )
@@ -200,17 +199,25 @@ def enrich_contacts(
     job_titles: list[str],
     max_contacts: int = 1,
     contact_locations: Optional[list[str]] = None,
-) -> tuple[Optional[Contact], Optional[str]]:
+    logger: Optional[Any] = None,
+) -> tuple[Optional[Contact], Optional[str], str]:
     """
     Stage 4: Find and reveal a contactable decision-maker at a company.
-    Returns (Contact | None, generic_email | None). A contact is returned only
-    when Apollo reveals a real email; generic emails are kept as metadata only.
+
+    Returns (Contact | None, generic_email | None, reason).
+    ``reason`` is empty when a contactable email was revealed. Otherwise it
+    distinguishes "no person matched" from "person found, email not revealed"
+    so the run log can show which Apollo filter dropped the company.
 
     contact_locations restricts the PERSON's location (Apollo person_locations[]).
     Strict: if set and no candidate matches, the company yields no contact —
     a global BPO's Manila HR director is useless for a Spain-hub campaign.
     """
+    lg = logger or log
     generic_email = _guess_generic_email(website) if website else None
+    domain = _extract_domain(website) if website else None
+    where = ", ".join(contact_locations) if contact_locations else "any location"
+    at = domain or company_name
 
     people = _search_contact_candidates(
         company_name=company_name,
@@ -218,10 +225,30 @@ def enrich_contacts(
         job_titles=job_titles,
         max_candidates=max(max_contacts + 5, 8),
         contact_locations=contact_locations,
+        logger=lg,
     )
+    # verified-only is the default and hides people Apollo can still reveal.
+    # Retry once without that filter before declaring the company empty.
+    if not people and not (os.environ.get("APOLLO_EMAIL_STATUSES") or "").strip():
+        people = _search_contact_candidates(
+            company_name=company_name,
+            website=website,
+            job_titles=job_titles,
+            max_candidates=max(max_contacts + 5, 8),
+            contact_locations=contact_locations,
+            email_statuses="",
+            logger=lg,
+        )
+        if people:
+            lg.info(
+                "Apollo: verified-email filter returned 0 for %s; %d candidates without it",
+                company_name,
+                len(people),
+            )
     if not people:
-        log.info("Apollo: no contact candidates for %s", company_name)
-        return None, generic_email
+        reason = f"no person matched the titles in {where} at {at}"
+        lg.info("Apollo: %s — %s", company_name, reason)
+        return None, generic_email, reason
 
     # Only keep people whose primary title matches the campaign ICP job_titles.
     matched = [
@@ -230,16 +257,15 @@ def enrich_contacts(
     ]
     if not matched:
         rejected_titles = [primary_title(str(p.get("title") or "")) or "?" for p in people[:5]]
-        log.info(
-            "Apollo: %d candidates for %s but none match ICP job_titles — sample titles: %s",
-            len(people),
-            company_name,
-            "; ".join(rejected_titles),
+        reason = (
+            f"no person matched ICP titles — Apollo returned {len(people)} other people "
+            f"({'; '.join(rejected_titles)})"
         )
-        return None, generic_email
+        lg.info("Apollo: %s — %s", company_name, reason)
+        return None, generic_email, reason
 
     if len(matched) < len(people):
-        log.info(
+        lg.info(
             "Apollo: ICP title filter kept %d/%d candidates for %s",
             len(matched),
             len(people),
@@ -261,21 +287,47 @@ def enrich_contacts(
     reveal_phone = bool(resolve_apollo_phone_webhook_url()) and not skip_phone
     max_attempts = max(1, int(os.environ.get("APOLLO_MAX_REVEAL_ATTEMPTS", "2")))
 
-    for person in prioritized[:max_attempts]:
-        if not person.get("has_email"):
-            continue
-        revealed = _reveal_person(person, reveal_phone=reveal_phone)
+    revealable = [p for p in prioritized if p.get("has_email")]
+    no_email = [p for p in prioritized if not p.get("has_email")]
+    for person in revealable[:max_attempts]:
+        revealed = _reveal_person(person, reveal_phone=reveal_phone, logger=lg)
         if revealed and revealed.email:
-            log.info(
+            lg.info(
                 "Apollo: revealed contactable decision-maker for %s: %s (%s)",
                 company_name,
                 revealed.name or "unknown",
                 revealed.title or "unknown title",
             )
-            return revealed, generic_email
+            return revealed, generic_email, ""
 
-    log.info("Apollo: candidates found for %s, but no email was revealed", company_name)
-    return None, generic_email
+    parts: list[str] = []
+    if revealable:
+        parts.append(
+            "person found, email not revealed — "
+            + _format_apollo_people(revealable[:max_attempts])
+        )
+    if no_email:
+        parts.append(
+            "person matched titles but Apollo has no email to reveal — "
+            + _format_apollo_people(no_email[:5])
+        )
+    reason = "; ".join(parts) or "person found, email not revealed"
+    lg.info("Apollo: %s — %s", company_name, reason)
+    return None, generic_email, reason
+
+
+def _format_apollo_people(people: list[dict]) -> str:
+    bits: list[str] = []
+    for person in people:
+        name = (
+            person.get("name")
+            or person.get("first_name")
+            or "unknown"
+        )
+        title = primary_title(str(person.get("title") or "")) or "unknown title"
+        flag = "has_email" if person.get("has_email") else "no_email"
+        bits.append(f"{name} ({title}, {flag})")
+    return "; ".join(bits)
 
 
 def _search_contact_candidates(
@@ -284,8 +336,19 @@ def _search_contact_candidates(
     job_titles: list[str],
     max_candidates: int,
     contact_locations: Optional[list[str]] = None,
+    email_statuses: Optional[str] = None,
+    logger: Optional[Any] = None,
 ) -> list[dict]:
-    """Use Apollo People API Search with documented query-array filters."""
+    """Use Apollo People API Search with documented query-array filters.
+
+    Do not send ``person_seniorities[]``. Apollo ANDs that filter with
+    ``person_titles[]``. Titles such as President, Principal, and Broker are
+    often untagged or tagged outside owner/founder/c_suite/director/manager,
+    so the seniority filter returns zero people even when the title search
+    finds the decision-maker (confirmed on boxinsurance.com: Adam Syswerda,
+    President, disappears as soon as seniorities are added).
+    """
+    lg = logger or log
     params: list[tuple[str, Any]] = [
         ("per_page", min(max_candidates, 100)),
         ("page", 1),
@@ -294,11 +357,11 @@ def _search_contact_candidates(
             os.environ.get("APOLLO_INCLUDE_SIMILAR_TITLES", "true").lower(),
         ),
     ]
-    # Comma-separated list, e.g. "verified,unverified". Default keeps the
-    # original strict behaviour; relax for marginal accounts where Apollo has
-    # people but no verified-status email (the reveal step is still the gate).
-    email_statuses = os.environ.get("APOLLO_EMAIL_STATUSES", "verified")
-    for status in email_statuses.split(","):
+    # Comma-separated list, e.g. "verified,unverified". Empty string omits the
+    # filter. Default keeps verified-first; enrich_contacts retries without it.
+    if email_statuses is None:
+        email_statuses = os.environ.get("APOLLO_EMAIL_STATUSES", "verified")
+    for status in (email_statuses or "").split(","):
         status = status.strip()
         if status:
             params.append(("contact_email_status[]", status))
@@ -316,30 +379,36 @@ def _search_contact_candidates(
         if title:
             params.append(("person_titles[]", title))
 
-    for seniority in seniorities_from_job_titles(job_titles):
-        params.append(("person_seniorities[]", seniority))
-
     try:
         data = _post("mixed_people/api_search", params=params)
     except Exception as e:
-        log.error("Apollo contact search failed for %s: %s", company_name, e)
+        lg.error("Apollo contact search failed for %s: %s", company_name, e)
         return []
 
     _record_apollo_credits(data)
     people = data.get("people", []) or []
-    log.info(
-        "Apollo: %d contact candidates for %s (total_entries=%s)",
+    lg.info(
+        "Apollo: %d contact candidates for %s (total_entries=%s, domain=%s, locations=%s, email_status=%s)",
         len(people),
         company_name,
         data.get("total_entries"),
+        domain or "—",
+        ", ".join(contact_locations or []) or "any",
+        email_statuses or "any",
     )
     return people
 
 
-def _record_apollo_credits(data: dict) -> int:
-    """Bump session + CostTracker from an Apollo people/match response."""
+def _record_apollo_credits(data: dict, *, min_credits: int = 0) -> int:
+    """Bump session + CostTracker from an Apollo people/match response.
+
+    Apollo often omits ``credits_consumed`` on ``people/match`` even when a
+    reveal was billed. Callers can pass ``min_credits=1`` for reveal attempts.
+    """
     global _credits_used
     credits = int(data.get("credits_consumed") or data.get("credit_consumed") or 0)
+    if credits < min_credits:
+        credits = min_credits
     _credits_used += credits
     if credits:
         from agent.utils.cost_tracker import get_cost_tracker
@@ -378,10 +447,19 @@ def _contact_from_match(match: dict, person: Optional[dict] = None) -> Optional[
     )
 
 
-def _reveal_person(person: dict, reveal_phone: bool = False) -> Optional[Contact]:
+def _reveal_person(
+    person: dict,
+    reveal_phone: bool = False,
+    logger: Optional[Any] = None,
+) -> Optional[Contact]:
     """Reveal email/phone for a People Search candidate using People Enrichment."""
+    lg = logger or log
     person_id = person.get("id")
     if not person_id:
+        lg.info(
+            "Apollo: skip reveal for %s — search row has no person id",
+            person.get("name") or person.get("first_name") or "unknown",
+        )
         return None
 
     params: list[tuple[str, Any]] = [
@@ -396,15 +474,21 @@ def _reveal_person(person: dict, reveal_phone: bool = False) -> Optional[Contact
     try:
         data = _post("people/match", params=params)
     except Exception as e:
-        log.warning("Apollo person reveal failed for id=%s: %s", person_id, e)
+        lg.warning("Apollo person reveal failed for id=%s: %s", person_id, e)
         return None
 
     _record_apollo_credits(data)
     match = _first_person_match(data)
     if not match:
+        lg.info("Apollo: people/match returned no person for id=%s", person_id)
         return None
     contact = _contact_from_match(match, person)
     if not contact or not contact.email:
+        lg.info(
+            "Apollo: people/match for id=%s returned no email (title=%s)",
+            person_id,
+            (contact.title if contact else None) or person.get("title") or "?",
+        )
         return None
     return contact
 
@@ -462,7 +546,10 @@ def enrich_person_by_linkedin(
     People Enrichment by LinkedIn URL (talent T05).
 
     Primary match: ``linkedin_url`` + ``reveal_personal_emails``.
-    Fallback when URL match returns no person: name + organization / domain.
+    If that returns a person **without** a personal email (common for opaque
+    HarvestAPI ``/in/ACw…`` member IDs), fall through to name + organization /
+    domain — Apollo often has the enrichable record under name identity.
+
     Phone reveal is never requested here (talent phone is TS-8 / T06).
 
     Credits are tracked via ``get_credits_used()`` / CostTracker.
@@ -478,16 +565,16 @@ def enrich_person_by_linkedin(
         ("reveal_phone_number", "false"),
     ]
     contact = _people_match_contact(params, label=f"linkedin={url}")
-    if contact:
+    if contact and (contact.email or "").strip():
         return contact
 
-    # Fallback: name + company identity when LinkedIn URL is unknown to Apollo
+    # Fallback: name + company identity when LinkedIn URL miss / no-email shell match
     fn = (first_name or "").strip()
     ln = (last_name or "").strip()
     org = (organization_name or "").strip()
     dom = (domain or "").strip().lower()
     if not (fn or ln) or not (org or dom):
-        return None
+        return contact  # may be no-email shell; caller gates on email
 
     fallback: list[tuple[str, Any]] = [
         ("reveal_personal_emails", "true" if reveal_personal_emails else "false"),
@@ -501,12 +588,31 @@ def enrich_person_by_linkedin(
         fallback.append(("organization_name", org))
     if dom:
         fallback.append(("domain", dom))
-    # Keep LinkedIn URL in the request when present — Apollo may still use it as a hint
-    fallback.append(("linkedin_url", url))
-    return _people_match_contact(
+    # Prefer vanity LinkedIn URLs as a hint; opaque ACw member IDs often hurt match quality
+    if url and not _is_opaque_linkedin_member_url(url):
+        fallback.append(("linkedin_url", url))
+    alt = _people_match_contact(
         fallback,
         label=f"name={fn} {ln} org={org or dom}",
     )
+    if alt and (alt.email or "").strip():
+        return alt
+    # Prefer any match that carries LinkedIn / email over nothing
+    if alt:
+        return alt
+    return contact
+
+
+def _is_opaque_linkedin_member_url(url: str) -> bool:
+    """HarvestAPI Short cards often use /in/ACw… member URNs Apollo cannot enrich."""
+    from agent.utils.talent_people import normalize_linkedin_person_url
+
+    norm = normalize_linkedin_person_url(url)
+    if not norm:
+        return False
+    slug = norm.rstrip("/").rsplit("/", 1)[-1]
+    # LinkedIn member URN-style ids (ACwAA…, ACoAA…)
+    return bool(slug) and slug.startswith(("ACw", "ACo", "AEMA", "AEM"))
 
 
 def _people_match_contact(
@@ -521,7 +627,12 @@ def _people_match_contact(
         log.warning("Apollo people/match failed (%s): %s", label, e)
         return None
 
-    credits = _record_apollo_credits(data)
+    reveal = any(
+        k == "reveal_personal_emails" and str(v).lower() in ("true", "1", "yes")
+        for k, v in params
+    )
+    # people/match frequently returns credits_consumed=0 even on billed reveals
+    credits = _record_apollo_credits(data, min_credits=1 if reveal else 0)
     match = _first_person_match(data)
     if not match:
         log.info("Apollo people/match: no person for %s (credits=%s)", label, credits)

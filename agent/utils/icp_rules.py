@@ -60,6 +60,7 @@ class IcpRules(BaseModel):
     require_include_keywords: bool = False
     require_industry_match: bool = False
     require_location_match: bool = False
+    allow_recruiter_companies: bool | None = None
 
     def industries_list(self) -> list[str]:
         out = list(self.industries)
@@ -190,6 +191,7 @@ def icp_config_to_rules(icp: CampaignIcpConfig) -> IcpRules:
         require_include_keywords=False,
         require_industry_match=False,
         require_location_match=resolve_require_location_match(icp),
+        allow_recruiter_companies=getattr(icp, "allow_recruiter_companies", None),
     )
 
 

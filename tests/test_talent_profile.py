@@ -129,6 +129,7 @@ def test_run_talent_profile_stage_writes_csvs(tmp_path: Path, monkeypatch: pytes
     ok_path, fail_path, n_ok, n_fail = run_talent_profile_stage(
         tmp_path,
         fetch_profile=fake_fetch,
+        scrape_profile=True,
     )
     assert n_ok == 1
     assert n_fail == 1
@@ -174,6 +175,7 @@ def test_run_talent_profile_stage_limit(tmp_path: Path):
         tmp_path,
         fetch_profile=fake_fetch,
         limit=2,
+        scrape_profile=True,
     )
     assert n_ok == 2
     assert n_fail == 0
@@ -182,4 +184,34 @@ def test_run_talent_profile_stage_limit(tmp_path: Path):
 
 def test_missing_input_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
-        run_talent_profile_stage(tmp_path, fetch_profile=lambda _u: {})
+        run_talent_profile_stage(tmp_path, scrape_profile=True)
+
+
+def test_run_talent_profile_stage_vanity_passthrough_default(tmp_path: Path):
+    """Default T04: no profile scrape — rows pass through for Apollo."""
+    stages = tmp_path / "stages"
+    stages.mkdir()
+    write_people_csv(
+        stages / STAGE_T03_ICP_MATCHED,
+        [
+            _row(person_id="p-1", linkedin_url="https://www.linkedin.com/in/someone"),
+        ],
+    )
+    calls: list[str] = []
+
+    def fake_fetch(url: str | None) -> dict:
+        calls.append(url or "")
+        return {"about": "should not run"}
+
+    ok_path, _, n_ok, n_fail = run_talent_profile_stage(
+        tmp_path,
+        fetch_profile=fake_fetch,
+        scrape_profile=False,
+    )
+    assert n_ok == 1
+    assert n_fail == 0
+    assert calls == []
+    with ok_path.open(encoding="utf-8", newline="") as f:
+        rows = list(csv.DictReader(f))
+    assert rows[0]["profile_status"] == PROFILE_OK
+    assert rows[0]["person_id"] == "p-1"

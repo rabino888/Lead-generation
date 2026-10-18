@@ -16,7 +16,7 @@ from typing import Any, Optional
 SCHEMA_VERSION = "4"
 
 WORKFLOW_STEPS = ("seeding", "apollo_contact", "enrichment")
-SOURCES = ("apify", "apollo", "firecrawl", "llm")
+SOURCES = ("apify", "apollo", "firecrawl", "llm", "treg")
 
 FUNNEL_STEPS = [
     ("intake", "ICP + seed plan"),
@@ -36,6 +36,7 @@ SOURCE_DISPLAY = {
     "apollo": "Apollo",
     "firecrawl": "Firecrawl",
     "llm": "LLM (est)",
+    "treg": "treg",
 }
 
 
@@ -77,6 +78,19 @@ def _empty_source() -> dict[str, Any]:
 
 def _round_usd(v: float) -> float:
     return round(float(v), 4)
+
+
+def _resolve_campaign_dir(campaign_id: str, root: Path) -> Path:
+    """Prefer client-tree campaign folder; fall back to data/campaigns/{id} junction."""
+    try:
+        from agent.utils.client_store import resolve_campaign_dir
+
+        found = resolve_campaign_dir(root, campaign_id)
+        if found is not None:
+            return found
+    except Exception:
+        pass
+    return root / "campaigns" / campaign_id
 
 
 def _load_campaign_context(campaign_id: str, root: Path) -> Optional[dict[str, Any]]:
@@ -380,7 +394,7 @@ def build_campaign_report(campaign_id: str, root: Optional[Path] = None) -> dict
     from apify_client import ApifyClient
 
     root = root or Path("data")
-    campaign_dir = root / "campaigns" / campaign_id
+    campaign_dir = _resolve_campaign_dir(campaign_id, root)
     manifest_path = campaign_dir / "cost_runs.json"
     if not manifest_path.exists():
         raise FileNotFoundError(f"Missing {manifest_path}")
@@ -539,7 +553,25 @@ def build_campaign_report(campaign_id: str, root: Optional[Path] = None) -> dict
             row["sources"].update(fc_sources)
             row["sources"].update(llm_sources)
 
-            total_usd = _round_usd(apify_usd + fc_usd + llm_usd)
+            treg_usd = float(
+                (entry.get("treg") or {}).get("usd")
+                if (entry.get("treg") or {}).get("usd") is not None
+                else tracker.get("treg_usd")
+                or 0
+            )
+            if treg_usd:
+                treg_detail = {
+                    "usd": _round_usd(treg_usd),
+                    "basis": "treg_catalog",
+                    "is_est": False,
+                    "display_label": SOURCE_DISPLAY["treg"],
+                    "source": "treg",
+                    "workflow_step": "enrichment",
+                }
+                row["sources"]["treg"] = treg_detail
+                _add_source(by_source, "treg", treg_usd, treg_detail)
+
+            total_usd = _round_usd(apify_usd + fc_usd + llm_usd + treg_usd)
             row["total_usd"] = total_usd
             by_step["enrichment"]["usd"] = _round_usd(by_step["enrichment"]["usd"] + total_usd)
             by_step["enrichment"]["runs"] += 1

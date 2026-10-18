@@ -13,15 +13,25 @@ from typing import Any, Optional
 
 ESSENTIAL_MODULES = ("icp_match", "dedupe")
 
+# Legacy keys → canonical (plans saved before rename still load).
+MODULE_ALIASES: dict[str, str] = {
+    "apify_dm_profile": "linkedin_dm_profile",
+    "apify_dm_posts": "linkedin_dm_posts",
+    "apify_company_profile": "linkedin_company_profile",
+    "apify_company_jobs": "linkedin_company_jobs",
+}
+
 DEFAULT_MODULES_COMPANY: dict[str, bool] = {
     "icp_match": True,
     "dedupe": True,
     "apollo_email": True,
-    "apify_dm_profile": True,
-    "apify_dm_posts": True,
+    "linkedin_dm_profile": True,
+    "linkedin_dm_posts": True,
     "website_scrape": True,
-    "apify_company_profile": False,
-    "apify_company_jobs": False,
+    "linkedin_company_profile": False,
+    "linkedin_company_jobs": True,
+    "facebook_company_posts": False,
+    "instagram_company_posts": False,
     "apollo_phone": False,
 }
 
@@ -29,13 +39,24 @@ DEFAULT_MODULES_TALENT: dict[str, bool] = {
     "icp_match": True,
     "dedupe": True,
     "apollo_email": True,
-    "apify_dm_profile": True,
-    "apify_dm_posts": False,
+    "linkedin_dm_profile": True,
+    "linkedin_dm_posts": True,
     "website_scrape": False,
-    "apify_company_profile": False,
-    "apify_company_jobs": False,
+    "linkedin_company_profile": False,
+    "linkedin_company_jobs": False,
+    "facebook_company_posts": False,
+    "instagram_company_posts": False,
     "apollo_phone": True,
 }
+
+# Builder META "Core" tier — on by default for both campaign types (operator can turn off).
+CORE_MODULES: tuple[str, ...] = (
+    "apollo_email",
+    "linkedin_dm_profile",
+    "linkedin_dm_posts",
+    "website_scrape",
+    "linkedin_company_jobs",
+)
 
 DEFAULT_TALENT_PASS_RATES = {
     "after_dedupe": 0.90,
@@ -62,14 +83,19 @@ def unit_rates() -> dict[str, float]:
       apimaestro person ≈ $0.005/run, posts ≈ $0.009, company ≈ $0.004
       blended enrich ~$0.13/lead (see data/campaigns/automata/cost_log_run_20260719_*).
     Override via BUILDER_* env vars when plans change.
+    When LINKEDIN_ENRICH_PROVIDER=treg, DM profile/posts use catalog midpoints.
     """
-    return {
+    rates = {
         "apollo_per_credit": _env_float("APOLLO_CREDIT_USD", 0.02),
         "apollo_credits_per_lead": _env_float("BUILDER_APOLLO_CREDITS_PER_LEAD", 1.5),
         "apify_dm_profile_usd": _env_float("BUILDER_APIFY_DM_PROFILE_USD", 0.005),
         "apify_dm_posts_usd": _env_float("BUILDER_APIFY_DM_POSTS_USD", 0.009),
+        "treg_dm_profile_usd": _env_float("BUILDER_TREG_DM_PROFILE_USD", 0.0042),
+        "treg_dm_posts_usd": _env_float("BUILDER_TREG_DM_POSTS_USD", 0.004),
         "apify_company_profile_usd": _env_float("BUILDER_APIFY_COMPANY_PROFILE_USD", 0.004),
-        "apify_company_jobs_usd": _env_float("BUILDER_APIFY_COMPANY_JOBS_USD", 0.02),
+        "apify_company_jobs_usd": _env_float("BUILDER_APIFY_COMPANY_JOBS_USD", 0.005),
+        "facebook_company_posts_usd": _env_float("BUILDER_FACEBOOK_POSTS_USD", 0.002),
+        "instagram_company_posts_usd": _env_float("BUILDER_INSTAGRAM_POSTS_USD", 0.002),
         "apify_website_per_page_usd": _env_float("BUILDER_APIFY_WEBSITE_PAGE_USD", 0.004),
         "firecrawl_per_page": _env_float("FIRECRAWL_PAGE_USD", 0.01),
         "llm_website_per_lead_usd": _env_float("BUILDER_LLM_WEBSITE_PER_LEAD_USD", 0.023),
@@ -80,6 +106,42 @@ def unit_rates() -> dict[str, float]:
         "talent_seed_scrape_usd": _env_float("BUILDER_TALENT_SEED_SCRAPE_USD", 0.01),
         "talent_profile_usd": _env_float("BUILDER_TALENT_PROFILE_USD", 0.005),
     }
+    if (os.environ.get("LINKEDIN_ENRICH_PROVIDER") or "").strip().lower() == "treg":
+        rates["apify_dm_profile_usd"] = rates["treg_dm_profile_usd"]
+        rates["apify_dm_posts_usd"] = rates["treg_dm_posts_usd"]
+        rates["talent_profile_usd"] = rates["treg_dm_profile_usd"]
+        rates["apify_company_jobs_usd"] = _env_float(
+            "BUILDER_TREG_COMPANY_JOBS_USD", 0.005
+        )
+    # Canonical aliases used by estimate line items
+    rates["linkedin_dm_profile_usd"] = rates["apify_dm_profile_usd"]
+    rates["linkedin_dm_posts_usd"] = rates["apify_dm_posts_usd"]
+    rates["linkedin_company_profile_usd"] = rates["apify_company_profile_usd"]
+    rates["linkedin_company_jobs_usd"] = rates["apify_company_jobs_usd"]
+    return rates
+
+
+def plan_module(modules: dict[str, Any] | None, key: str, default: bool = False) -> bool:
+    """Read a module flag by canonical or legacy name."""
+    mods = modules or {}
+    if key in mods:
+        return bool(mods.get(key))
+    for legacy, canon in MODULE_ALIASES.items():
+        if canon == key and legacy in mods:
+            return bool(mods.get(legacy))
+    return default
+
+
+def _canonicalize_modules(incoming: dict[str, Any], base: dict[str, bool]) -> dict[str, bool]:
+    modules = dict(base)
+    # Apply legacy keys first, then canonical overrides
+    for legacy, canon in MODULE_ALIASES.items():
+        if legacy in incoming and canon in modules:
+            modules[canon] = bool(incoming[legacy])
+    for key, val in incoming.items():
+        if key in modules:
+            modules[key] = bool(val)
+    return modules
 
 
 def plan_path(campaign_dir: Path) -> Path:
@@ -147,11 +209,7 @@ def normalize_plan(data: dict[str, Any], *, campaign_id: str) -> dict[str, Any]:
     if ctype not in ("company_outreach", "talent_search"):
         ctype = "company_outreach"
     base = default_plan(campaign_id, campaign_type=ctype)
-    modules = dict(base["modules"])
-    incoming = data.get("modules") or {}
-    for key, val in incoming.items():
-        if key in modules:
-            modules[key] = bool(val)
+    modules = _canonicalize_modules(data.get("modules") or {}, base["modules"])
     for key in ESSENTIAL_MODULES:
         modules[key] = True
 
@@ -286,26 +344,26 @@ def _estimate_company(plan: dict[str, Any], rates: dict[str, float]) -> dict[str
             "Email reveal is OFF — LinkedIn-only mode; not contactable under DECISIONS D3."
         )
 
-    if m.get("apify_dm_profile"):
+    if m.get("linkedin_dm_profile"):
         lines.append(
             _line(
-                "apify_dm_profile",
+                "linkedin_dm_profile",
                 "LinkedIn DM profile",
-                unit_usd=rates["apify_dm_profile_usd"],
+                unit_usd=rates["linkedin_dm_profile_usd"],
                 units=n,
-                line_usd=n * rates["apify_dm_profile_usd"],
-                basis="1 person-profile run / lead",
+                line_usd=n * rates["linkedin_dm_profile_usd"],
+                basis="treg/anyapi profile / contactable",
             )
         )
-    if m.get("apify_dm_posts"):
+    if m.get("linkedin_dm_posts"):
         lines.append(
             _line(
-                "apify_dm_posts",
-                "LinkedIn DM posts",
-                unit_usd=rates["apify_dm_posts_usd"],
+                "linkedin_dm_posts",
+                "LinkedIn DM recent posts",
+                unit_usd=rates["linkedin_dm_posts_usd"],
                 units=n,
-                line_usd=n * rates["apify_dm_posts_usd"],
-                basis="1 posts run / lead",
+                line_usd=n * rates["linkedin_dm_posts_usd"],
+                basis="treg harvestapi posts / contactable",
             )
         )
     if m.get("website_scrape"):
@@ -338,26 +396,48 @@ def _estimate_company(plan: dict[str, Any], rates: dict[str, float]) -> dict[str
         )
         if crawler == "firecrawl" and not (os.environ.get("FIRECRAWL_API_KEY") or "").strip():
             warnings.append("Firecrawl selected but FIRECRAWL_API_KEY is not set.")
-    if m.get("apify_company_profile"):
+    if m.get("linkedin_company_profile"):
         lines.append(
             _line(
-                "apify_company_profile",
+                "linkedin_company_profile",
                 "LinkedIn company profile",
-                unit_usd=rates["apify_company_profile_usd"],
+                unit_usd=rates["linkedin_company_profile_usd"],
                 units=n,
-                line_usd=n * rates["apify_company_profile_usd"],
-                basis="1 company run / lead",
+                line_usd=n * rates["linkedin_company_profile_usd"],
+                basis="1 company profile / lead",
             )
         )
-    if m.get("apify_company_jobs"):
+    if m.get("linkedin_company_jobs"):
         lines.append(
             _line(
-                "apify_company_jobs",
-                "LinkedIn company jobs",
-                unit_usd=rates["apify_company_jobs_usd"],
+                "linkedin_company_jobs",
+                "Company open jobs (treg)",
+                unit_usd=rates["linkedin_company_jobs_usd"],
                 units=n,
-                line_usd=n * rates["apify_company_jobs_usd"],
-                basis="1 jobs run / lead",
+                line_usd=n * rates["linkedin_company_jobs_usd"],
+                basis="treg.companies.jobs.search / lead",
+            )
+        )
+    if m.get("facebook_company_posts"):
+        lines.append(
+            _line(
+                "facebook_company_posts",
+                "Facebook recent posts",
+                unit_usd=rates["facebook_company_posts_usd"],
+                units=n,
+                line_usd=n * rates["facebook_company_posts_usd"],
+                basis="treg.facebook.user.posts when social URL found",
+            )
+        )
+    if m.get("instagram_company_posts"):
+        lines.append(
+            _line(
+                "instagram_company_posts",
+                "Instagram recent posts",
+                unit_usd=rates["instagram_company_posts_usd"],
+                units=n,
+                line_usd=n * rates["instagram_company_posts_usd"],
+                basis="treg.instagram.user.posts when handle found",
             )
         )
     if m.get("apollo_phone"):
@@ -402,10 +482,29 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
     phones = emails if phone_on else 0.0
 
     seed_scrape = seeds * rates["talent_seed_scrape_usd"]
-    profile = survivors * rates["talent_profile_usd"]
+    profile_on = plan_module(plan.get("modules"), "linkedin_dm_profile", True)
+    posts_on = plan_module(plan.get("modules"), "linkedin_dm_posts", True)
+    employer_on = plan_module(plan.get("modules"), "linkedin_company_profile", False)
+    website_on = plan_module(plan.get("modules"), "website_scrape", False)
+    crawler = (plan.get("website_crawler") or "apify").strip().lower()
+    # Profile + posts + employer + website run post-Apollo on contactables.
+    profile = (emails * rates["talent_profile_usd"]) if profile_on else 0.0
+    posts = (emails * rates["linkedin_dm_posts_usd"]) if posts_on else 0.0
+    employer = (emails * rates["linkedin_company_profile_usd"]) if employer_on else 0.0
+    website_pages = rates["website_pages_per_company"]
+    per_page = (
+        rates["firecrawl_per_page"]
+        if crawler == "firecrawl"
+        else rates["apify_website_per_page_usd"]
+    )
+    website_crawl = (emails * website_pages * per_page) if website_on else 0.0
+    website_llm = (emails * rates["llm_website_per_lead_usd"]) if website_on else 0.0
     email_reveal = survivors * rates["apollo_credits_per_lead"] * rates["apollo_per_credit"]
     phone_reveal = phones * rates["apollo_per_credit"]
-    total = seed_scrape + profile + email_reveal + phone_reveal
+    total = (
+        seed_scrape + profile + posts + employer + website_crawl + website_llm
+        + email_reveal + phone_reveal
+    )
     per = (total / emails) if emails > 0 else 0.0
 
     lines = [
@@ -419,14 +518,62 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
         ),
         _line("dedupe", "Deduplication", unit_usd=0, units=0, line_usd=0, basis="local"),
         _line("icp_match", "ICP match", unit_usd=0, units=0, line_usd=0, basis="local"),
-        _line(
-            "talent_profile",
-            "Personal profile scrape",
-            unit_usd=rates["talent_profile_usd"],
-            units=survivors,
-            line_usd=profile,
-            basis="profile_icp_survivors",
-        ),
+    ]
+    if profile_on:
+        lines.append(
+            _line(
+                "talent_profile",
+                "LinkedIn work history / current position",
+                unit_usd=rates["talent_profile_usd"],
+                units=emails,
+                line_usd=profile,
+                basis="profile_contactable_est",
+            )
+        )
+    if posts_on:
+        lines.append(
+            _line(
+                "linkedin_dm_posts",
+                "LinkedIn recent posts",
+                unit_usd=rates["linkedin_dm_posts_usd"],
+                units=emails,
+                line_usd=posts,
+                basis="posts_contactable_est",
+            )
+        )
+    if employer_on:
+        lines.append(
+            _line(
+                "linkedin_company_profile",
+                "Employer company profile",
+                unit_usd=rates["linkedin_company_profile_usd"],
+                units=emails,
+                line_usd=employer,
+                basis="employer_company_contactable_est",
+            )
+        )
+    if website_on:
+        lines.append(
+            _line(
+                "website_scrape",
+                f"Employer website scrape ({crawler})",
+                unit_usd=per_page,
+                units=emails * website_pages,
+                line_usd=website_crawl,
+                basis="employer_website_pages_est",
+            )
+        )
+        lines.append(
+            _line(
+                "website_llm",
+                "Employer website LLM (brief-driven)",
+                unit_usd=rates["llm_website_per_lead_usd"],
+                units=emails,
+                line_usd=website_llm,
+                basis="employer_website_llm_est",
+            )
+        )
+    lines.append(
         _line(
             "apollo_email",
             "Apollo email reveal",
@@ -434,8 +581,8 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
             units=survivors * rates["apollo_credits_per_lead"],
             line_usd=email_reveal,
             basis="apollo_credits_est",
-        ),
-    ]
+        )
+    )
     if phone_on:
         lines.append(
             _line(
@@ -449,7 +596,8 @@ def _estimate_talent(plan: dict[str, Any], rates: dict[str, float]) -> dict[str,
         )
 
     warnings = [
-        "Profile spend applies to ICP survivors, not every seed.",
+        "Profile, posts, employer company, and website spend apply to contactable leads (post-email).",
+        "Employer website extraction is guided by CLIENT.md / client brief / ICP keywords.",
         "Pre-run estimate — seed count × assumed pass rates. Confidence est.",
     ]
     if phone_on and not (os.environ.get("APOLLO_PHONE_WEBHOOK_URL") or "").strip():

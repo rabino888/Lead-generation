@@ -17,6 +17,7 @@ from typing import Any, Callable, Sequence
 log = logging.getLogger("leadgen.talent_list_run")
 
 from agent.utils.list_run import load_list_run, update_list_run
+from agent.utils.enrichment_plan import plan_module
 from agent.utils.talent_people import (
     STAGE_T01_RAW_PEOPLE,
     STAGE_T02_DEDUPED,
@@ -25,6 +26,20 @@ from agent.utils.talent_people import (
     read_people_csv,
     talent_stage_path,
 )
+
+
+def _display_stage_path(campaign_dir: Path, stage_file: Path) -> str:
+    """Prefer data/clients/... in UI (data/campaigns junction points at the same folder)."""
+    try:
+        resolved = stage_file.resolve()
+        parts = resolved.parts
+        if "clients" in parts:
+            idx = parts.index("clients")
+            start = idx - 1 if idx > 0 and str(parts[idx - 1]).lower() == "data" else idx
+            return str(Path(*parts[start:]))
+    except Exception:
+        pass
+    return str(stage_file)
 
 
 def _run_stage(label: str, stage_main: Callable[[], int], argv: Sequence[str]) -> int:
@@ -124,7 +139,13 @@ def _linkedin_people_configured(cfg: dict[str, Any]) -> bool:
         return True
     if (cfg.get("query") or cfg.get("searchQuery") or "").strip():
         return True
-    title = cfg.get("title") or cfg.get("titles") or ""
+    # keywords[] is a common operator alias for searchQuery
+    kws = cfg.get("keywords") or cfg.get("keyword") or ""
+    if isinstance(kws, list) and any(str(k).strip() for k in kws):
+        return True
+    if isinstance(kws, str) and kws.strip():
+        return True
+    title = cfg.get("title") or cfg.get("titles") or cfg.get("currentJobTitles") or ""
     if isinstance(title, list) and any(str(t).strip() for t in title):
         return True
     if isinstance(title, str) and title.strip():
@@ -220,9 +241,13 @@ def start_talent_smoke_gate(
     from agent.utils.campaign_config import load_campaign
     from agent.utils.enrichment_plan import load_plan
     from agent.utils.icp_rules import ensure_stages_dir
+    from agent.utils.list_run import ensure_run_payload
 
     smoke_leads = max(1, min(int(smoke_leads or 2), 10))
     target_leads = max(smoke_leads, int(target_leads or 50))
+
+    # Same as company smoke: paid stages need sender+icp via load_client_profile
+    ensure_run_payload(campaign_id)
 
     update_list_run(
         campaign_dir,
@@ -290,10 +315,15 @@ def start_talent_smoke_gate(
             raise RuntimeError("T03_icp_matched.csv is empty — nothing to smoke-test")
 
         smoke_n = min(smoke_leads, t03_n)
+        profile_on = plan_module(plan.get("modules"), "linkedin_dm_profile", True)
         update_list_run(
             campaign_dir,
             phase="smoking",
-            message=f"Paid smoke on {smoke_n} person(s) (profile + Apollo)…",
+            message=(
+                f"Paid smoke on {smoke_n} person(s) "
+                f"(vanity + Apollo"
+                f"{' + post-email profile' if profile_on else ''})…"
+            ),
             counts={
                 "seeds": seed_n,
                 "after_dedupe": t02_n,
@@ -301,6 +331,7 @@ def start_talent_smoke_gate(
             },
         )
 
+        # T04: vanity SERP only (no thin treg/Apify profile scrape pre-Apollo).
         rc = _run_stage(
             "stage_talent_profile.py",
             profile_main,
@@ -316,6 +347,30 @@ def start_talent_smoke_gate(
         )
         if rc != 0:
             raise RuntimeError(f"T05 Apollo failed (exit {rc})")
+
+        # Full profile (anyapi → Apify) only on contactables
+        if profile_on:
+            from agent.utils.talent_profile import enrich_contactable_work_history
+
+            enrich_contactable_work_history(camp_dir)
+
+        posts_on = plan_module(plan.get("modules"), "linkedin_dm_posts", True)
+        if posts_on:
+            from agent.utils.talent_profile import enrich_contactable_posts
+
+            enrich_contactable_posts(camp_dir)
+
+        employer_on = plan_module(plan.get("modules"), "linkedin_company_profile", False)
+        if employer_on:
+            from agent.utils.talent_employer import enrich_contactable_employer_company
+
+            enrich_contactable_employer_company(camp_dir)
+
+        website_on = plan_module(plan.get("modules"), "website_scrape", False)
+        if website_on:
+            from agent.utils.talent_employer_website import enrich_contactable_employer_website
+
+            enrich_contactable_employer_website(camp_dir)
 
         # Prefer skip phone on smoke (even if plan has apollo_phone).
         phone_action, _ = talent_phone_gate(plan, skip_phone=True)
@@ -345,7 +400,7 @@ def start_talent_smoke_gate(
                 f"{seed_n} seeds on disk. Review results, then approve the full batch."
             ),
             smoke_run_id=f"talent-smoke:{campaign_id}",
-            smoke_csv_path=str(t05_path) if t05_path.is_file() else "",
+            smoke_csv_path=_display_stage_path(campaign_dir, t05_path) if t05_path.is_file() else "",
             seed_preview=seed_preview,
             smoke_preview=smoke_preview,
             counts=counts,
@@ -391,6 +446,10 @@ def approve_talent_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str,
     smoke_leads = max(1, int(state.get("smoke_leads") or 2))
     target_leads = max(smoke_leads, int(state.get("target_leads") or 50))
 
+    from agent.utils.list_run import ensure_run_payload
+
+    ensure_run_payload(campaign_id)
+
     update_list_run(
         campaign_dir,
         phase="running_full",
@@ -409,6 +468,8 @@ def approve_talent_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str,
             raise RuntimeError("No T03_icp_matched.csv — re-run the smoke gate")
 
         limit = min(target_leads, t03_n)
+        profile_on = plan_module(plan.get("modules"), "linkedin_dm_profile", True)
+        # T04: vanity resolve only — full profile after email gate when module on.
         rc = _run_stage(
             "stage_talent_profile.py",
             profile_main,
@@ -425,6 +486,50 @@ def approve_talent_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str,
         if rc != 0:
             raise RuntimeError(f"T05 Apollo failed (exit {rc})")
 
+        # Full profile (anyapi → Apify) only for email-contactable people
+        if profile_on:
+            from agent.utils.talent_profile import enrich_contactable_work_history
+
+            update_list_run(
+                campaign_dir,
+                phase="running_full",
+                message="Full LinkedIn profile on contactable leads…",
+            )
+            enrich_contactable_work_history(camp_dir)
+
+        posts_on = plan_module(plan.get("modules"), "linkedin_dm_posts", True)
+        if posts_on:
+            from agent.utils.talent_profile import enrich_contactable_posts
+
+            update_list_run(
+                campaign_dir,
+                phase="running_full",
+                message="Recent LinkedIn posts on contactable leads…",
+            )
+            enrich_contactable_posts(camp_dir)
+
+        employer_on = plan_module(plan.get("modules"), "linkedin_company_profile", False)
+        if employer_on:
+            from agent.utils.talent_employer import enrich_contactable_employer_company
+
+            update_list_run(
+                campaign_dir,
+                phase="running_full",
+                message="Employer company profile on contactable leads…",
+            )
+            enrich_contactable_employer_company(camp_dir)
+
+        website_on = plan_module(plan.get("modules"), "website_scrape", False)
+        if website_on:
+            from agent.utils.talent_employer_website import enrich_contactable_employer_website
+
+            update_list_run(
+                campaign_dir,
+                phase="running_full",
+                message="Employer website (brief-driven) on contactable leads…",
+            )
+            enrich_contactable_employer_website(camp_dir)
+
         phone_action, phone_err = talent_phone_gate(plan, skip_phone=False)
         if phone_action == "error":
             raise RuntimeError(phone_err or "T06 phone prereqs failed")
@@ -440,12 +545,30 @@ def approve_talent_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str,
         counts["full_seeds"] = limit
         counts["full_contactable"] = delivered_n
 
+        sheet_url = ""
+        try:
+            from agent.utils.talent_sheets import maybe_publish_talent_sheet
+
+            meta = maybe_publish_talent_sheet(camp_dir, campaign_id)
+            if meta:
+                sheet_url = str(meta.get("sheet_url") or "")
+        except Exception:
+            log.debug("talent sheet publish skipped", exc_info=True)
+
+        msg = f"Full talent batch finished — {delivered_n} contactable lead(s) on disk."
+        if sheet_url:
+            msg = f"{msg} Sheet: {sheet_url}"
+
         state = update_list_run(
             campaign_dir,
             phase="completed",
-            message=f"Full talent batch finished — {delivered_n} contactable lead(s) on disk.",
+            message=msg,
             full_run_id=f"talent-full:{campaign_id}",
-            smoke_csv_path=str(t05_path) if t05_path.is_file() else state.get("smoke_csv_path") or "",
+            smoke_csv_path=(
+                _display_stage_path(campaign_dir, t05_path)
+                if t05_path.is_file()
+                else state.get("smoke_csv_path") or ""
+            ),
             counts=counts,
             error="",
         )

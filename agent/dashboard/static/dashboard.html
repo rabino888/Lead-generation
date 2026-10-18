@@ -52,7 +52,7 @@
     llm_flat_rate_est: 'Tokens x rate',
     legacy_cost_log: 'Pre-v4 cost log'
   };
-  const STAGES = [
+  const STAGES_COMPANY = [
     ['seeds', 'Raw seeds'],
     ['icp_matched', 'ICP matched'],
     ['deduped', 'Deduped'],
@@ -60,6 +60,17 @@
     ['enriched', 'Enriched'],
     ['scored', 'Scored']
   ];
+  // Talent: dedupe runs before ITP match (T01 → T02 → T03 → T05)
+  const STAGES_TALENT = [
+    ['seeds', 'Raw people'],
+    ['deduped', 'Deduped'],
+    ['icp_matched', 'ITP matched'],
+    ['contactable', 'Apollo contactable'],
+    ['enriched', 'Work history enriched']
+  ];
+  function stagesFor(c) {
+    return campaignTypeOf(c) === 'talent_search' ? STAGES_TALENT : STAGES_COMPANY;
+  }
   function outreachLabel(ctype) { return ctype === 'talent_search' ? 'talent outreach' : 'company outreach'; }
   function targetingLabel(ctype) { return ctype === 'talent_search' ? 'ITP' : 'ICP'; }
   const TYPE_LABEL = { company_outreach: 'company outreach', talent_search: 'talent outreach' };
@@ -245,12 +256,15 @@
 
     const funnel = el('div', 'funnel');
     const bars = el('div', 'funnel-bars');
-    const steps = [counts.seeds || 0, counts.icp_matched || 0, c.delivered_leads || 0];
+    // Mid step = after targeting filter (ICP/ITP), not pre-ICP dedupe
+    const mid = counts.icp_matched || counts.deduped || 0;
+    const steps = [counts.seeds || 0, mid, c.delivered_leads || 0];
     const peak = Math.max.apply(null, steps.concat([1]));
+    const midLabel = campaignTypeOf(c) === 'talent_search' ? 'ITP matched' : 'ICP matched';
     steps.forEach((v, i) => {
       const bar = el('div', 'funnel-bar' + (i ? ' s' + (i + 1) : ''));
       bar.style.width = Math.max(2, Math.round((v / peak) * 100)) + '%';
-      bar.title = ['seeds', 'ICP matched', 'contactable'][i] + ': ' + int(v);
+      bar.title = ['seeds', midLabel, 'contactable'][i] + ': ' + int(v);
       bars.append(bar);
     });
     funnel.append(bars);
@@ -488,12 +502,15 @@
   }
 
   function campaignListDate(c) {
-    if (c.logged_at) return String(c.logged_at).slice(0, 10);
+    // Prefer real pipeline run dates — never the dashboard rebuild stamp (logged_at).
     const dates = runsOf((r) => r.campaign_id === c.campaign_id)
       .map((r) => r.run_date)
       .filter(Boolean)
       .sort();
-    return dates.length ? dates[dates.length - 1] : '--';
+    if (dates.length) return dates[dates.length - 1];
+    if (c.list_date) return String(c.list_date).slice(0, 10);
+    if (c.activity_at) return String(c.activity_at).slice(0, 10);
+    return '--';
   }
 
   /** One row per delivered list (campaign) — not per stage micro-run. */
@@ -701,11 +718,13 @@
     ['icp_match', 'ICP match'],
     ['dedupe', 'Deduplication'],
     ['apollo_email', 'Email reveal'],
-    ['apify_dm_profile', 'LinkedIn DM profile'],
-    ['apify_dm_posts', 'LinkedIn DM posts'],
+    ['linkedin_dm_profile', 'LinkedIn DM profile'],
+    ['linkedin_dm_posts', 'LinkedIn DM posts'],
     ['website_scrape', 'Website scrape'],
-    ['apify_company_profile', 'Company profile'],
-    ['apify_company_jobs', 'Company open jobs'],
+    ['linkedin_company_profile', 'Company profile'],
+    ['linkedin_company_jobs', 'Company open jobs'],
+    ['facebook_company_posts', 'Facebook posts'],
+    ['instagram_company_posts', 'Instagram posts'],
     ['apollo_phone', 'Phone reveal'],
   ];
 
@@ -717,10 +736,13 @@
     if (ctype === 'talent_search') {
       chips = [
         ['Seed scrape', true],
-        ['DM profile', true],
-        ['Dedupe', true],
-        ['ICP match', true],
-        ['Email', !!m.apollo_email],
+        ['Dedupe', !!m.dedupe || m.dedupe == null],
+        ['ICP match', !!m.icp_match || m.icp_match == null],
+        ['Email', !!m.apollo_email || m.apollo_email == null],
+        ['DM profile', m.linkedin_dm_profile !== false && m.apify_dm_profile !== false],
+        ['DM posts', m.linkedin_dm_posts !== false && m.apify_dm_posts !== false],
+        ['Employer co.', !!(m.linkedin_company_profile || m.apify_company_profile)],
+        ['Employer web', !!m.website_scrape],
         ['Phone', !!m.apollo_phone],
       ].filter((x) => x[1]);
     } else {
@@ -1234,12 +1256,12 @@
 
     view.append(section(
       'Company outreach — existing ICPs',
-      'From data/clients/' + clientId + '/company_outreach/icps/ (legacy flat icps/ still listed).',
+      'From data/clients/' + clientId + '/icps/ (legacy company_outreach/icps/ still listed).',
       companyIcpPanel
     ));
     view.append(section(
       'Talent outreach — existing ITPs',
-      'From data/clients/' + clientId + '/talent_outreach/itps/.',
+      'From data/clients/' + clientId + '/itps/ (legacy talent_outreach/itps/ still listed).',
       talentIcpPanel
     ));
 
@@ -1306,8 +1328,8 @@
       const disk = summary.disk_path
         || ('data/clients/' + clientId + '/'
           + (summary.campaign_type === 'talent_search'
-            ? 'talent_outreach/itps/'
-            : 'company_outreach/icps/')
+            ? 'itps/'
+            : 'icps/')
           + summary.icp_id + '/');
       body.append(el('p', 'note', 'Library path: ' + disk));
 
@@ -1532,12 +1554,12 @@
       renderIcpRowsInto(
         companyIcpPanel,
         companyRows,
-        'No ICPs in data/clients/' + clientId + '/company_outreach/icps/ yet. Use Build new ICP.'
+        'No ICPs in data/clients/' + clientId + '/icps/ yet. Use Build new ICP.'
       );
       renderIcpRowsInto(
         talentIcpPanel,
         talentRows,
-        'No ITPs in data/clients/' + clientId + '/talent_outreach/itps/ yet. Use Build new ITP.'
+        'No ITPs in data/clients/' + clientId + '/itps/ yet. Use Build new ITP.'
       );
     }
 
@@ -1593,6 +1615,17 @@
       { label: 'Seeds in', value: int(counts.seeds), foot: pct(c.delivered_leads, counts.seeds) + ' reached contactable' }
     ]));
 
+    if (c.sheet_url) {
+      const sheetPanel = el('div', 'panel');
+      const a = el('a', null, 'Open Google Sheet');
+      a.href = c.sheet_url;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      sheetPanel.append(a);
+      sheetPanel.append(el('p', 'note', 'Google Sheet for this campaign.'));
+      view.append(section('Deliverable', 'Linked from campaign_sheet.json', sheetPanel));
+    }
+
     const gatePanel = el('div', 'panel');
     gatePanel.append(el('div', 'empty', 'Loading gated-run status…'));
     view.append(section(
@@ -1629,14 +1662,24 @@
             'Seed list (' + (lr.counts && lr.counts.seeds != null ? lr.counts.seeds : seeds.length) + ')'));
           const ul = el('ul', 'seed-list');
           seeds.slice(0, 25).forEach((s) => {
-            ul.appendChild(el('li', null,
-              (s.company_name || '')
-              + (s.website ? (' — ' + s.website) : '')
-              + (s.location ? (' · ' + s.location) : '')
-            ));
+            let line;
+            if (s.full_name || s.title || s.linkedin_url) {
+              const bits = [];
+              if (s.full_name) bits.push(s.full_name);
+              if (s.title) bits.push(s.title);
+              if (s.company_name) bits.push('@ ' + s.company_name);
+              if (s.location) bits.push(s.location);
+              line = bits.join(' · ');
+            } else {
+              line = (s.company_name || '')
+                + (s.website ? (' — ' + s.website) : '')
+                + (s.location ? (' · ' + s.location) : '');
+            }
+            ul.appendChild(el('li', null, line));
           });
           if ((lr.counts && lr.counts.seeds > 25) || seeds.length >= 25) {
-            ul.appendChild(el('li', 'note', '… see stages/01_raw_seeds.csv for full list'));
+            ul.appendChild(el('li', 'note',
+              '… see stages/T01_raw_people.csv (talent) or stages/01_raw_seeds.csv'));
           }
           gatePanel.append(ul);
         }
@@ -1647,13 +1690,19 @@
           if (smokeRows.length) {
             const sul = el('ul', 'seed-list');
             smokeRows.forEach((s) => {
-              const email = s.decision_maker_email || '(no email)';
-              sul.appendChild(el('li', null,
-                (s.company_name || '')
-                + ' — ' + (s.decision_maker_name || '')
-                + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
-                + ' · ' + email
-              ));
+              let line;
+              if (s.full_name || s.email || s.linkedin_url) {
+                line = (s.full_name || '')
+                  + (s.title ? (' — ' + s.title) : '')
+                  + (s.company_name ? (' @ ' + s.company_name) : '')
+                  + ' · ' + (s.email || s.decision_maker_email || '(no email)');
+              } else {
+                line = (s.decision_maker_name || s.company_name || '')
+                  + (s.decision_maker_name && s.company_name ? (' @ ' + s.company_name) : '')
+                  + (s.decision_maker_title ? (', ' + s.decision_maker_title) : '')
+                  + ' · ' + (s.decision_maker_email || s.email || '(no email)');
+              }
+              sul.appendChild(el('li', null, line));
             });
             gatePanel.append(sul);
           } else if (lr.phase === 'error') {
@@ -1692,8 +1741,9 @@
     }
 
     const funnelPanel = el('div', 'panel');
-    const top = Math.max.apply(null, STAGES.map(([k]) => counts[k] || 0).concat([1]));
-    STAGES.forEach(([key, label]) => {
+    const stageDefs = stagesFor(c);
+    const top = Math.max.apply(null, stageDefs.map(([k]) => counts[k] || 0).concat([1]));
+    stageDefs.forEach(([key, label]) => {
       const value = counts[key] || 0;
       const row = el('div', 'stage-row');
       row.append(el('div', 'stage-name', label));
@@ -1706,7 +1756,10 @@
       row.append(el('div', 'pct', pct(value, counts.seeds)));
       funnelPanel.append(row);
     });
-    view.append(section('Funnel', 'Share is measured against raw seeds in.', funnelPanel));
+    const funnelNote = campaignTypeOf(c) === 'talent_search'
+      ? 'Talent order: people → dedupe → ITP → contactable. Share vs raw people in.'
+      : 'Share is measured against raw seeds in.';
+    view.append(section('Funnel', funnelNote, funnelPanel));
 
     const cols = el('div', 'cols');
     const vendorSec = el('div', 'section');

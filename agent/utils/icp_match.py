@@ -49,6 +49,92 @@ def _parse_employee_count(size: str | int | None) -> int | None:
     return None
 
 
+_STAFFING_INDUSTRY_RE = re.compile(r"\b(staffing|recruiting|recruitment)\b", re.I)
+
+_SPAM_HOST_SUFFIXES = (
+    "blogspot.com",
+    "wordpress.com",
+    "wixsite.com",
+    "godaddysites.com",
+    "web.app",
+    "firebaseapp.com",
+    "sites.google.com",
+    "linktr.ee",
+    "carrd.co",
+    "notion.site",
+    "medium.com",
+    "beacons.ai",
+    "bio.link",
+    "myshopify.com",
+)
+_SPAM_TLDS = (
+    ".biz",
+    ".info",
+    ".xyz",
+    ".top",
+    ".click",
+    ".loan",
+    ".gq",
+    ".tk",
+    ".ml",
+    ".cf",
+    ".ga",
+)
+_SPAM_TEXT_RE = re.compile(
+    r"email\s*lists?|lead\s*lists?|buy\s+leads|leads?\s+for\s+sale|"
+    r"\bdirectory\b|crypto|blockchain|\bweb3\b|casino|gambling",
+    re.I,
+)
+
+
+def allows_recruiter_companies(rules: IcpRules) -> bool:
+    """
+    Recruiter and staffing names are rejected unless this ICP is targeting them.
+
+    Explicit ``allow_recruiter_companies`` true/false wins. When unset, allow
+    only if a target industry is staffing or recruiting.
+    """
+    explicit = rules.allow_recruiter_companies
+    if explicit is True:
+        return True
+    if explicit is False:
+        return False
+    return any(_STAFFING_INDUSTRY_RE.search(ind or "") for ind in rules.industries_list())
+
+
+def small_company_spam_reason(name: str, website: str, industry: str = "") -> str | None:
+    """
+    Spam check for companies under 10 employees.
+
+    Real boutiques pass. Free hosts, spam TLDs, lead-list language, and
+    education institutes do not.
+    """
+    domain = _root_domain(website)
+    if not domain or "." not in domain:
+        return "missing_domain"
+    for host in _SPAM_HOST_SUFFIXES:
+        if domain == host or domain.endswith("." + host):
+            return f"free_host:{host}"
+    for tld in _SPAM_TLDS:
+        if domain.endswith(tld):
+            return f"spam_tld:{tld}"
+    blob = f"{name} {industry}"
+    if _SPAM_TEXT_RE.search(blob):
+        return "spam_text"
+    if re.search(r"\binstitute\b", name or "", re.I) and (
+        domain.endswith(".org") or "education" in (industry or "").lower()
+    ):
+        return "edu_institute"
+    return None
+
+
+def _notes_for_name_pattern(notes: str) -> str:
+    """Notes for name-pattern checks, without seed-source boilerplate or URLs."""
+    text = re.sub(r"https?://\S+", " ", notes or "")
+    text = re.sub(r"linkedin company search", " ", text, flags=re.I)
+    return text
+
+
 def _blob(row: Mapping[str, Any]) -> str:
     parts = [
         row.get("company_name") or "",
@@ -83,15 +169,18 @@ def match_company(
     if not website:
         return False, ["missing website"]
 
-    # Cheap recruiter / staffing name gate (no website crawl required)
-    if RECRUITER_NAME_RE.search(name):
+    # Cheap recruiter / staffing name gate (no website crawl required).
+    # Staffing ICPs set allow_recruiter_companies so the target industry is not rejected.
+    if not allows_recruiter_companies(rules) and RECRUITER_NAME_RE.search(name):
         return False, ["recruiter_or_staffing_name"]
 
-    # Excluded name / industry patterns — also scan notes (LinkedIn often buries industry there)
+    # Excluded name / industry patterns. Notes can bury industry on job scrapes.
+    # Do not scan source_url: a linkedin\b rule would reject every LinkedIn-sourced seed.
     pattern_str = rules.merged_excluded_name_pattern()
     if pattern_str:
         pattern = re.compile(pattern_str, re.I)
-        if pattern.search(name) or pattern.search(industry) or pattern.search(blob):
+        notes = _notes_for_name_pattern(str(seed_row.get("notes") or ""))
+        if pattern.search(name) or pattern.search(industry) or pattern.search(notes):
             return False, ["excluded_name_pattern"]
 
     # Excluded keywords (substring in company blob)
@@ -131,6 +220,10 @@ def match_company(
             return False, [f"company_size_below_min:{emp}<{rules.company_size_min}"]
         if rules.company_size_max is not None and emp > rules.company_size_max:
             return False, [f"company_size_above_max:{emp}>{rules.company_size_max}"]
+        if emp < 10:
+            spam = small_company_spam_reason(name, website, industry)
+            if spam:
+                return False, [f"small_company_spam:{spam}"]
 
     # Location — hard gate when require_location_match (company location only;
     # do not trust search geo_segment — jobs/maps queries stamp every row).

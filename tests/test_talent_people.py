@@ -189,9 +189,11 @@ def test_harvestapi_fixture_maps_to_t01(tmp_path: Path):
     assert ada["last_name"] == "Rahman"
     assert "Los Angeles" in ada["location"]
     assert ada["company_name"] == "CVS Health"
+    assert ada["title"] == "Staff Pharmacist"
     assert "cvshealth" in ada["company_linkedin_url"]
     hamid = by_url["https://www.linkedin.com/in/hamidsharif"]
     assert hamid["headline"] == "Backend Engineer"
+    assert hamid["full_name"] == "Hamid R. Sharif"
     assert hamid["company_name"] == "Example SA"
     assert hamid["location"] == "Madrid, Community of Madrid, Spain"
     out = persist_t01(tmp_path, rows)

@@ -145,6 +145,8 @@ def test_talent_phone_skipped_on_smoke(tmp_path, monkeypatch):
     mock_camp.campaign_id = "talent_gated"
     mock_camp.campaign_dir = camp
     mock_camp.stages_dir = stages
+    mock_camp.icp_path = camp / "icp.json"
+    mock_camp.run_payload_path = camp / "run_payload.json"
 
     phone_calls: list[tuple] = []
 
@@ -204,3 +206,73 @@ def test_talent_phone_skipped_on_smoke(tmp_path, monkeypatch):
     assert state["phase"] == "awaiting_approval"
     assert phone_calls == []
     assert state["counts"].get("smoke_contactable") == 1
+    # Talent smoke synthesizes run_payload when missing (same seam as company)
+    assert (camp / "run_payload.json").is_file()
+    payload = json.loads((camp / "run_payload.json").read_text(encoding="utf-8"))
+    assert payload.get("sender", {}).get("client_id")
+    assert "icp" in payload
+
+
+def test_talent_smoke_synthesizes_missing_run_payload(tmp_path, monkeypatch):
+    """Paid talent stages need run_payload; smoke gate must create it before T04."""
+    camp = _write_talent_campaign(tmp_path, with_people_seeds=True)
+    stages = camp / "stages"
+    stages.mkdir()
+    # Explicitly no run_payload.json
+    assert not (camp / "run_payload.json").exists()
+
+    (stages / "T01_raw_people.csv").write_text(
+        "person_id,linkedin_url,full_name,first_name,last_name,headline,title,"
+        "location,company_name,company_linkedin_url,source_url,seed_source_id,notes\n"
+        "p1,https://www.linkedin.com/in/b,B,,,Engineer,Engineer,Madrid,Co,,"
+        "https://www.linkedin.com/in/b,csv,\n",
+        encoding="utf-8",
+    )
+
+    mock_camp = MagicMock()
+    mock_camp.campaign_id = "talent_gated"
+    mock_camp.campaign_dir = camp
+    mock_camp.stages_dir = stages
+    mock_camp.icp_path = camp / "icp.json"
+    mock_camp.run_payload_path = camp / "run_payload.json"
+
+    def _dedupe():
+        (stages / "T02_deduped.csv").write_text(
+            (stages / "T01_raw_people.csv").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return 0
+
+    def _icp():
+        (stages / "T03_icp_matched.csv").write_text(
+            (stages / "T01_raw_people.csv").read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        return 0
+
+    def _apollo():
+        (stages / "T05_apollo_contactable.csv").write_text(
+            "linkedin_url,full_name,title,location,company_name,email\n"
+            "https://www.linkedin.com/in/b,B,Engineer,Madrid,Co,b@example.com\n",
+            encoding="utf-8",
+        )
+        return 0
+
+    monkeypatch.setattr("agent.utils.campaign_config.load_campaign", lambda _c: mock_camp)
+    monkeypatch.setattr(
+        "agent.utils.enrichment_plan.load_plan",
+        lambda *_a, **_k: {"campaign_type": "talent_search", "modules": {}},
+    )
+    monkeypatch.setattr("agent.utils.icp_rules.ensure_stages_dir", lambda _c: stages)
+    monkeypatch.setattr("scripts.stage_talent_seed.main", lambda: 0)
+    monkeypatch.setattr("scripts.stage_talent_dedupe.main", _dedupe)
+    monkeypatch.setattr("scripts.stage_talent_icp.main", _icp)
+    monkeypatch.setattr("scripts.stage_talent_profile.main", lambda: 0)
+    monkeypatch.setattr("scripts.stage_talent_apollo.main", _apollo)
+
+    state = start_talent_smoke_gate(camp, "talent_gated", smoke_leads=1, target_leads=5)
+    assert state["phase"] == "awaiting_approval"
+    assert (camp / "run_payload.json").is_file()
+    payload = json.loads((camp / "run_payload.json").read_text(encoding="utf-8"))
+    assert "sender" in payload and "icp" in payload
+    assert payload.get("campaign_id") == "talent_gated"

@@ -40,7 +40,7 @@ def test_company_estimate_scales_with_leads():
     assert "website_scrape" in ids
 
 
-def test_talent_estimate_profile_on_icp_survivors():
+def test_talent_estimate_profile_on_contactables():
     plan = default_plan("ta", campaign_type="talent_search")
     plan["seed_count"] = 100
     plan["talent_pass_rates"] = {
@@ -50,13 +50,64 @@ def test_talent_estimate_profile_on_icp_survivors():
     }
     est = estimate_plan(plan)
     profile = next(x for x in est["line_items"] if x["module_id"] == "talent_profile")
-    assert abs(profile["units"] - 36.0) < 0.01  # survivors_after_icp = 100*0.9*0.4
-    assert profile["basis"] == "profile_icp_survivors"
+    # contactables ≈ 100*0.9*0.4*0.7 = 25.2
+    assert abs(profile["units"] - 25.2) < 0.01
+    assert profile["basis"] == "profile_contactable_est"
     assert est["funnel"]["seeds"] == 100
     assert abs(est["funnel"]["after_icp"] - 36.0) < 0.01
     assert est["campaign_type"] == "talent_search"
-    assert any("ICP survivors" in w for w in est["warnings"])
+    assert any("contactable" in w.lower() for w in est["warnings"])
     assert not any("every seed pays" in w.lower() for w in est["warnings"])
+
+
+def test_talent_estimate_posts_module():
+    plan = default_plan("ta", campaign_type="talent_search")
+    plan["seed_count"] = 100
+    # Core: posts on by default for talent
+    assert plan["modules"]["linkedin_dm_posts"] is True
+    plan["talent_pass_rates"] = {
+        "after_dedupe": 0.9,
+        "after_icp": 0.4,
+        "email_success": 0.7,
+    }
+    est = estimate_plan(plan)
+    posts = next(x for x in est["line_items"] if x["module_id"] == "linkedin_dm_posts")
+    assert abs(posts["units"] - 25.2) < 0.01
+    assert posts["basis"] == "posts_contactable_est"
+
+
+def test_talent_estimate_employer_company_module():
+    plan = default_plan("ta", campaign_type="talent_search")
+    plan["seed_count"] = 100
+    plan["modules"]["linkedin_company_profile"] = True
+    plan["talent_pass_rates"] = {
+        "after_dedupe": 0.9,
+        "after_icp": 0.4,
+        "email_success": 0.7,
+    }
+    est = estimate_plan(plan)
+    employer = next(x for x in est["line_items"] if x["module_id"] == "linkedin_company_profile")
+    assert abs(employer["units"] - 25.2) < 0.01
+    assert employer["basis"] == "employer_company_contactable_est"
+    assert "Employer" in employer["label"]
+
+
+def test_talent_estimate_employer_website_module():
+    plan = default_plan("ta", campaign_type="talent_search")
+    plan["seed_count"] = 100
+    plan["modules"]["website_scrape"] = True
+    plan["website_crawler"] = "apify"
+    plan["talent_pass_rates"] = {
+        "after_dedupe": 0.9,
+        "after_icp": 0.4,
+        "email_success": 0.7,
+    }
+    est = estimate_plan(plan)
+    scrape = next(x for x in est["line_items"] if x["module_id"] == "website_scrape")
+    llm = next(x for x in est["line_items"] if x["module_id"] == "website_llm")
+    assert scrape["basis"] == "employer_website_pages_est"
+    assert llm["basis"] == "employer_website_llm_est"
+    assert abs(llm["units"] - 25.2) < 0.01
 
 
 def test_save_and_load_plan(tmp_path: Path):
@@ -222,7 +273,7 @@ def test_builder_create_includes_brief_on_summary(builder_client, tmp_path):
     assert g.status_code == 200
     assert g.json()["brief"] == "Spain TA managers · 50–200 · Madrid"
     assert (
-        tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / campaign_id / "icp.json"
+        tmp_path / "clients" / "sample" / "campaigns" / "in_progress" / campaign_id / "icp.json"
     ).is_file()
 
 
@@ -255,7 +306,6 @@ def test_builder_meta_updates_brief(builder_client, tmp_path):
             tmp_path
             / "clients"
             / "sample"
-            / "company_outreach"
             / "icps"
             / icp_id
             / "meta.json"
@@ -285,8 +335,8 @@ def test_builder_create_prefills_icp_from_brief(builder_client, tmp_path):
             tmp_path
             / "clients"
             / "mkt"
-            / "company_outreach"
             / "campaigns"
+            / "in_progress"
             / campaign_id
             / "icp.json"
         ).read_text(encoding="utf-8")
@@ -302,7 +352,7 @@ def test_builder_create_prefills_icp_from_brief(builder_client, tmp_path):
     assert summary_icp["company_size_min"] == 1
     assert summary_icp["company_size_max"] == 50
     assert "COO" in summary_icp["job_titles"]
-    mirror = tmp_path / "clients" / "mkt" / "company_outreach" / "icps"
+    mirror = tmp_path / "clients" / "mkt" / "icps"
     assert mirror.is_dir()
     assert any(mirror.iterdir())
 
@@ -318,7 +368,7 @@ def test_builder_rename_meta(builder_client, tmp_path):
         (tmp_path / "campaigns" / "sample_co" / "campaign.json").read_text(encoding="utf-8")
     )
     assert meta["display_name"] == "Sample renamed ICP"
-    mirror = tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / "sample_co" / "campaign.json"
+    mirror = tmp_path / "clients" / "sample" / "campaigns" / "in_progress" / "sample_co" / "campaign.json"
     assert mirror.is_file()
     assert json.loads(mirror.read_text(encoding="utf-8"))["display_name"] == "Sample renamed ICP"
 
@@ -340,7 +390,7 @@ def test_builder_create_campaign(builder_client, tmp_path):
     assert campaign_id == "sample_outreach"
     assert body["campaign"]["client_id"] == "sample"
     assert body.get("icp_id")
-    camp = tmp_path / "clients" / "sample" / "company_outreach" / "campaigns" / campaign_id
+    camp = tmp_path / "clients" / "sample" / "campaigns" / "in_progress" / campaign_id
     assert (camp / "campaign.json").is_file()
     assert (camp / "enrichment_plan.json").is_file()
     assert (camp / "icp.json").is_file()
@@ -349,7 +399,7 @@ def test_builder_create_campaign(builder_client, tmp_path):
     assert meta["name"] == "Sample Co"
     assert meta["icp_id"] == body["icp_id"]
     icp_lib = (
-        tmp_path / "clients" / "sample" / "company_outreach" / "icps" / body["icp_id"] / "icp.json"
+        tmp_path / "clients" / "sample" / "icps" / body["icp_id"] / "icp.json"
     )
     assert icp_lib.is_file()
 
@@ -393,7 +443,7 @@ def test_builder_list_client_icps(builder_client, tmp_path):
     assert forced.status_code == 200, forced.text
     assert forced.json()["ok"] is True
     assert not (
-        tmp_path / "clients" / "sample" / "company_outreach" / "icps" / icp_id
+        tmp_path / "clients" / "sample" / "icps" / icp_id
     ).is_dir()
 
 
@@ -410,12 +460,12 @@ def test_builder_create_explicit_id_still_works(builder_client, tmp_path):
     assert r.status_code == 200, r.text
     assert r.json()["campaign"]["campaign_id"] == "new_list_1"
     assert r.json()["campaign"]["campaign_type"] == "talent_search"
-    camp = tmp_path / "clients" / "sample" / "talent_outreach" / "campaigns" / "new_list_1"
+    camp = tmp_path / "clients" / "sample" / "campaigns" / "in_progress" / "new_list_1"
     assert (camp / "campaign.json").is_file()
     icp_id = r.json().get("icp_id")
     assert icp_id
     assert (
-        tmp_path / "clients" / "sample" / "talent_outreach" / "itps" / icp_id / "icp.json"
+        tmp_path / "clients" / "sample" / "itps" / icp_id / "icp.json"
     ).is_file()
 
 
@@ -428,8 +478,8 @@ def test_builder_put_client_brief(builder_client, tmp_path):
     meta = json.loads((tmp_path / "clients" / "newco" / "client.json").read_text(encoding="utf-8"))
     assert meta["client_name"] == "New Co"
     assert meta["brief"] == "B2B SaaS in Spain"
-    assert (tmp_path / "clients" / "newco" / "company_outreach" / "icps").is_dir()
-    assert (tmp_path / "clients" / "newco" / "talent_outreach" / "itps").is_dir()
+    assert (tmp_path / "clients" / "newco" / "icps").is_dir()
+    assert (tmp_path / "clients" / "newco" / "itps").is_dir()
 
 
 def test_builder_list_clients_includes_icp_only(builder_client, tmp_path):
@@ -543,8 +593,8 @@ def test_builder_create_falls_back_to_client_brief(builder_client, tmp_path):
             tmp_path
             / "clients"
             / "sample"
-            / "company_outreach"
             / "campaigns"
+            / "in_progress"
             / campaign_id
             / "campaign.json"
         ).read_text(encoding="utf-8")
@@ -670,7 +720,7 @@ def test_list_run_state_roundtrip(tmp_path):
     assert loaded["smoke_leads"] == 3
 
     plan = default_plan("c1")
-    plan["modules"]["apify_dm_posts"] = False
+    plan["modules"]["linkedin_dm_posts"] = False
     plan["modules"]["apollo_phone"] = True
     with apply_plan_runtime(plan):
         assert os.environ.get("APIFY_SKIP_LINKEDIN_POSTS") == "1"

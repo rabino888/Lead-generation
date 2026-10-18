@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import shutil
 from pathlib import Path
 from typing import Any, Optional
@@ -11,6 +12,7 @@ from agent.utils.campaign_config import (
     STAGE_ENRICHED,
     STAGE_SCORED,
 )
+from agent.utils.talent_people import STAGE_T05_APOLLO_CONTACTABLE, STAGE_T06_PHONE_ENRICHED
 
 STAGE_ALIASES = {
     "scored": STAGE_SCORED,
@@ -19,11 +21,15 @@ STAGE_ALIASES = {
     "06_scored": STAGE_SCORED,
     "05_enriched": STAGE_ENRICHED,
     "04_apollo_contactable": STAGE_APOLLO_CONTACTABLE,
+    "t05_apollo_contactable": STAGE_T05_APOLLO_CONTACTABLE,
+    "t06_phone_enriched": STAGE_T06_PHONE_ENRICHED,
+    "talent_contactable": STAGE_T05_APOLLO_CONTACTABLE,
 }
 
-# Campaign dashboard: compact operator summary
+# Campaign dashboard: compact operator summary (company outreach)
 SUMMARY_COLS = [
     "company_name",
+    "company_name_humanized",
     "website",
     "location",
     "decision_maker_name",
@@ -34,9 +40,24 @@ SUMMARY_COLS = [
     "run_id",
 ]
 
+# Talent outreach summary
+TALENT_SUMMARY_COLS = [
+    "full_name",
+    "email",
+    "title",
+    "current_position",
+    "company_name",
+    "company_name_humanized",
+    "location",
+    "outreach_language",
+    "linkedin_url",
+    "experience_summary",
+]
+
 # Full-results page: Sheet-like width
 FULL_COLS = [
     "company_name",
+    "company_name_humanized",
     "website",
     "location",
     "industry",
@@ -64,15 +85,64 @@ FULL_COLS = [
     "run_id",
 ]
 
+TALENT_FULL_COLS = [
+    "full_name",
+    "email",
+    "email_status",
+    "title",
+    "current_position",
+    "headline",
+    "company_name",
+    "company_name_humanized",
+    "company_linkedin_url",
+    "company_industry",
+    "company_size",
+    "company_linkedin_description",
+    "website",
+    "website_summary",
+    "website_brief_findings",
+    "website_brief_findings_summary",
+    "website_services",
+    "website_listing_urls",
+    "location",
+    "outreach_language",
+    "linkedin_url",
+    "experience_summary",
+    "about",
+    "education_summary",
+    "linkedin_post_summary",
+    "linkedin_interests",
+    "linkedin_recent_posts",
+    "person_id",
+    "apollo_person_id",
+    "profile_status",
+]
+
 # Back-compat alias
 PREVIEW_COLS = FULL_COLS
 
 
-def _columns_for_view(view: str) -> list[str]:
+def _is_talent_campaign(campaign_dir: Path) -> bool:
+    stages = campaign_dir / "stages"
+    if (stages / STAGE_T05_APOLLO_CONTACTABLE).is_file():
+        return True
+    if (stages / "T01_raw_people.csv").is_file():
+        return True
+    camp = campaign_dir / "campaign.json"
+    if camp.is_file():
+        try:
+            meta = json.loads(camp.read_text(encoding="utf-8-sig"))
+            return (meta.get("campaign_type") or "").strip() == "talent_search"
+        except (OSError, json.JSONDecodeError):
+            pass
+    return False
+
+
+def _columns_for_view(view: str, *, talent: bool = False) -> list[str]:
     mode = (view or "summary").strip().lower()
     if mode in ("full", "wide", "all"):
-        return list(FULL_COLS)
-    return list(SUMMARY_COLS)
+        return list(TALENT_FULL_COLS if talent else FULL_COLS)
+    return list(TALENT_SUMMARY_COLS if talent else SUMMARY_COLS)
 
 
 def resolve_stage_file(campaign_dir: Path, stage: str = "auto") -> tuple[str, Path]:
@@ -85,6 +155,13 @@ def resolve_stage_file(campaign_dir: Path, stage: str = "auto") -> tuple[str, Pa
             return name, path
         raise FileNotFoundError(f"Stage file not found: {name}")
 
+    # Talent: T06 phone → T05 contactable
+    if _is_talent_campaign(campaign_dir):
+        for name in (STAGE_T06_PHONE_ENRICHED, STAGE_T05_APOLLO_CONTACTABLE):
+            path = stages_dir / name
+            if path.is_file() and path.stat().st_size > 0:
+                return name, path
+
     for key in ("scored", "enriched", "contactable"):
         name = STAGE_ALIASES[key]
         path = stages_dir / name
@@ -96,6 +173,22 @@ def resolve_stage_file(campaign_dir: Path, stage: str = "auto") -> tuple[str, Pa
     if fallback is not None:
         return "client_run", fallback
     raise FileNotFoundError("No contactable/enriched/scored stage CSV on disk")
+
+
+def _sheet_url_for_campaign(campaign_dir: Path) -> str:
+    """Prefer campaign_sheet.json, then list_run.sheet_url."""
+    for name in ("campaign_sheet.json", "list_run.json"):
+        path = campaign_dir / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        url = (data.get("sheet_url") or "").strip()
+        if url:
+            return url
+    return ""
 
 
 def _fallback_client_run_csv(campaign_dir: Path) -> Optional[Path]:
@@ -150,7 +243,15 @@ def _fallback_client_run_csv(campaign_dir: Path) -> Optional[Path]:
 
 
 def _slim_row(row: dict[str, str], columns: list[str]) -> dict[str, str]:
-    return {k: (row.get(k) or "") for k in columns}
+    from agent.utils.company_name import humanize_company_name
+    from agent.utils.outreach_language import infer_outreach_language_from_row
+
+    out = {k: (row.get(k) or "") for k in columns}
+    if "company_name_humanized" in out:
+        out["company_name_humanized"] = humanize_company_name(row.get("company_name"))
+    if "outreach_language" in out and not out["outreach_language"].strip():
+        out["outreach_language"] = infer_outreach_language_from_row(row)
+    return out
 
 
 def lead_summary(
@@ -161,9 +262,8 @@ def lead_summary(
     run_id: Optional[str] = None,
     view: str = "summary",
 ) -> dict[str, Any]:
-    import json as _json
-
-    cols = _columns_for_view(view)
+    talent = _is_talent_campaign(campaign_dir)
+    cols = _columns_for_view(view, talent=talent)
     stage_name, path = resolve_stage_file(campaign_dir, stage)
     with path.open(encoding="utf-8-sig", newline="") as f:
         rows = list(csv.DictReader(f))
@@ -180,18 +280,17 @@ def lead_summary(
     preview_n = max(0, min(preview, 200))
     sample = [_slim_row(r, cols) for r in rows[:preview_n]]
 
-    sheet_url = ""
-    lr_path = campaign_dir / "list_run.json"
+    sheet_url = _sheet_url_for_campaign(campaign_dir)
     run_id_guess = ""
+    lr_path = campaign_dir / "list_run.json"
     if lr_path.is_file():
         try:
-            lr = _json.loads(lr_path.read_text(encoding="utf-8-sig"))
-            sheet_url = (lr.get("sheet_url") or "").strip()
+            lr = json.loads(lr_path.read_text(encoding="utf-8-sig"))
             if not run_id:
                 run_id_guess = (lr.get("full_run_id") or lr.get("smoke_run_id") or "").strip()
             else:
                 run_id_guess = run_id.strip()
-        except (OSError, _json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError):
             run_id_guess = (rows[0].get("run_id") or "").strip() if rows else ""
     else:
         run_id_guess = (rows[0].get("run_id") or "").strip() if rows else ""
@@ -201,7 +300,7 @@ def lead_summary(
             meta: dict[str, Any] = {}
             camp_meta = campaign_dir / "campaign.json"
             if camp_meta.is_file():
-                meta = _json.loads(camp_meta.read_text(encoding="utf-8-sig"))
+                meta = json.loads(camp_meta.read_text(encoding="utf-8-sig"))
             cid = (meta.get("client_id") or "").strip()
             if cid:
                 from agent.utils.client_paths import client_runs_dir
@@ -209,13 +308,11 @@ def lead_summary(
                 summary = client_runs_dir(cid, smoke=False) / f"{run_id_guess}_summary.json"
                 if summary.is_file():
                     sheet_url = (
-                        _json.loads(summary.read_text(encoding="utf-8-sig")).get("sheet_url") or ""
+                        json.loads(summary.read_text(encoding="utf-8-sig")).get("sheet_url") or ""
                     ).strip()
         except Exception:
             sheet_url = sheet_url or ""
 
-    view_mode = "full" if cols is FULL_COLS or cols == FULL_COLS else "summary"
-    # normalize
     view_mode = "full" if (view or "").strip().lower() in ("full", "wide", "all") else "summary"
 
     return {

@@ -281,6 +281,49 @@ def test_enrich_person_by_linkedin_fallback_name_org():
     assert get_credits_used() == 1
 
 
+def test_enrich_person_by_linkedin_falls_through_when_url_match_has_no_email():
+    """Opaque ACw URLs often match a no-email shell; name+org must still run."""
+    reset_credits_used()
+    shell = {
+        "credits_consumed": 1,
+        "person": {
+            "id": "shell",
+            "name": "Sara Mandirola",
+            "linkedin_url": "https://www.linkedin.com/in/ACwAAATQlu4BYwa8fakHDYchobWcVsHjNMhA8h4",
+            # no email
+        },
+    }
+    found = {
+        "credits_consumed": 1,
+        "person": {
+            "id": "p-real",
+            "email": "sara@example.com",
+            "email_status": "verified",
+            "linkedin_url": "https://www.linkedin.com/in/sara-mandirola",
+        },
+    }
+
+    def side_effect(endpoint, payload=None, params=None):
+        assert endpoint == "people/match"
+        keys = {k for k, _ in (params or [])}
+        if "organization_name" in keys or "first_name" in keys:
+            # Opaque linkedin must NOT be re-sent on name fallback
+            assert ("linkedin_url", shell["person"]["linkedin_url"]) not in (params or [])
+            return found
+        return shell
+
+    with patch("agent.integrations.apollo._post", side_effect=side_effect):
+        contact = enrich_person_by_linkedin(
+            shell["person"]["linkedin_url"],
+            first_name="Sara",
+            last_name="Mandirola",
+            organization_name="LM Group Real Estate",
+        )
+    assert contact is not None
+    assert contact.email == "sara@example.com"
+    assert get_credits_used() == 2
+
+
 def test_missing_input_raises(tmp_path: Path):
     with pytest.raises(FileNotFoundError):
         run_talent_apollo_stage(tmp_path / "missing")

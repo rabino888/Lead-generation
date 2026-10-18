@@ -11,7 +11,14 @@ from pathlib import Path
 from typing import Any, Mapping, Optional
 from urllib.parse import urlparse
 
-from agent.utils.icp_match import RECRUITER_NAME_RE, _parse_employee_count, _root_domain
+from agent.utils.icp_match import (
+    RECRUITER_NAME_RE,
+    _notes_for_name_pattern,
+    _parse_employee_count,
+    _root_domain,
+    allows_recruiter_companies,
+    small_company_spam_reason,
+)
 from agent.utils.icp_rules import IcpRules
 from agent.utils.icp_seed_quality import weak_seed_reason
 
@@ -127,7 +134,7 @@ def pre_apollo_reject_reason(
     if not name or not website:
         return "missing_name_or_website"
 
-    if RECRUITER_NAME_RE.search(name):
+    if not allows_recruiter_companies(rules) and RECRUITER_NAME_RE.search(name):
         return "recruiter_or_staffing_name"
 
     domain = _root_domain(website)
@@ -138,7 +145,7 @@ def pre_apollo_reject_reason(
     if pattern_str:
         pattern = re.compile(pattern_str, re.I)
         industry = (row.get("industry") or "").strip()
-        notes = (row.get("notes") or "").strip()
+        notes = _notes_for_name_pattern((row.get("notes") or "").strip())
         if pattern.search(name) or (industry and pattern.search(industry)) or (notes and pattern.search(notes)):
             return "excluded_name_pattern"
 
@@ -173,6 +180,14 @@ def pre_apollo_reject_reason(
             return f"employees_above_max:{employees}>{rules.company_size_max}"
         if rules.company_size_min is not None and employees < rules.company_size_min:
             return f"employees_below_min:{employees}<{rules.company_size_min}"
+        if employees < 10:
+            spam = small_company_spam_reason(
+                name,
+                website,
+                (row.get("industry") or "").strip(),
+            )
+            if spam:
+                return f"small_company_spam:{spam}"
     elif drop_unknown_size and rules.company_size_max is not None:
         return "unknown_employee_count"
 

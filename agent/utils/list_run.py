@@ -100,9 +100,21 @@ def apply_plan_runtime(plan: dict[str, Any]) -> Iterator[None]:
     def _flag(on: bool) -> str:
         return "0" if on else "1"
 
-    desired["APIFY_SKIP_PERSON_PROFILE"] = _flag(bool(mods.get("apify_dm_profile", True)))
-    desired["APIFY_SKIP_LINKEDIN_POSTS"] = _flag(bool(mods.get("apify_dm_posts", True)))
-    desired["APIFY_SKIP_LINKEDIN_JOBS"] = _flag(bool(mods.get("apify_company_jobs", False)))
+    desired["APIFY_SKIP_PERSON_PROFILE"] = _flag(
+        bool(mods.get("linkedin_dm_profile", mods.get("apify_dm_profile", True)))
+    )
+    desired["APIFY_SKIP_LINKEDIN_POSTS"] = _flag(
+        bool(mods.get("linkedin_dm_posts", mods.get("apify_dm_posts", True)))
+    )
+    desired["APIFY_SKIP_LINKEDIN_JOBS"] = _flag(
+        bool(mods.get("linkedin_company_jobs", mods.get("apify_company_jobs", False)))
+    )
+    desired["FACEBOOK_COMPANY_POSTS"] = (
+        "1" if mods.get("facebook_company_posts") else "0"
+    )
+    desired["INSTAGRAM_COMPANY_POSTS"] = (
+        "1" if mods.get("instagram_company_posts") else "0"
+    )
     if mods.get("apollo_phone"):
         desired["APOLLO_SKIP_PHONE"] = "0"
     else:
@@ -1027,6 +1039,89 @@ def _record_gated_run_cost(
     append_manifest_run(campaign_dir, entry, campaign_id=campaign_id)
 
 
+def merge_contactable_rows(
+    full_rows: list[dict[str, str]],
+    smoke_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """Append smoke contactable leads that the full batch did not re-process."""
+
+    def _key(row: dict[str, str]) -> str:
+        email = (row.get("decision_maker_email") or "").strip().lower()
+        if email:
+            return f"e:{email}"
+        site = (row.get("website") or "").strip().lower().removeprefix("https://").removeprefix("http://")
+        site = site.removeprefix("www.").rstrip("/")
+        return f"w:{site}"
+
+    seen = {_key(row) for row in full_rows}
+    merged = list(full_rows)
+    for row in smoke_rows:
+        if not (row.get("decision_maker_email") or "").strip():
+            continue
+        key = _key(row)
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(row)
+    return merged
+
+
+def include_smoke_leads_in_delivery(campaign_dir: Path, *, sheet_url: str = "") -> int:
+    """
+    Copy smoke contactable rows into the full-batch stage CSVs and the Leads sheet.
+
+    The full batch skips the smoke slice so those companies are not billed twice.
+    Without this merge, the delivered sheet and 04/05/06 CSVs omit them.
+    Returns how many smoke leads were added to the stage files.
+    """
+    smoke_path = campaign_dir / "stages" / "04_smoke_contactable.csv"
+    if not smoke_path.is_file():
+        return 0
+    with smoke_path.open(encoding="utf-8-sig", newline="") as f:
+        smoke_rows = list(csv.DictReader(f))
+    smoke_rows = [r for r in smoke_rows if (r.get("decision_maker_email") or "").strip()]
+    if not smoke_rows:
+        return 0
+
+    added = 0
+    stages = campaign_dir / "stages"
+    for name in (
+        "04_apollo_contactable.csv",
+        "05_enriched.csv",
+        "06_scored.csv",
+    ):
+        path = stages / name
+        if not path.is_file():
+            continue
+        with path.open(encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            full_rows = list(reader)
+            fields = list(reader.fieldnames or [])
+        before = len(full_rows)
+        merged = merge_contactable_rows(full_rows, smoke_rows)
+        if len(merged) == before:
+            continue
+        for row in merged:
+            for key in row:
+                if key not in fields:
+                    fields.append(key)
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            writer.writeheader()
+            for row in merged:
+                writer.writerow({k: row.get(k, "") for k in fields})
+        added = max(added, len(merged) - before)
+
+    if added and sheet_url:
+        try:
+            from agent.integrations.sheets import append_csv_leads_to_sheet
+
+            append_csv_leads_to_sheet(sheet_url, smoke_rows)
+        except Exception:
+            log.debug("smoke lead sheet append skipped", exc_info=True)
+    return added
+
+
 def approve_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
     """Run remaining deduped companies up to target_leads after smoke approval."""
     from agent.utils.talent_list_run import approve_talent_full_batch, resolve_campaign_type
@@ -1063,7 +1158,9 @@ def approve_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
         if not deduped:
             raise RuntimeError("No 03_deduped.csv — re-run the smoke gate")
 
-        # Prefer companies after the smoke slice; if fewer remain, use all up to target.
+        # Smoke companies were already enriched. Skip them here so Apollo is not
+        # billed twice; their contactable rows are merged back into the delivery
+        # after this run (see include_smoke_leads_in_delivery).
         remaining = deduped[smoke_leads:] if len(deduped) > smoke_leads else deduped
         seeds = _rows_to_seeds(remaining)
         if not seeds:
@@ -1090,6 +1187,10 @@ def approve_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str, Any]:
                 sheet_url = str(final.sheet_url or "")
         except Exception:
             sheet_url = ""
+        try:
+            include_smoke_leads_in_delivery(campaign_dir, sheet_url=sheet_url)
+        except Exception:
+            log.debug("smoke lead merge into stages skipped", exc_info=True)
         try:
             contactable = Path(mirrored["contactable"]) if mirrored.get("contactable") else None
             if contactable and contactable.is_file():

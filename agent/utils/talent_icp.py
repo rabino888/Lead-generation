@@ -42,6 +42,7 @@ class TalentPersonRules(BaseModel):
     skills: list[str] = Field(default_factory=list)
     keywords: list[str] = Field(default_factory=list)
     excluded_keywords: list[str] = Field(default_factory=list)
+    exclude_titles: list[str] = Field(default_factory=list)
     contact_locations: list[str] = Field(default_factory=list)
     location: Optional[str] = None
     location_hints: list[str] = Field(default_factory=list)
@@ -66,6 +67,9 @@ def rules_from_icp_dict(data: Mapping[str, Any] | None) -> TalentPersonRules:
     skills = _as_list(pm.get("skills"))
     keywords = _as_list(raw.get("keywords")) or _as_list(raw.get("include_keywords"))
     excluded = _as_list(raw.get("excluded_keywords")) or _as_list(raw.get("exclude_keywords"))
+    exclude_titles = _as_list(pm.get("exclude_titles")) or _as_list(raw.get("exclude_titles"))
+    # Also fold person_match.exclude_keywords into excluded
+    excluded = excluded + _as_list(pm.get("exclude_keywords"))
     contact_locations = _as_list(raw.get("contact_locations"))
     location = (geo.get("primary_location") or raw.get("location") or "").strip() or None
     location_hints = _as_list(geo.get("location_hints"))
@@ -94,6 +98,7 @@ def rules_from_icp_dict(data: Mapping[str, Any] | None) -> TalentPersonRules:
         skills=skills,
         keywords=keywords,
         excluded_keywords=excluded,
+        exclude_titles=exclude_titles,
         contact_locations=contact_locations,
         location=location,
         location_hints=location_hints,
@@ -165,6 +170,11 @@ def match_person(
     for kw in rules.excluded_keywords:
         if kw and kw.lower() in blob:
             return False, [f"excluded_keyword:{kw}"]
+
+    for bad in rules.exclude_titles:
+        b = (bad or "").strip().lower()
+        if b and b in title_text:
+            return False, [f"excluded_title:{bad}"]
 
     # Cheap recruiter / staffing gate on person-facing seed fields
     scan = f"{title_text} {company}".strip()

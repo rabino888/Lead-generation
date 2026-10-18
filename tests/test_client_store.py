@@ -33,12 +33,10 @@ def test_save_and_list_icp(tmp_path: Path):
     assert items[0]["display_name"] == "Headhunting US 1-50"
     assert items[0]["campaign_type"] == "company_outreach"
     assert items[0]["icp"]["job_titles"][:2] == ["COO", "CTO"]
-    assert (
-        root / "clients" / "acme" / "company_outreach" / "icps" / "headhunting_us" / "icp.json"
-    ).is_file()
+    assert (root / "clients" / "acme" / "icps" / "headhunting_us" / "icp.json").is_file()
 
 
-def test_save_talent_itp_under_typed_tree(tmp_path: Path):
+def test_save_talent_itp_under_flat_tree(tmp_path: Path):
     root = tmp_path
     save_icp(
         root,
@@ -53,15 +51,13 @@ def test_save_talent_itp_under_typed_tree(tmp_path: Path):
     assert any(x["icp_id"] == "spain_engineers" for x in items)
     talent = next(x for x in items if x["icp_id"] == "spain_engineers")
     assert talent["campaign_type"] == "talent_search"
-    assert (
-        root / "clients" / "acme" / "talent_outreach" / "itps" / "spain_engineers" / "icp.json"
-    ).is_file()
+    assert (root / "clients" / "acme" / "itps" / "spain_engineers" / "icp.json").is_file()
 
 
-def test_legacy_flat_icps_still_list(tmp_path: Path):
-    """Existing clients with flat icps/ remain readable."""
+def test_legacy_typed_icps_still_list(tmp_path: Path):
+    """Existing clients with company_outreach/icps remain readable."""
     root = tmp_path
-    legacy = root / "clients" / "acme" / "icps" / "legacy_headhunt"
+    legacy = root / "clients" / "acme" / "company_outreach" / "icps" / "legacy_headhunt"
     legacy.mkdir(parents=True)
     (legacy / "icp.json").write_text(
         json.dumps({"job_titles": ["COO"], "company_size_min": 1, "company_size_max": 50}),
@@ -109,12 +105,10 @@ def test_extract_and_migrate_campaign(tmp_path: Path):
     icp_id = extract_icp_from_campaign(root, legacy)
     assert icp_id
     assert list_client_icps(root, "acme")
-    assert (
-        root / "clients" / "acme" / "company_outreach" / "icps" / icp_id / "icp.json"
-    ).is_file()
+    assert (root / "clients" / "acme" / "icps" / icp_id / "icp.json").is_file()
 
     dest = migrate_campaign_under_client(root, legacy)
-    assert dest == root / "clients" / "acme" / "company_outreach" / "campaigns" / "acme_outreach"
+    assert dest == root / "clients" / "acme" / "campaigns" / "in_progress" / "acme_outreach"
     assert (dest / "stages" / "01_raw_seeds.csv").is_file()
     meta = json.loads((dest / "campaign.json").read_text(encoding="utf-8"))
     assert meta["icp_id"] == icp_id
@@ -134,7 +128,7 @@ def test_resolve_prefers_stages_over_config_mirror(tmp_path: Path):
     (live / "stages").mkdir()
     (live / "stages" / "01_raw_seeds.csv").write_text("company_name\nX\n", encoding="utf-8")
 
-    mirror = root / "clients" / "acme" / "company_outreach" / "campaigns" / "acme_outreach"
+    mirror = root / "clients" / "acme" / "campaigns" / "in_progress" / "acme_outreach"
     mirror.mkdir(parents=True)
     (mirror / "campaign.json").write_text(
         json.dumps({"client_id": "acme", "campaign_type": "company_outreach"}),
@@ -146,14 +140,14 @@ def test_resolve_prefers_stages_over_config_mirror(tmp_path: Path):
     assert resolved.resolve() == live.resolve()
 
 
-def test_unique_icp_id_skips_legacy(tmp_path: Path):
+def test_unique_icp_id_skips_existing(tmp_path: Path):
     from agent.utils.client_store import unique_icp_id
 
     root = tmp_path
-    legacy = root / "clients" / "acme" / "icps" / "headhunting_us"
-    legacy.mkdir(parents=True)
-    (legacy / "icp.json").write_text("{}", encoding="utf-8")
-    (legacy / "meta.json").write_text(
+    existing = root / "clients" / "acme" / "icps" / "headhunting_us"
+    existing.mkdir(parents=True)
+    (existing / "icp.json").write_text("{}", encoding="utf-8")
+    (existing / "meta.json").write_text(
         json.dumps({"brief": "keep me", "campaign_type": "company_outreach"}),
         encoding="utf-8",
     )
@@ -169,7 +163,7 @@ def test_unique_icp_id_skips_legacy(tmp_path: Path):
         campaign_type="company_outreach",
         create_new=True,
     )
-    meta = json.loads((legacy / "meta.json").read_text(encoding="utf-8"))
+    meta = json.loads((existing / "meta.json").read_text(encoding="utf-8"))
     assert meta["brief"] == "keep me"
 
 
@@ -195,7 +189,7 @@ def test_sync_and_rename_under_client_folder(tmp_path: Path):
     )
 
     dest = sync_campaign_config_to_client(camp)
-    assert dest == data / "clients" / "acme" / "company_outreach" / "campaigns" / "demo_outreach"
+    assert dest == data / "clients" / "acme" / "campaigns" / "in_progress" / "demo_outreach"
     assert (dest / "icp.json").is_file()
 
     meta = set_campaign_display_name(camp, "Headhunting US 1-50")

@@ -41,6 +41,41 @@ def test_select_outreach_urls_priority_order():
     assert "https://acme.com/contact" not in plan.urls
 
 
+def test_select_news_press_without_blog():
+    """Sites with /news or /press-releases but no /blog still get those pages."""
+    mapped = [
+        "https://acme.com/about",
+        "https://acme.com/press-releases",
+        "https://acme.com/news/2026/launch",
+        "https://acme.com/careers",
+        "https://acme.com/services",
+    ]
+    plan = select_outreach_urls(mapped, "https://acme.com", max_pages=6)
+    assert plan.blog_url is None
+    assert plan.news_url == "https://acme.com/press-releases"
+    assert "https://acme.com/press-releases" in plan.urls
+    assert "https://acme.com/news/2026/launch" in plan.urls
+
+
+def test_select_newsroom_index():
+    mapped = ["https://acme.com/newsroom", "https://acme.com/about"]
+    plan = select_outreach_urls(mapped, "https://acme.com", max_pages=4)
+    assert plan.news_url == "https://acme.com/newsroom"
+
+
+def test_augment_adds_news_when_missing_from_map():
+    from agent.utils.website_outreach import augment_mapped_with_content_hubs
+
+    mapped = ["https://acme.com/about", "https://acme.com/services"]
+    out = augment_mapped_with_content_hubs(
+        mapped, "https://acme.com", probe=False
+    )
+    joined = " ".join(out)
+    assert "/news" in joined or "/press" in joined
+    plan = select_outreach_urls(out, "https://acme.com", max_pages=5)
+    assert plan.news_url is not None
+
+
 def test_select_skips_job_postings_and_blog_pagination():
     mapped = [
         "https://acme.com/careers/senior-engineer",

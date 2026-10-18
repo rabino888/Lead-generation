@@ -187,7 +187,8 @@ def _location_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _current_company(item: dict[str, Any]) -> tuple[str, str]:
+def _current_position_fields(item: dict[str, Any]) -> tuple[str, str, str]:
+    """Return (title, company_name, company_linkedin_url) from Short/Full payloads."""
     positions = item.get("currentPosition") or item.get("currentPositions") or []
     if isinstance(positions, dict):
         positions = [positions]
@@ -195,24 +196,36 @@ def _current_company(item: dict[str, Any]) -> tuple[str, str]:
         for pos in positions:
             if not isinstance(pos, dict):
                 continue
+            title = str(pos.get("title") or pos.get("jobTitle") or "").strip()
             name = str(pos.get("companyName") or pos.get("name") or "").strip()
             url = str(
                 pos.get("companyLinkedinUrl") or pos.get("companyUrl") or ""
             ).strip()
-            if name or url:
-                return name, url
+            if title or name or url:
+                return title, name, url
     experience = item.get("experience") or []
     if isinstance(experience, list) and experience:
         first = experience[0]
         if isinstance(first, dict):
             return (
+                str(first.get("title") or first.get("jobTitle") or "").strip(),
                 str(first.get("companyName") or "").strip(),
                 str(first.get("companyLinkedinUrl") or "").strip(),
             )
     return (
+        str(item.get("title") or item.get("jobTitle") or item.get("occupation") or "").strip(),
         str(item.get("companyName") or item.get("company") or "").strip(),
         str(item.get("companyUrl") or item.get("companyLinkedinUrl") or "").strip(),
     )
+
+
+def _full_name(item: dict[str, Any]) -> str:
+    direct = str(item.get("fullName") or item.get("name") or "").strip()
+    if direct:
+        return direct
+    first = str(item.get("firstName") or "").strip()
+    last = str(item.get("lastName") or "").strip()
+    return f"{first} {last}".strip()
 
 
 def items_from_apify_people(
@@ -226,36 +239,58 @@ def items_from_apify_people(
         if not isinstance(item, dict):
             continue
         nested = item.get("element") if isinstance(item.get("element"), dict) else item
-        candidates = [
-            nested.get("linkedinUrl"),
-            nested.get("profileUrl"),
-            nested.get("linkedin_url"),
-            nested.get("url"),
-        ]
+        # Prefer vanity publicIdentifier — HarvestAPI Short often puts opaque ACw
+        # member URNs in linkedinUrl, which Apollo people/match cannot enrich well.
+        candidates: list[Any] = []
         public_id = str(nested.get("publicIdentifier") or "").strip()
         if public_id and not public_id.startswith("http"):
             candidates.append(f"https://www.linkedin.com/in/{public_id}")
+        candidates.extend(
+            [
+                nested.get("linkedinUrl"),
+                nested.get("profileUrl"),
+                nested.get("linkedin_url"),
+                nested.get("url"),
+            ]
+        )
         linkedin_raw = ""
+        opaque_fallback = ""
         for cand in candidates:
             s = str(cand or "").strip()
-            if "linkedin.com/in/" in s.lower() or s.lower().startswith("/in/"):
-                linkedin_raw = s
-                break
+            if "linkedin.com/in/" not in s.lower() and not s.lower().startswith("/in/"):
+                continue
+            # Prefer first non-opaque /in/ URL
+            slug = s.rstrip("/").rsplit("/", 1)[-1]
+            if slug.startswith(("ACw", "ACo", "AEMA", "AEM")):
+                if not opaque_fallback:
+                    opaque_fallback = s
+                continue
+            linkedin_raw = s
+            break
+        if not linkedin_raw:
+            linkedin_raw = opaque_fallback
         if not linkedin_raw:
             continue
 
-        company_name, company_li = _current_company(nested)
+        pos_title, company_name, company_li = _current_position_fields(nested)
+        headline = str(
+            nested.get("headline") or nested.get("occupation") or pos_title or ""
+        ).strip()
+        title = str(
+            nested.get("title")
+            or nested.get("jobTitle")
+            or nested.get("occupation")
+            or pos_title
+            or ""
+        ).strip()
         row = person_row_from_mapping(
             {
                 "linkedin_url": linkedin_raw,
-                "full_name": nested.get("fullName") or nested.get("name") or "",
+                "full_name": _full_name(nested),
                 "first_name": nested.get("firstName") or "",
                 "last_name": nested.get("lastName") or "",
-                "headline": nested.get("headline") or nested.get("occupation") or "",
-                "title": nested.get("title")
-                or nested.get("jobTitle")
-                or nested.get("occupation")
-                or "",
+                "headline": headline,
+                "title": title,
                 "location": _location_text(
                     nested.get("location")
                     or nested.get("geoLocationName")
@@ -317,6 +352,12 @@ def scrape_linkedin_people(
         len(clean_urls),
     )
     run = client.actor(resolved_actor).call(run_input=run_input)
+    try:
+        from agent.utils.apify_spend import record_apify_run_billed
+
+        record_apify_run_billed(run)
+    except Exception as exc:  # noqa: BLE001 — never fail seed on cost bookkeeping
+        log.warning("Could not record Apify people-search spend: %s", exc)
     dataset_id = (
         run.default_dataset_id
         if hasattr(run, "default_dataset_id")

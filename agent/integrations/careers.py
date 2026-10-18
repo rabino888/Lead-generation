@@ -18,8 +18,8 @@ from __future__ import annotations
 
 import re
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import httpx
 
@@ -369,4 +369,249 @@ def pick_careers_portal_hop(
         host = urlparse(picked).netloc.lower()
         if host.startswith(("jobs.", "careers.", "talent.")):
             return picked
+    return None
+
+
+# Public job-board JSON. Used when a careers page only links out to Ashby,
+# Greenhouse, or Lever — scraping those apps often misses the listings.
+_ATS_SKIP_SLUGS = frozenset(
+    {"jobs", "job", "embed", "job_board", "job_app", "v1", "postings"}
+)
+_GENERIC_ROLE_TITLES = frozenset(
+    {
+        "careers",
+        "jobs",
+        "open roles",
+        "open positions",
+        "join us",
+        "we're hiring",
+        "we are hiring",
+    }
+)
+_MAX_ATS_ROLES = 40
+
+
+def ats_board_identity(url: str) -> Optional[tuple[str, str]]:
+    """
+    Return ('ashby'|'greenhouse'|'lever', board slug) for a job-board URL.
+
+    Single-posting URLs collapse to the board so the listing API returns
+    every open role, not one job.
+    """
+    raw = _clean_url(url or "")
+    if not raw or _is_rejected_careers_url(raw):
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    host = parsed.netloc.lower()
+    parts = [p for p in parsed.path.split("/") if p]
+    if "ashbyhq.com" in host:
+        if not parts or parts[0].lower() in _ATS_SKIP_SLUGS:
+            return None
+        return ("ashby", parts[0])
+    if "greenhouse.io" in host:
+        token = (parse_qs(parsed.query).get("for") or [""])[0].strip()
+        if token:
+            return ("greenhouse", token)
+        for part in parts:
+            if part.lower() in _ATS_SKIP_SLUGS or part.isdigit():
+                continue
+            return ("greenhouse", part)
+        return None
+    if "lever.co" in host:
+        for part in parts:
+            if part.lower() in _ATS_SKIP_SLUGS:
+                continue
+            return ("lever", part)
+        return None
+    return None
+
+
+def canonical_ats_board_url(url: str) -> Optional[str]:
+    ident = ats_board_identity(url)
+    if not ident:
+        return None
+    provider, slug = ident
+    safe = quote(slug, safe="-_.~")
+    if provider == "ashby":
+        return f"https://jobs.ashbyhq.com/{safe}"
+    if provider == "greenhouse":
+        return f"https://job-boards.greenhouse.io/{safe}"
+    if provider == "lever":
+        return f"https://jobs.lever.co/{safe}"
+    return None
+
+
+def clean_role_titles(titles: list[Any], *, limit: int = _MAX_ATS_ROLES) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in titles:
+        title = " ".join(str(raw or "").split())
+        if not title or len(title) > 140:
+            continue
+        if title.casefold() in _GENERIC_ROLE_TITLES:
+            continue
+        key = title.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(title)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def titles_from_ats_payload(provider: str, payload: Any) -> list[str]:
+    titles: list[str] = []
+    if provider == "ashby" and isinstance(payload, dict):
+        for job in payload.get("jobs") or []:
+            if not isinstance(job, dict) or job.get("isListed") is False:
+                continue
+            titles.append(job.get("title") or "")
+    elif provider == "greenhouse" and isinstance(payload, dict):
+        for job in payload.get("jobs") or []:
+            if isinstance(job, dict):
+                titles.append(job.get("title") or "")
+    elif provider == "lever" and isinstance(payload, list):
+        for job in payload:
+            if isinstance(job, dict):
+                titles.append(job.get("text") or job.get("title") or "")
+    return clean_role_titles(titles)
+
+
+def fetch_ats_open_roles(url: str) -> list[str]:
+    """Open-role titles from a public Ashby, Greenhouse, or Lever board. Empty on failure."""
+    ident = ats_board_identity(url)
+    if not ident:
+        return []
+    provider, slug = ident
+    safe = quote(slug, safe="-_.~")
+    try:
+        if provider == "ashby":
+            resp = httpx.get(
+                f"https://api.ashbyhq.com/posting-api/job-board/{safe}",
+                timeout=25,
+                follow_redirects=True,
+            )
+        elif provider == "greenhouse":
+            resp = httpx.get(
+                f"https://boards-api.greenhouse.io/v1/boards/{safe}/jobs",
+                timeout=25,
+                follow_redirects=True,
+            )
+        else:
+            resp = httpx.get(
+                f"https://api.lever.co/v0/postings/{safe}",
+                params={"mode": "json"},
+                timeout=25,
+                follow_redirects=True,
+            )
+    except Exception as exc:
+        log.warning("ATS job board fetch failed for %s: %s", url, exc)
+        return []
+    if resp.status_code != 200:
+        log.info("ATS job board %s returned HTTP %s for %s", provider, resp.status_code, slug)
+        return []
+    try:
+        payload = resp.json()
+    except Exception:
+        return []
+    titles = titles_from_ats_payload(provider, payload)
+    if titles:
+        log.info("ATS %s/%s: %d open roles", provider, slug, len(titles))
+    return titles
+
+
+def open_roles_from_ats(url: Optional[str]) -> Optional[dict[str, Any]]:
+    """
+    Structured listings for an ATS URL.
+
+    Returns careers_url, open_roles, and a short markdown list — or None.
+    """
+    if not url:
+        return None
+    canonical = canonical_ats_board_url(url)
+    if not canonical:
+        return None
+    titles = fetch_ats_open_roles(canonical)
+    if not titles:
+        return None
+    return {
+        "careers_url": canonical,
+        "open_roles": titles,
+        "markdown": "\n".join(f"- {title}" for title in titles),
+    }
+
+
+_ICIMS_JOB = re.compile(r"/jobs/\d+/([^/?#\"']+)/job", re.I)
+_SMALL_WORDS = frozenset({"i", "ii", "iii", "iv", "qc", "qa"})
+
+
+def _title_from_slug(slug: str) -> str:
+    text = unquote(slug).replace("&amp;", " and ").replace("-", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    words: list[str] = []
+    for word in text.split():
+        if word.casefold() in _SMALL_WORDS:
+            words.append(word.upper())
+        else:
+            words.append(word[:1].upper() + word[1:].lower())
+    return " ".join(words)
+
+
+def titles_from_icims_html(html: str) -> list[str]:
+    return clean_role_titles([_title_from_slug(slug) for slug in _ICIMS_JOB.findall(html or "")])
+
+
+def icims_board_url(url: str) -> Optional[str]:
+    raw = _clean_url(url or "")
+    if "://" not in raw:
+        raw = "https://" + raw
+    host = urlparse(raw).netloc.lower()
+    if "icims.com" not in host:
+        return None
+    return f"https://{host}/jobs/search?ss=1&in_iframe=1"
+
+
+def fetch_icims_open_roles(url: str) -> list[str]:
+    """Open-role titles from an iCIMS board search page (titles are in the job URLs)."""
+    board = icims_board_url(url)
+    if not board:
+        return []
+    titles: list[str] = []
+    for page in range(4):
+        page_url = board if page == 0 else f"{board}&pr={page}"
+        try:
+            resp = httpx.get(
+                page_url,
+                timeout=25,
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+        except Exception as exc:
+            log.warning("iCIMS fetch failed for %s: %s", page_url, exc)
+            break
+        if resp.status_code != 200:
+            break
+        found = titles_from_icims_html(resp.text)
+        if not found:
+            break
+        before = len(titles)
+        titles = clean_role_titles(titles + found)
+        if len(titles) == before:
+            break
+    if titles:
+        log.info("iCIMS %s: %d open roles", urlparse(board).netloc, len(titles))
+    return titles
+
+
+def preferred_ats_board_url(markdown: Optional[str], website: str) -> Optional[str]:
+    """Highest-ranked Ashby/Greenhouse/Lever board linked from crawled markdown."""
+    if not markdown or not website:
+        return None
+    for url in extract_careers_links(markdown, website):
+        canonical = canonical_ats_board_url(url)
+        if canonical:
+            return canonical
     return None

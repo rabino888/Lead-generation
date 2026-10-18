@@ -3,18 +3,20 @@ Client-first data layout:
 
   data/clients/{client_id}/
     client.json
-    company_outreach/
-      icps/{icp_id}/
-        meta.json     — display_name, brief, campaign_type, cross-refs
-        icp.json      — targeting rules (1 ICP → many campaigns)
-      campaigns/{campaign_id}/
-    talent_outreach/
-      itps/{itp_id}/  — same meta.json + icp.json shape
-      campaigns/{campaign_id}/
+    icps/{icp_id}/              # company-outreach library ICPs
+      meta.json
+      icp.json
+    itps/{itp_id}/              # talent-search library profiles
+    campaigns/
+      in_progress/{campaign_id}/
+      saved_for_later/{campaign_id}/
+      completed/
+        company_outreach/{campaign_id}/
+        talent/{campaign_id}/
 
-Legacy flat trees are still read for existing data:
-  data/clients/{client_id}/icps/{id}/
-  data/clients/{client_id}/campaigns/{id}/
+Legacy trees are still read (not written for new clients):
+  company_outreach/icps|campaigns, talent_outreach/itps|campaigns
+  campaigns/{id} flat under the client (pre-status)
 
 Legacy pipeline folders under data/campaigns/{id}/ are still resolved
 (and may be junctions into the client tree).
@@ -37,10 +39,22 @@ CAMPAIGN_SYNC_FILES = (
     "enrichment_plan.json",
 )
 
+# Legacy typed profile roots (still scanned for existing data)
 _PROFILE_COMPANY = "company_outreach"
 _PROFILE_TALENT = "talent_outreach"
 _LIB_ICP = "icps"
 _LIB_ITP = "itps"
+
+CAMPAIGN_STATUS_IN_PROGRESS = "in_progress"
+CAMPAIGN_STATUS_SAVED = "saved_for_later"
+CAMPAIGN_STATUS_COMPLETED = "completed"
+CAMPAIGN_STATUSES = (
+    CAMPAIGN_STATUS_IN_PROGRESS,
+    CAMPAIGN_STATUS_SAVED,
+    CAMPAIGN_STATUS_COMPLETED,
+)
+_COMPLETED_TYPE_COMPANY = "company_outreach"
+_COMPLETED_TYPE_TALENT = "talent"
 
 
 def data_root(explicit: Optional[Path] = None) -> Path:
@@ -55,11 +69,20 @@ def slug_id(value: str, *, fallback: str = "item") -> str:
 
 
 def profile_folder(campaign_type: str) -> str:
+    """Legacy typed profile folder (company_outreach / talent_outreach)."""
     return _PROFILE_TALENT if (campaign_type or "").strip() == "talent_search" else _PROFILE_COMPANY
 
 
 def library_folder(campaign_type: str) -> str:
     return _LIB_ITP if (campaign_type or "").strip() == "talent_search" else _LIB_ICP
+
+
+def completed_type_folder(campaign_type: str) -> str:
+    return (
+        _COMPLETED_TYPE_TALENT
+        if (campaign_type or "").strip() == "talent_search"
+        else _COMPLETED_TYPE_COMPANY
+    )
 
 
 def client_dir(root: Path, client_id: str) -> Path:
@@ -73,23 +96,19 @@ def icp_dir(
     *,
     campaign_type: str = "company_outreach",
 ) -> Path:
-    """Canonical write path for a library ICP/ITP under the typed profile tree."""
-    return (
-        client_dir(root, client_id)
-        / profile_folder(campaign_type)
-        / library_folder(campaign_type)
-        / icp_id
-    )
+    """Canonical write path: flat icps/ or itps/ under the client."""
+    lib = library_folder(campaign_type)
+    return client_dir(root, client_id) / lib / icp_id
 
 
 def find_icp_dir(root: Path, client_id: str, icp_id: str) -> Optional[Path]:
-    """Locate a library ICP/ITP: typed folders first, then legacy flat icps/."""
+    """Locate a library ICP/ITP: flat first, then legacy typed folders."""
     base = client_dir(root, client_id)
     candidates = (
+        base / _LIB_ICP / icp_id,
+        base / _LIB_ITP / icp_id,
         base / _PROFILE_COMPANY / _LIB_ICP / icp_id,
         base / _PROFILE_TALENT / _LIB_ITP / icp_id,
-        base / _LIB_ICP / icp_id,
-        # Tolerant of accidental cross-nesting
         base / _PROFILE_COMPANY / _LIB_ITP / icp_id,
         base / _PROFILE_TALENT / _LIB_ICP / icp_id,
     )
@@ -105,14 +124,14 @@ def client_campaign_dir(
     campaign_id: str,
     *,
     campaign_type: str = "company_outreach",
+    status: str = CAMPAIGN_STATUS_IN_PROGRESS,
 ) -> Path:
-    """Canonical write path for a campaign under the typed profile tree."""
-    return (
-        client_dir(root, client_id)
-        / profile_folder(campaign_type)
-        / "campaigns"
-        / campaign_id
-    )
+    """Canonical write path under campaigns/{status}/…"""
+    st = (status or CAMPAIGN_STATUS_IN_PROGRESS).strip() or CAMPAIGN_STATUS_IN_PROGRESS
+    base = client_dir(root, client_id) / "campaigns"
+    if st == CAMPAIGN_STATUS_COMPLETED:
+        return base / CAMPAIGN_STATUS_COMPLETED / completed_type_folder(campaign_type) / campaign_id
+    return base / st / campaign_id
 
 
 def _campaign_dir_score(path: Path) -> int:
@@ -155,10 +174,21 @@ def _pick_best_campaign_dir(candidates: list[Path]) -> Optional[Path]:
 
 def find_client_campaign_dir(root: Path, client_id: str, campaign_id: str) -> Optional[Path]:
     base = client_dir(root, client_id)
+    camps = base / "campaigns"
     candidates = [
+        camps / CAMPAIGN_STATUS_IN_PROGRESS / campaign_id,
+        camps / CAMPAIGN_STATUS_SAVED / campaign_id,
+        camps / CAMPAIGN_STATUS_COMPLETED / _COMPLETED_TYPE_COMPANY / campaign_id,
+        camps / CAMPAIGN_STATUS_COMPLETED / _COMPLETED_TYPE_TALENT / campaign_id,
+        # Optional typed nesting under non-completed statuses
+        camps / CAMPAIGN_STATUS_IN_PROGRESS / _COMPLETED_TYPE_COMPANY / campaign_id,
+        camps / CAMPAIGN_STATUS_IN_PROGRESS / _COMPLETED_TYPE_TALENT / campaign_id,
+        camps / CAMPAIGN_STATUS_SAVED / _COMPLETED_TYPE_COMPANY / campaign_id,
+        camps / CAMPAIGN_STATUS_SAVED / _COMPLETED_TYPE_TALENT / campaign_id,
+        # Legacy typed + flat
         base / _PROFILE_COMPANY / "campaigns" / campaign_id,
         base / _PROFILE_TALENT / "campaigns" / campaign_id,
-        base / "campaigns" / campaign_id,
+        camps / campaign_id,
     ]
     return _pick_best_campaign_dir(candidates)
 
@@ -222,14 +252,18 @@ def ensure_client(
 ) -> Path:
     path = client_dir(root, client_id)
     path.mkdir(parents=True, exist_ok=True)
-    # Canonical typed trees
-    (path / _PROFILE_COMPANY / _LIB_ICP).mkdir(parents=True, exist_ok=True)
-    (path / _PROFILE_COMPANY / "campaigns").mkdir(parents=True, exist_ok=True)
-    (path / _PROFILE_TALENT / _LIB_ITP).mkdir(parents=True, exist_ok=True)
-    (path / _PROFILE_TALENT / "campaigns").mkdir(parents=True, exist_ok=True)
-    # Legacy flat dirs (compat for existing data + readers)
+    # Canonical layout
     (path / _LIB_ICP).mkdir(exist_ok=True)
-    (path / "campaigns").mkdir(exist_ok=True)
+    (path / _LIB_ITP).mkdir(exist_ok=True)
+    camps = path / "campaigns"
+    (camps / CAMPAIGN_STATUS_IN_PROGRESS).mkdir(parents=True, exist_ok=True)
+    (camps / CAMPAIGN_STATUS_SAVED).mkdir(parents=True, exist_ok=True)
+    (camps / CAMPAIGN_STATUS_COMPLETED / _COMPLETED_TYPE_COMPANY).mkdir(
+        parents=True, exist_ok=True
+    )
+    (camps / CAMPAIGN_STATUS_COMPLETED / _COMPLETED_TYPE_TALENT).mkdir(
+        parents=True, exist_ok=True
+    )
     meta_path = path / "client.json"
     meta = _read_json(meta_path, {})
     if not isinstance(meta, dict):
@@ -261,9 +295,10 @@ def _iter_library_dirs(root: Path, client_id: str) -> list[tuple[Path, str]]:
     base = client_dir(root, client_id)
     out: list[tuple[Path, str]] = []
     typed = (
+        (base / _LIB_ICP, "company_outreach"),
+        (base / _LIB_ITP, "talent_search"),
         (base / _PROFILE_COMPANY / _LIB_ICP, "company_outreach"),
         (base / _PROFILE_TALENT / _LIB_ITP, "talent_search"),
-        (base / _LIB_ICP, "company_outreach"),  # legacy flat
     )
     seen: set[Path] = set()
     for folder, default_ctype in typed:
@@ -413,7 +448,7 @@ def save_icp(
     ensure_client(root, client_id, client_name)
     ctype = campaign_type or "company_outreach"
     if create_new:
-        # Always write under the typed library — never overwrite a legacy same-id folder.
+        # Always write under the canonical flat library — never overwrite a legacy same-id folder.
         path = icp_dir(root, client_id, icp_id, campaign_type=ctype)
     else:
         existing = find_icp_dir(root, client_id, icp_id)
@@ -453,7 +488,7 @@ def unique_icp_id(
     *,
     campaign_type: str = "company_outreach",
 ) -> str:
-    """Allocate an ICP/ITP id unused in any library location (typed + legacy)."""
+    """Allocate an ICP/ITP id unused in any library location (flat + legacy typed)."""
     base = (preferred or "item")[:64] or "item"
     for n in range(0, 100):
         cand = base if n == 0 else f"{base}_{n + 1}"[:64]
@@ -482,21 +517,68 @@ def snapshot_icp_into_campaign(
     _write_json(campaign_dir / "icp.json", snap)
 
 
+def _looks_like_campaign_dir(path: Path) -> bool:
+    if not path.is_dir() or path.name.startswith("."):
+        return False
+    if path.name in CAMPAIGN_STATUSES or path.name in (
+        _COMPLETED_TYPE_COMPANY,
+        _COMPLETED_TYPE_TALENT,
+    ):
+        return False
+    return any(
+        (path / name).exists()
+        for name in (
+            "campaign.json",
+            "icp.json",
+            "list_run.json",
+            "enrichment_plan.json",
+            "seed_sources.json",
+            "stages",
+        )
+    )
+
+
+def _collect_campaign_dirs_under(folder: Path, into: dict[str, list[Path]]) -> None:
+    if not folder.is_dir():
+        return
+    for p in folder.iterdir():
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        if p.name in (_COMPLETED_TYPE_COMPANY, _COMPLETED_TYPE_TALENT) and not _looks_like_campaign_dir(p):
+            for child in p.iterdir():
+                if _looks_like_campaign_dir(child):
+                    into.setdefault(child.name, []).append(child)
+            continue
+        if _looks_like_campaign_dir(p):
+            into.setdefault(p.name, []).append(p)
+
+
 def list_client_campaign_dirs(root: Path, client_id: str) -> list[Path]:
     base = client_dir(root, client_id)
-    folders = (
+    by_id: dict[str, list[Path]] = {}
+    camps = base / "campaigns"
+    if camps.is_dir():
+        for status in (CAMPAIGN_STATUS_IN_PROGRESS, CAMPAIGN_STATUS_SAVED):
+            _collect_campaign_dirs_under(camps / status, by_id)
+        completed = camps / CAMPAIGN_STATUS_COMPLETED
+        if completed.is_dir():
+            for type_name in (_COMPLETED_TYPE_COMPANY, _COMPLETED_TYPE_TALENT):
+                _collect_campaign_dirs_under(completed / type_name, by_id)
+            # stray campaign folders directly under completed/
+            for p in completed.iterdir():
+                if _looks_like_campaign_dir(p):
+                    by_id.setdefault(p.name, []).append(p)
+        # Legacy flat campaigns sitting next to status folders
+        for p in camps.iterdir():
+            if p.name in CAMPAIGN_STATUSES:
+                continue
+            if _looks_like_campaign_dir(p):
+                by_id.setdefault(p.name, []).append(p)
+    for folder in (
         base / _PROFILE_COMPANY / "campaigns",
         base / _PROFILE_TALENT / "campaigns",
-        base / "campaigns",  # legacy flat
-    )
-    by_id: dict[str, list[Path]] = {}
-    for folder in folders:
-        if not folder.is_dir():
-            continue
-        for p in folder.iterdir():
-            if not p.is_dir() or p.name.startswith("."):
-                continue
-            by_id.setdefault(p.name, []).append(p)
+    ):
+        _collect_campaign_dirs_under(folder, by_id)
     out: list[Path] = []
     for cid, cands in by_id.items():
         picked = _pick_best_campaign_dir(cands)
@@ -553,18 +635,24 @@ def list_all_campaign_dirs(root: Path) -> list[Path]:
 
 
 def _campaign_already_under_client(campaign_dir: Path, client_id: str) -> bool:
-    """True when campaign_dir is …/clients/{client_id}/…/campaigns/{id}."""
+    """True when campaign_dir is under …/clients/{client_id}/…/campaigns/…"""
     try:
-        parts = campaign_dir.resolve().parts
+        parts = list(campaign_dir.resolve().parts)
     except OSError:
-        parts = campaign_dir.parts
-    if "clients" not in parts or campaign_dir.parent.name != "campaigns":
+        parts = list(campaign_dir.parts)
+    if "clients" not in parts or "campaigns" not in parts:
         return False
     try:
         idx = parts.index("clients")
     except ValueError:
         return False
-    return idx + 1 < len(parts) and parts[idx + 1] == client_id
+    if idx + 1 >= len(parts) or parts[idx + 1] != client_id:
+        return False
+    try:
+        cidx = parts.index("campaigns", idx + 1)
+    except ValueError:
+        return False
+    return cidx < len(parts) - 1
 
 
 def sync_campaign_config_to_client(
@@ -618,6 +706,83 @@ def set_campaign_display_name(campaign_dir: Path, display_name: str) -> dict[str
     return meta
 
 
+def move_campaign_to_status(
+    root: Path,
+    client_id: str,
+    campaign_id: str,
+    *,
+    status: str,
+    campaign_type: Optional[str] = None,
+) -> Path:
+    """
+    Move a campaign between status buckets (in_progress / saved_for_later / completed/…).
+
+    Updates ``campaign.json`` status and refreshes the ``data/campaigns/{id}`` junction.
+    """
+    root = Path(root)
+    st = (status or "").strip()
+    if st not in CAMPAIGN_STATUSES:
+        raise ValueError(f"status must be one of {CAMPAIGN_STATUSES}")
+
+    src = find_client_campaign_dir(root, client_id, campaign_id)
+    if src is None or not src.is_dir():
+        raise FileNotFoundError(f"Campaign not found: {client_id}/{campaign_id}")
+
+    meta = _read_json(src / "campaign.json", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    ctype = (
+        (campaign_type or "").strip()
+        or str(meta.get("campaign_type") or "company_outreach").strip()
+        or "company_outreach"
+    )
+    dest = client_campaign_dir(
+        root, client_id, campaign_id, campaign_type=ctype, status=st
+    )
+    if src.resolve() == dest.resolve():
+        meta["status"] = st
+        meta["campaign_type"] = ctype
+        _write_json(src / "campaign.json", meta)
+        return src
+
+    if dest.exists():
+        raise FileExistsError(f"Destination already exists: {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+    meta = _read_json(dest / "campaign.json", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    meta["status"] = st
+    meta["campaign_type"] = ctype
+    meta["campaign_id"] = campaign_id
+    meta["client_id"] = client_id
+    _write_json(dest / "campaign.json", meta)
+
+    # Refresh legacy junction under data/campaigns/{id}
+    legacy = legacy_campaign_dir(root, campaign_id)
+    try:
+        if legacy.exists() or legacy.is_symlink():
+            if legacy.is_dir() and not legacy.is_symlink():
+                # Real folder should not be deleted; only junctions/links
+                if os.name == "nt":
+                    import subprocess
+
+                    subprocess.run(
+                        ["cmd", "/c", "rmdir", str(legacy)],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                else:
+                    legacy.unlink(missing_ok=True)  # type: ignore[arg-type]
+            else:
+                legacy.unlink(missing_ok=True)
+    except OSError:
+        pass
+    _try_junction(legacy, dest)
+    return dest
+
+
 def extract_icp_from_campaign(
     root: Path,
     campaign_dir: Path,
@@ -648,9 +813,7 @@ def extract_icp_from_campaign(
             fallback=campaign_dir.name,
         )
     ensure_client(root, client_id, client_name)
-    lib_parent = (
-        client_dir(root, client_id) / profile_folder(ctype) / library_folder(ctype)
-    )
+    lib_parent = client_dir(root, client_id) / library_folder(ctype)
     lib_parent.mkdir(parents=True, exist_ok=True)
     new_id = unique_id(lib_parent, preferred)
     icp_doc = _read_json(campaign_dir / "icp.json", {})
@@ -674,7 +837,7 @@ def extract_icp_from_campaign(
 
 def migrate_campaign_under_client(root: Path, campaign_dir: Path) -> Path:
     """
-    Move legacy data/campaigns/{id} → data/clients/{cid}/{profile}/campaigns/{id}
+    Move legacy data/campaigns/{id} → data/clients/{cid}/campaigns/in_progress/{id}
     and extract/link ICP. Leaves a directory junction at the legacy path when possible.
     """
     root = Path(root)
@@ -785,10 +948,77 @@ def migrate_all_legacy_campaigns(root: Optional[Path] = None) -> dict[str, Any]:
 
 def migrate_legacy_library_icps(root: Optional[Path] = None) -> dict[str, Any]:
     """
-    Move data/clients/{id}/icps/{icp} → company_outreach/icps/{icp}
-    (or talent_outreach/itps when meta.campaign_type is talent_search).
+    Move typed library folders into flat client libs:
+      company_outreach/icps/{id} → icps/{id}
+      talent_outreach/itps/{id}  → itps/{id}
 
-    Leaves nothing at the legacy path once moved. Safe to re-run.
+    Leaves nothing at the typed path once moved. Safe to re-run.
+    """
+    root = data_root(root)
+    clients_root = Path(root) / "clients"
+    moved: list[str] = []
+    skipped: list[str] = []
+    errors: list[str] = []
+    if not clients_root.is_dir():
+        return {"moved": moved, "skipped": skipped, "errors": errors}
+
+    typed_sources = (
+        (_PROFILE_COMPANY, _LIB_ICP, "company_outreach"),
+        (_PROFILE_TALENT, _LIB_ITP, "talent_search"),
+        (_PROFILE_COMPANY, _LIB_ITP, "talent_search"),
+        (_PROFILE_TALENT, _LIB_ICP, "company_outreach"),
+    )
+
+    for client_dir_path in sorted(clients_root.iterdir()):
+        if not client_dir_path.is_dir() or client_dir_path.name.startswith("."):
+            continue
+        cid = client_dir_path.name
+        for profile, lib, default_ctype in typed_sources:
+            src_root = client_dir_path / profile / lib
+            if not src_root.is_dir():
+                continue
+            for icp_folder in sorted(src_root.iterdir()):
+                if not icp_folder.is_dir() or icp_folder.name.startswith("."):
+                    continue
+                icp_id = icp_folder.name
+                meta = _read_json(icp_folder / "meta.json", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                ctype = str(meta.get("campaign_type") or default_ctype)
+                dest = icp_dir(root, cid, icp_id, campaign_type=ctype)
+                key = f"{cid}/{profile}/{lib}/{icp_id}"
+                try:
+                    if dest.resolve() == icp_folder.resolve():
+                        skipped.append(key)
+                        continue
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.exists():
+                        # Prefer keeping flat copy; drop typed duplicate
+                        shutil.rmtree(icp_folder)
+                        skipped.append(f"{key} (flat exists)")
+                    else:
+                        shutil.move(str(icp_folder), str(dest))
+                        meta2 = _read_json(dest / "meta.json", {})
+                        if isinstance(meta2, dict) and not meta2.get("campaign_type"):
+                            meta2["campaign_type"] = ctype
+                            _write_json(dest / "meta.json", meta2)
+                        moved.append(key)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{key}: {exc}")
+            try:
+                if src_root.is_dir() and not any(src_root.iterdir()):
+                    src_root.rmdir()
+            except OSError:
+                pass
+
+    return {"moved": moved, "skipped": skipped, "errors": errors}
+
+
+def migrate_legacy_typed_campaigns(root: Optional[Path] = None) -> dict[str, Any]:
+    """
+    Move company_outreach|talent_outreach/campaigns/{id}
+    → campaigns/in_progress/{id} (or completed/{type} when status is set).
+    Safe to re-run.
     """
     root = data_root(root)
     clients_root = Path(root) / "clients"
@@ -802,43 +1032,66 @@ def migrate_legacy_library_icps(root: Optional[Path] = None) -> dict[str, Any]:
         if not client_dir_path.is_dir() or client_dir_path.name.startswith("."):
             continue
         cid = client_dir_path.name
-        legacy = client_dir_path / _LIB_ICP
-        if not legacy.is_dir():
-            continue
-        for icp_folder in sorted(legacy.iterdir()):
-            if not icp_folder.is_dir() or icp_folder.name.startswith("."):
+        for profile, default_ctype in (
+            (_PROFILE_COMPANY, "company_outreach"),
+            (_PROFILE_TALENT, "talent_search"),
+        ):
+            src_root = client_dir_path / profile / "campaigns"
+            if not src_root.is_dir():
                 continue
-            icp_id = icp_folder.name
-            meta = _read_json(icp_folder / "meta.json", {})
-            if not isinstance(meta, dict):
-                meta = {}
-            ctype = str(meta.get("campaign_type") or "company_outreach")
-            dest = icp_dir(root, cid, icp_id, campaign_type=ctype)
-            key = f"{cid}/{icp_id}"
-            try:
-                if dest.resolve() == icp_folder.resolve():
-                    skipped.append(key)
+            for camp in sorted(src_root.iterdir()):
+                if not _looks_like_campaign_dir(camp):
                     continue
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                if dest.exists():
-                    # Prefer keeping typed copy; drop legacy duplicate
-                    shutil.rmtree(icp_folder)
-                    skipped.append(f"{key} (typed exists)")
-                else:
-                    shutil.move(str(icp_folder), str(dest))
-                    # Ensure meta has campaign_type
-                    meta2 = _read_json(dest / "meta.json", {})
-                    if isinstance(meta2, dict) and not meta2.get("campaign_type"):
-                        meta2["campaign_type"] = ctype
-                        _write_json(dest / "meta.json", meta2)
-                    moved.append(key)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(f"{key}: {exc}")
-        # Remove empty legacy icps/ folder
-        try:
-            if legacy.is_dir() and not any(legacy.iterdir()):
-                legacy.rmdir()
-        except OSError:
-            pass
+                meta = _read_json(camp / "campaign.json", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                ctype = str(meta.get("campaign_type") or default_ctype)
+                status = str(meta.get("status") or CAMPAIGN_STATUS_IN_PROGRESS)
+                if status not in CAMPAIGN_STATUSES:
+                    status = CAMPAIGN_STATUS_IN_PROGRESS
+                dest = client_campaign_dir(
+                    root, cid, camp.name, campaign_type=ctype, status=status
+                )
+                key = f"{cid}/{profile}/campaigns/{camp.name}"
+                try:
+                    if dest.resolve() == camp.resolve():
+                        skipped.append(key)
+                        continue
+                    ensure_client(root, cid, str(meta.get("client_name") or cid))
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    if dest.exists():
+                        _merge_tree(camp, dest)
+                        shutil.rmtree(camp)
+                        skipped.append(f"{key} (merged into status)")
+                    else:
+                        shutil.move(str(camp), str(dest))
+                        moved.append(key)
+                    # Refresh legacy junction if present
+                    legacy = legacy_campaign_dir(root, dest.name)
+                    if legacy.exists():
+                        try:
+                            if os.name == "nt":
+                                import subprocess
+
+                                # Remove junction / empty dir without deleting target
+                                subprocess.run(
+                                    ["cmd", "/c", "rmdir", str(legacy)],
+                                    check=False,
+                                    capture_output=True,
+                                    text=True,
+                                )
+                            elif legacy.is_symlink():
+                                legacy.unlink()
+                        except OSError:
+                            pass
+                    if not legacy.exists():
+                        _try_junction(legacy, dest)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{key}: {exc}")
+            try:
+                if src_root.is_dir() and not any(src_root.iterdir()):
+                    src_root.rmdir()
+            except OSError:
+                pass
 
     return {"moved": moved, "skipped": skipped, "errors": errors}
