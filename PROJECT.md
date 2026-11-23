@@ -102,6 +102,16 @@ seed_sources.json  →  scrape  →  match_campaign_icp.py  →  dedup + pre_apo
 
 Entry points: `scripts/run_seed_source.py`, `scripts/match_campaign_icp.py`,
 independent `scripts/stage_*.py`, `scripts/run_deterministic_campaign.py`.
+
+**Autopilot** (`scripts/autopilot.py`, `GET /autopilot`): one company URL, three
+human gates. Research writes a plan and waits. Approval runs seed → ICP match →
+dedupe, then waits so the companies can be checked. The next approval runs
+contacts and enrichment, then waits again. The outreach sequence is optional at
+that last gate (`--generate-sequence`); skipping it keeps the list. Each pause
+stores an assistant note (findings, sample rows, a suggested input change).
+Failed checkers retry with a bounded input change and do not weaken the checker.
+Sequence generation shells out to outreach-content-agent (`OUTREACH_REPO`) and
+never calls `deliver`.
 Post-run cost: `scripts/build_cost_dashboard.py` → `scripts/serve_cost_dashboard.py`
 (or `GET /dashboard` on `uvicorn main:app`).
 
@@ -160,6 +170,7 @@ Lead generation/
 │   ├── serve_cost_dashboard.py      Local HTTP server for /dashboard (port 8765)
 │   ├── build_campaign_cost_report.py Per-campaign v4 report or --ledger SPA index
 │   ├── open_campaign_cost_dashboard.py  Build + open campaign report or --ledger
+│   ├── autopilot.py                 URL → plan → companies → optional sequence
 │   ├── stage_*.py                   Independent stage CLIs
 │   ├── upload_campaign_enriched.py
 │   ├── request_apollo_phone_reveals.py   Async Apollo phone reveal requests
@@ -167,7 +178,8 @@ Lead generation/
 ├── agent/dashboard/
 │   ├── routes.py                    GET /dashboard SPA + API
 │   ├── builder_routes.py            GET /builder create/edit questionnaire
-│   └── static/                      dashboard.html, builder.html, portal.css
+│   ├── autopilot_routes.py          GET /autopilot plan / companies / sequence gates
+│   └── static/                      dashboard.html, builder.html, autopilot.html, portal.css
 ├── .env                             Local secrets (never committed)
 ├── requirements.txt
 ├── railway.toml

@@ -87,6 +87,32 @@ python scripts/stage_qa_flags.py --campaign {campaign_id}
 
 Or orchestrate with `scripts/run_deterministic_campaign.py` / `POST /run` (curated seeds).
 
+### Autopilot (URL → plan → companies → optional sequence)
+
+Three human gates. The outreach sequence is off unless you ask for it at the last gate. Nothing is sent.
+
+```powershell
+python scripts/autopilot.py plan --url https://example.com
+python scripts/autopilot.py approve --run ap_... --gate plan
+python scripts/autopilot.py approve --run ap_... --gate companies
+python scripts/autopilot.py approve --run ap_... --gate sequence
+python scripts/autopilot.py approve --run ap_... --gate sequence --generate-sequence
+```
+
+The same pauses are on `/autopilot` (also linked from the ledger and the builder).
+
+| Gate | What you review | What approval runs next |
+|------|-----------------|-------------------------|
+| Plan | Seed source, ICP, enrichment, cost cap | Seed → ICP match → dedupe |
+| Companies | The kept companies | Contacts → enrichment |
+| Sequence | The enriched list | Optional sequence draft, or stop |
+
+Each gate has an assistant note: what it sees, and a change it would try. Notes do not relax the checkers. Inside a stretch, a failed checker can still adjust inputs and retry (bounded, logged, under the spend cap). Learnings that helped are stored under `data/autopilot/learnings/` and `data/clients/{id}/autopilot_learnings.json`.
+
+Set `OUTREACH_REPO` to a checkout of outreach-content-agent before `--generate-sequence`. The draft uses that repo's CLI (`sequence`, `kit`, `generate --dry-run` or `render`/`verify`). `deliver` is not called.
+
+`python scripts/autopilot.py revise --run ap_... --notes "..."` rebuilds the plan from your notes. Add `--rerun` to repeat the stretch that just paused.
+
 **Seed sources** (`--source`): `csv_ingest` (free), `linkedin_companies` (company search),
 `google_search` (web SERP queries via Apify `apify/google-search-scraper`, one seed per
 registrable domain, ~$0.14 per 150 seeds), `google_maps` (local businesses). Queries,
@@ -155,7 +181,8 @@ for seeding (far more expensive than enrichment).
 
 ```
 agent/
-  dashboard/        # Ledger + builder UI (FastAPI routes + static)
+  autopilot/        # URL → three approval gates → optional sequence
+  dashboard/        # Ledger + builder + autopilot UI
   integrations/     # Apollo, Firecrawl, Apify, LLM, Sheets
   stages/           # Pipeline stages
   utils/            # ICP rules, client_store, cost dashboard, scoring
