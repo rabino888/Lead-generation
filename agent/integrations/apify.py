@@ -22,6 +22,8 @@ Actors used:
                                  Do NOT use afanasenko/linkedin-jobs-scraper — burned
                                  $6.27/53 empty SUCCEEDED runs on 2026-08-25.
                                  Candidate open-jobs: gtgyani206/linkedin-company-scraper
+                                 (2026-11-11: LinkedIn HTTP 999 on 50 UK insurers;
+                                 a FAILED run is unknown, not "not hiring".)
                                  Seed jobs actor (optional): curious_coder/linkedin-jobs-scraper
                                  with jobs *search* URLs (not /jobs/view/ or company /jobs/).
 """
@@ -61,16 +63,36 @@ def _actor_dataset_items(client, run) -> list[dict]:
         if hasattr(run, "default_dataset_id")
         else run.get("defaultDatasetId")
     )
-    return list(client.dataset(dataset_id).iterate_items())
+    items = list(client.dataset(dataset_id).iterate_items())
+    try:
+        from agent.utils.raw_replies import store_raw_reply
+
+        store_raw_reply("apify.dataset", {"items": items}, key=str(dataset_id or ""))
+    except Exception:
+        pass
+    return items
 
 
 def _normalize_linkedin_url(url: Optional[str]) -> Optional[str]:
+    """Canonical LinkedIn URL.
+
+    Apollo often stores ``http://www.linkedin.com/...``. The company-jobs actor
+    rejects anything that is not ``https://www.linkedin.com/company/...``.
+    """
     if not url:
         return None
     url = url.strip()
     if not url.startswith("http"):
         url = f"https://{url}"
-    return url.split("?")[0].rstrip("/")
+    if url.startswith("http://"):
+        url = "https://" + url[len("http://"):]
+    url = url.split("?")[0].split("#")[0].rstrip("/")
+    rest = url[len("https://"):] if url.startswith("https://") else url
+    host, _, path = rest.partition("/")
+    host = host.lower()
+    if host.endswith(".linkedin.com") or host == "linkedin.com":
+        host = "www.linkedin.com"
+    return f"https://{host}/{path}" if path else f"https://{host}"
 
 
 def _skip_linkedin_posts() -> bool:
@@ -861,21 +883,31 @@ def get_linkedin_company_jobs_batch(
             }
         run = client.actor(actor_id).call(run_input=run_input)
         _record_apify_run(run)
+        status = ""
+        if isinstance(run, dict):
+            status = str(run.get("status") or "")
+        else:
+            status = str(getattr(run, "status", "") or "")
+        if status.upper() in {"FAILED", "TIMED-OUT", "ABORTED"}:
+            # A LinkedIn auth wall (HTTP 999) fails the run. Empty titles are
+            # not evidence that the company has no open roles.
+            log.warning(
+                "LinkedIn jobs actor %s finished %s — hiring left unknown",
+                actor_id,
+                status,
+            )
+            return results
         items = _actor_dataset_items(client, run)
     except Exception as e:
         log.warning("Apify LinkedIn jobs batch failed: %s", e)
         return results
 
+    from agent.utils.inbound_payload import map_record
+
     for item in items:
-        title = (item.get("title") or item.get("jobTitle") or item.get("position") or "").strip()
-        item_url = (
-            item.get("companyLinkedinUrl")
-            or item.get("companyUrl")
-            or item.get("companyLinkedinUrl")
-            or item.get("inputUrl")
-            or item.get("companyLinkedinUrl")
-            or ""
-        )
+        mapped_job = map_record(item, "job")
+        title = str(mapped_job.get("title") or "").strip()
+        item_url = str(mapped_job.get("company_url") or "")
         company_url = _normalize_linkedin_url(str(item_url))
         if company_url and company_url.endswith("/jobs"):
             company_url = company_url[:-len("/jobs")]
@@ -1041,6 +1073,7 @@ def enrich_decision_maker_linkedin(profile_url: Optional[str], max_posts: Option
             "interests": [],
             "post_summary": None,
             "is_hiring": None,
+            "posts_status": "skipped",
         }
     posts_data = get_linkedin_profile_posts(profile_url, max_posts=max_posts)
     posts = posts_data.get("posts") or []
@@ -1051,6 +1084,8 @@ def enrich_decision_maker_linkedin(profile_url: Optional[str], max_posts: Option
         "interests": posts_data.get("interests") or [],
         "post_summary": posts_data.get("summary"),
         "is_hiring": person_hiring,
+        "posts_status": posts_data.get("posts_status") or ("ok" if posts else "empty"),
+        "posts_error": posts_data.get("posts_error") or "",
     }
 
 
@@ -1104,7 +1139,7 @@ def get_linkedin_profile_posts(profile_url: Optional[str], max_posts: Optional[i
         max_posts = _default_max_posts()
     if _skip_linkedin_posts():
         log.info("LinkedIn posts skipped — APIFY_SKIP_LINKEDIN_POSTS is set")
-        return {"posts": [], "interests": [], "summary": None}
+        return {"posts": [], "interests": [], "summary": None, "posts_status": "skipped"}
 
     from agent.integrations.treg import linkedin_enrich_provider
 
@@ -1114,10 +1149,16 @@ def get_linkedin_profile_posts(profile_url: Optional[str], max_posts: Optional[i
         return treg_li.get_linkedin_profile_posts(profile_url, max_posts=max_posts)
 
     if not profile_url:
-        return {"posts": [], "interests": [], "summary": None}
+        return {"posts": [], "interests": [], "summary": None, "posts_status": "empty"}
     if not os.environ.get("APIFY_TOKEN"):
         log.warning("Apify LinkedIn posts skipped — APIFY_TOKEN is not configured")
-        return {"posts": [], "interests": [], "summary": None}
+        return {
+            "posts": [],
+            "interests": [],
+            "summary": None,
+            "posts_status": "error",
+            "posts_error": "APIFY_TOKEN is not configured",
+        }
 
     actor_id = os.environ.get(
         "APIFY_LINKEDIN_POSTS_ACTOR",
@@ -1132,7 +1173,13 @@ def get_linkedin_profile_posts(profile_url: Optional[str], max_posts: Optional[i
         items = _actor_dataset_items(client, run)
     except Exception as e:
         log.warning("Apify LinkedIn posts failed for '%s': %s", profile_url, e)
-        return {"posts": [], "interests": [], "summary": None}
+        return {
+            "posts": [],
+            "interests": [],
+            "summary": None,
+            "posts_status": "error",
+            "posts_error": str(e),
+        }
 
     if len(items) > max_posts:
         log.warning(
@@ -1147,8 +1194,15 @@ def get_linkedin_profile_posts(profile_url: Optional[str], max_posts: Optional[i
     summary = _summarize_posts(posts, interests)
     hiring = detect_hiring_from_posts(posts)
 
+    status = "ok" if posts else "empty"
     log.info("Apify LinkedIn posts returned %d posts for %s", len(posts), profile_url)
-    return {"posts": posts, "interests": interests, "summary": summary, "is_hiring": hiring}
+    return {
+        "posts": posts,
+        "interests": interests,
+        "summary": summary,
+        "is_hiring": hiring,
+        "posts_status": status,
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1174,29 +1228,19 @@ def _is_generic_site(url: str) -> bool:
 
 
 def _normalize_post(item: dict) -> dict:
-    text = (
-        item.get("text")
-        or item.get("postText")
-        or item.get("content")
-        or item.get("headline")
-        or item.get("commentary")
-        or ""
-    )
-    url = item.get("url") or item.get("postUrl") or item.get("shareUrl") or item.get("link")
-    posted_at = (
-        item.get("postedAt")
-        or item.get("date")
-        or item.get("publishedAt")
-        or item.get("time")
-        or item.get("datePublished")
-        or item.get("created_at")
-    )
+    """Map one vendor post object onto text / url / posted_at / likes / comments."""
+    from agent.utils.inbound_payload import map_record
+
+    mapped = map_record(item, "post")
+    text = mapped.get("text") or ""
+    if not isinstance(text, str):
+        text = str(text)
     return {
-        "text": str(text).strip()[:1000],
-        "url": url,
-        "posted_at": posted_at,
-        "likes": item.get("likes") or item.get("likeCount") or item.get("numLikes"),
-        "comments": item.get("comments") or item.get("commentCount") or item.get("numComments"),
+        "text": text.strip()[:1000],
+        "url": mapped.get("url"),
+        "posted_at": mapped.get("posted_at"),
+        "likes": mapped.get("likes"),
+        "comments": mapped.get("comments"),
     }
 
 
@@ -1225,18 +1269,14 @@ def _extract_interests(posts: list[dict]) -> list[str]:
 
 
 def _summarize_posts(posts: list[dict], interests: list[str]) -> Optional[str]:
+    """Numbered summary of each of the five latest posts. Interests stay on the contact."""
+    del interests
     if not posts:
         return None
-    snippets = []
-    for post in posts[:3]:
-        text = (post.get("text") or "").replace("\n", " ").strip()
-        if text:
-            snippets.append(text[:180])
-    if interests:
-        return f"Recent LinkedIn themes: {', '.join(interests)}. Examples: " + " | ".join(snippets)
-    if snippets:
-        return "Recent LinkedIn post examples: " + " | ".join(snippets)
-    return None
+    from agent.utils.company_social_posts import format_recent_posts
+
+    summary = format_recent_posts(posts, limit=5)
+    return summary or None
 
 
 def company_enrichment_foxlabs(

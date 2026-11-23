@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -32,6 +33,7 @@ DEFAULT_MODULES_COMPANY: dict[str, bool] = {
     "linkedin_company_jobs": True,
     "facebook_company_posts": False,
     "instagram_company_posts": False,
+    "meta_ads": False,
     "apollo_phone": False,
 }
 
@@ -46,6 +48,7 @@ DEFAULT_MODULES_TALENT: dict[str, bool] = {
     "linkedin_company_jobs": False,
     "facebook_company_posts": False,
     "instagram_company_posts": False,
+    "meta_ads": False,
     "apollo_phone": True,
 }
 
@@ -62,6 +65,14 @@ DEFAULT_TALENT_PASS_RATES = {
     "after_dedupe": 0.90,
     "after_icp": 0.40,
     "email_success": 0.70,
+}
+
+# Optional plan.extracts rows. Unknown ids, kinds, and parents are dropped.
+EXTRACT_ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,40}$")
+EXTRACT_COLUMN_RE = re.compile(r"^[a-z][a-z0-9_]{0,32}$")
+EXTRACT_PARENTS = {
+    "website_extract": "website_scrape",
+    "jobs_extract": "linkedin_company_jobs",
 }
 
 
@@ -96,6 +107,7 @@ def unit_rates() -> dict[str, float]:
         "apify_company_jobs_usd": _env_float("BUILDER_APIFY_COMPANY_JOBS_USD", 0.005),
         "facebook_company_posts_usd": _env_float("BUILDER_FACEBOOK_POSTS_USD", 0.002),
         "instagram_company_posts_usd": _env_float("BUILDER_INSTAGRAM_POSTS_USD", 0.002),
+        "meta_ads_usd": _env_float("BUILDER_META_ADS_USD", 0.002),
         "apify_website_per_page_usd": _env_float("BUILDER_APIFY_WEBSITE_PAGE_USD", 0.004),
         "firecrawl_per_page": _env_float("FIRECRAWL_PAGE_USD", 0.01),
         "llm_website_per_lead_usd": _env_float("BUILDER_LLM_WEBSITE_PER_LEAD_USD", 0.023),
@@ -142,6 +154,18 @@ def _canonicalize_modules(incoming: dict[str, Any], base: dict[str, bool]) -> di
         if key in modules:
             modules[key] = bool(val)
     return modules
+
+
+def apply_icp_module_overrides(plan: dict[str, Any], icp_doc: dict[str, Any] | None) -> dict[str, Any]:
+    """Turn on modules named in the library ICP. Unknown keys are ignored."""
+    overrides = (icp_doc or {}).get("enrichment_modules") or {}
+    if not isinstance(overrides, dict):
+        return plan
+    modules = plan.setdefault("modules", {})
+    for key, val in overrides.items():
+        if key in modules:
+            modules[key] = bool(val)
+    return plan
 
 
 def plan_path(campaign_dir: Path) -> Path:
@@ -204,6 +228,53 @@ def _infer_campaign_type(campaign_dir: Path) -> str:
     return "company_outreach"
 
 
+def normalize_extracts(raw: Any) -> list[dict[str, Any]]:
+    """Keep valid extract rows. Unknown ids and kinds are ignored."""
+    if not isinstance(raw, list):
+        return []
+    kept: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        extract_id = str(item.get("id") or "").strip()
+        if not EXTRACT_ID_RE.fullmatch(extract_id) or extract_id in seen:
+            continue
+        kind = str(item.get("kind") or "").strip()
+        parent = EXTRACT_PARENTS.get(kind)
+        if parent is None or str(item.get("parent_module") or "").strip() != parent:
+            continue
+        columns: list[str] = []
+        for col in item.get("columns") or []:
+            name = str(col).strip()
+            if EXTRACT_COLUMN_RE.fullmatch(name) and name not in columns:
+                columns.append(name)
+        if not columns:
+            continue
+        hints: list[str] = []
+        for hint in item.get("page_hints") or []:
+            text = str(hint).strip()
+            if text and text not in hints:
+                hints.append(text[:80])
+            if len(hints) >= 5:
+                break
+        instruction = re.sub(r"\s+", " ", str(item.get("instruction") or "").strip())
+        if len(instruction) > 500:
+            instruction = instruction[:500].rstrip()
+        seen.add(extract_id)
+        row: dict[str, Any] = {
+            "id": extract_id,
+            "kind": kind,
+            "parent_module": parent,
+            "columns": columns,
+            "page_hints": hints,
+        }
+        if instruction:
+            row["instruction"] = instruction
+        kept.append(row)
+    return kept
+
+
 def normalize_plan(data: dict[str, Any], *, campaign_id: str) -> dict[str, Any]:
     ctype = data.get("campaign_type") or "company_outreach"
     if ctype not in ("company_outreach", "talent_search"):
@@ -241,7 +312,7 @@ def normalize_plan(data: dict[str, Any], *, campaign_id: str) -> dict[str, Any]:
     except (TypeError, ValueError):
         seed = base["seed_count"]
 
-    return {
+    out: dict[str, Any] = {
         "schema_version": 1,
         "campaign_id": campaign_id,
         "campaign_type": ctype,
@@ -254,6 +325,10 @@ def normalize_plan(data: dict[str, Any], *, campaign_id: str) -> dict[str, Any]:
         "talent_seed": data.get("talent_seed"),
         "notes": data.get("notes") or "",
     }
+    extracts = normalize_extracts(data.get("extracts"))
+    if extracts:
+        out["extracts"] = extracts
+    return out
 
 
 def validate_plan(plan: dict[str, Any]) -> list[str]:
@@ -427,6 +502,17 @@ def _estimate_company(plan: dict[str, Any], rates: dict[str, float]) -> dict[str
                 units=n,
                 line_usd=n * rates["facebook_company_posts_usd"],
                 basis="treg.facebook.user.posts when social URL found",
+            )
+        )
+    if m.get("meta_ads"):
+        lines.append(
+            _line(
+                "meta_ads",
+                "Meta ads running",
+                unit_usd=rates["meta_ads_usd"],
+                units=n,
+                line_usd=n * rates["meta_ads_usd"],
+                basis="treg.meta-ads.library.advertiser / lead",
             )
         )
     if m.get("instagram_company_posts"):
@@ -723,6 +809,20 @@ def _seed_plan_summary(campaign_dir: Path, icp: dict[str, Any]) -> dict[str, Any
                                 f"Configured linkedin_companies — "
                                 f"{len(queries) or len(urls)} company-search quer(y/ies), "
                                 "Apify scrape on Start (paid; not jobs)."
+                            ),
+                        }
+                if sid == "google_search":
+                    queries = list(conf.get("queries") or [])
+                    if queries:
+                        return {
+                            "ok": True,
+                            "mode": "google_search",
+                            "query_count": len(queries),
+                            "queries": queries[:8],
+                            "count": int(conf.get("max_results") or 150),
+                            "message": (
+                                f"Configured google_search — {len(queries)} quer(y/ies), "
+                                "Apify SERP scrape on Start (paid, ~cents per query)."
                             ),
                         }
                 if sid == "google_maps":

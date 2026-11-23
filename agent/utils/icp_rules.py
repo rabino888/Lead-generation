@@ -20,6 +20,7 @@ from agent.utils.campaign_config import (
     STAGE_ICP_MATCHED,
     STAGE_ICP_REJECTED,
     STAGE_PRE_APOLLO_REJECTED,
+    STAGE_OUTREACH_SEGMENTS,
     STAGE_QA_FLAGS,
     STAGE_RAW_SEEDS,
     STAGE_SCORED,
@@ -108,6 +109,7 @@ STAGE_FILES = {
     "enriched": STAGE_ENRICHED,
     "scored": STAGE_SCORED,
     "qa_flags": STAGE_QA_FLAGS,
+    "outreach_segments": STAGE_OUTREACH_SEGMENTS,
 }
 
 
@@ -152,6 +154,27 @@ def icp_is_location_bound(icp: CampaignIcpConfig | dict[str, Any]) -> bool:
     return False
 
 
+def resolve_require_industry_match(icp: CampaignIcpConfig | dict[str, Any]) -> bool:
+    """
+    Explicit require_industry_match true/false wins.
+    Otherwise on when the ICP names both the industries it wants and the ones it rejects,
+    so a known industry outside that allow-list does not pass.
+    """
+    if isinstance(icp, CampaignIcpConfig):
+        explicit = icp.require_industry_match
+    else:
+        explicit = icp.get("require_industry_match") if isinstance(icp, dict) else None
+    if explicit is True or explicit is False:
+        return bool(explicit)
+    industries = icp.industries if isinstance(icp, CampaignIcpConfig) else (icp.get("industries") or [])
+    excluded = (
+        icp.excluded_industries
+        if isinstance(icp, CampaignIcpConfig)
+        else (icp.get("excluded_industries") or [])
+    )
+    return bool(industries and excluded)
+
+
 def resolve_require_location_match(icp: CampaignIcpConfig | dict[str, Any]) -> bool:
     """
     Explicit require_location_match true/false wins.
@@ -189,7 +212,7 @@ def icp_config_to_rules(icp: CampaignIcpConfig) -> IcpRules:
         weak_seed_rule_pack=getattr(icp, "weak_seed_rule_pack", "") or "",
         weak_seed_extra_patterns=list(getattr(icp, "weak_seed_extra_patterns", None) or []),
         require_include_keywords=False,
-        require_industry_match=False,
+        require_industry_match=resolve_require_industry_match(icp),
         require_location_match=resolve_require_location_match(icp),
         allow_recruiter_companies=getattr(icp, "allow_recruiter_companies", None),
     )

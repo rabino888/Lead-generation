@@ -166,6 +166,36 @@ def test_builder_list_and_get(builder_client):
     assert g.json()["plan"]["campaign_type"] == "company_outreach"
 
 
+def test_builder_collector_suggestions_are_read_only(builder_client, tmp_path):
+    camp = tmp_path / "campaigns" / "sample_co"
+    (camp / "collector_suggestions.json").write_text(
+        json.dumps(
+            {
+                "suggestions": [
+                    {"id": "public_quote_form", "status": "proposed", "why": "Record the form."}
+                ],
+                "leave_off": [
+                    {
+                        "module": "apollo_phone",
+                        "reason": "The magnet is a link.",
+                        "cost_note": "About one Apollo credit per lead.",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    got = builder_client.get("/builder/api/campaigns/sample_co/collector_suggestions")
+    assert got.status_code == 200
+    body = got.json()
+    assert body["present"] is True
+    assert body["suggestions"][0]["status"] == "proposed"
+    page = builder_client.get("/builder?new=1")
+    assert page.status_code == 200
+    assert 'id="collector-suggestions"' in page.text
+    assert "suggest_collectors.py" in page.text
+
+
 def test_builder_estimate_and_save(builder_client, tmp_path):
     plan = default_plan("sample_co")
     plan["target_leads"] = 5

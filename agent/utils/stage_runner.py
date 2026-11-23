@@ -79,7 +79,9 @@ def rows_to_raw_companies(rows: list[dict[str, Any]], icp: ICPProfile) -> list[R
             RawCompany(
                 company_name=seed.company_name,
                 website=website,
-                industry=seed.industry or icp.industry,
+                # Never copy the ICP's first industry onto a company. That list is a
+                # filter, and industries[0] was landing on every blank row as "restaurants".
+                industry=seed.industry,
                 location=seed.location or icp.location,
                 company_size=seed.company_size,
                 company_linkedin_url=seed.company_linkedin_url,

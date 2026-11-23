@@ -4,7 +4,8 @@ Deterministic seed-source registry.
 Operator step 2 (LLM) chooses a source id; step 4 runs it with no LLM.
 Apollo mixed_companies/search is intentionally NOT registered.
 
-Company discovery: prefer google_maps (businesses by keyword+location).
+Company discovery: linkedin_companies (company search), google_search (web SERP
+queries, one seed per root domain) or google_maps (local businesses).
 linkedin_jobs remains for hiring_first / talent-adjacent lists only.
 """
 from __future__ import annotations
@@ -309,16 +310,58 @@ def run_linkedin_jobs(
     return out
 
 
+def _record_seed_apify_cost(
+    campaign: CampaignConfig,
+    usd: float,
+    *,
+    source_id: str = "linkedin_companies",
+    label: str = "LinkedIn company search",
+    actor: str = "harvestapi/linkedin-company-search",
+) -> None:
+    """Append seed-source Apify spend to this campaign's cost log."""
+    from datetime import datetime, timezone
+
+    from agent.utils.cost_manifest import append_manifest_run
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+    amount = round(float(usd), 4)
+    append_manifest_run(
+        campaign.campaign_dir,
+        {
+            "run_key": f"seed_{source_id}_{stamp}",
+            "label": label,
+            "stage": "seed",
+            "run_id": f"seed-{stamp}",
+            "started_at_utc": datetime.now(timezone.utc).isoformat(),
+            "ended_at_utc": datetime.now(timezone.utc).isoformat(),
+            "cost_tracker": {
+                "total_usd": amount,
+                "apify_usd": amount,
+                "source": "apify usageTotalUsd",
+            },
+            "apify": {
+                "cost_tracker_usd": amount,
+                "api_truth_usd": amount,
+                "drift_usd": 0,
+                "source": actor,
+            },
+        },
+        campaign_id=campaign.campaign_id,
+    )
+
+
 def run_linkedin_companies(
     campaign: CampaignConfig,
     *,
     queries: list[dict[str, Any]] | None = None,
     urls: list[str] | None = None,
-    max_results: int = 80,
+    max_results: int | None = None,
     actor: str | None = None,
     geo_segment: str = "",
     scraper_mode: str = "full",
     firmographics: bool = False,
+    start_page: int | None = None,
+    append: bool = False,
 ) -> Path:
     """
     LinkedIn company search (not jobs) → stages/01_raw_seeds.csv.
@@ -328,22 +371,26 @@ def run_linkedin_companies(
     """
     from agent.utils.linkedin_company_seeds import (
         DEFAULT_ACTOR,
+        advance_start_page,
         companies_to_seed_rows,
+        per_query_limits,
         scrape_linkedin_companies,
     )
+    from agent.utils.contactable_fill import company_key, unseen_rows
 
     cfg = load_seed_sources(campaign)
     entry = cfg.source_by_id("linkedin_companies")
     resolved_queries: list[dict[str, Any]] = list(queries or [])
+    conf = (entry.config or {}) if entry else {}
     if not resolved_queries and entry:
-        conf = entry.config or {}
         resolved_queries = list(conf.get("queries") or [])
-        max_results = int(conf.get("max_results") or max_results)
         geo_segment = conf.get("geo_segment") or geo_segment
         actor = conf.get("actor") or actor
         scraper_mode = conf.get("scraper_mode") or scraper_mode
         if conf.get("firmographics") is True:
             firmographics = True
+    if max_results is None:
+        max_results = int(conf.get("max_results") or 80)
     if not resolved_queries:
         raise ValueError(
             "linkedin_companies requires queries from ICP / seed_sources.json "
@@ -354,11 +401,37 @@ def run_linkedin_companies(
         campaign.segment_order[0] if campaign.segment_order else "default"
     )
     actor_id = actor or DEFAULT_ACTOR
-    companies = scrape_linkedin_companies(
+    usable = [
+        q for q in resolved_queries
+        if (q.get("searchQuery") or q.get("keyword") or "").strip()
+    ]
+    page = 1
+    if append and entry is not None:
+        stored = (entry.config or {}).get("next_start_page")
+        if stored:
+            page = int(stored)
+        else:
+            already = 0
+            raw_existing = stage_path(campaign, "raw_seeds")
+            if raw_existing.is_file():
+                try:
+                    with raw_existing.open(encoding="utf-8-sig", newline="") as f:
+                        already = sum(1 for _ in csv.DictReader(f))
+                except OSError:
+                    already = 0
+            query_count = max(1, len(usable))
+            per_query = max(1, (already + query_count - 1) // query_count) if already else 1
+            page = advance_start_page(1, per_query)
+    if start_page is not None:
+        page = max(1, int(start_page))
+    limits = per_query_limits(max_results, len(usable) or 1)
+    largest = max((n for n in limits if n > 0), default=0)
+    companies, apify_usd = scrape_linkedin_companies(
         resolved_queries,
         max_results=max_results,
         actor_id=actor_id,
         scraper_mode=scraper_mode,
+        start_page=page,
     )
 
     raw_path = campaign.campaign_dir / "linkedin_companies_raw.json"
@@ -374,18 +447,45 @@ def run_linkedin_companies(
     )
     rows = _maybe_firmographics(rows, enabled=firmographics)
 
-    out = _write_raw_seeds_csv(campaign, rows)
+    existing: list[dict[str, Any]] = []
+    raw_out = stage_path(campaign, "raw_seeds")
+    if append and raw_out.is_file():
+        try:
+            with raw_out.open(encoding="utf-8-sig", newline="") as f:
+                existing = list(csv.DictReader(f))
+        except OSError:
+            existing = []
+    seen = {company_key(row) for row in existing}
+    new_rows = unseen_rows(rows, seen)
+    offset = len(existing)
+    for i, row in enumerate(new_rows, start=offset + 1):
+        row["seed_id"] = f"{campaign.seed_id_prefix}-{i:04d}"
+    combined = existing + new_rows if append else rows
+
+    out = _write_raw_seeds_csv(campaign, combined)
     with campaign.seeds_csv.open("w", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=SEED_HEADERS, extrasaction="ignore")
         w.writeheader()
-        for row in rows:
+        for row in combined:
             w.writerow(row)
+
+    next_page = advance_start_page(page, largest)
+    stats_path = campaign.campaign_dir / "linkedin_page_stats.json"
+    try:
+        stats_path.write_text(
+            json.dumps(
+                {"scraped": len(companies), "added": len(new_rows) if append else len(rows), "start_page": page}
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        pass
 
     touch_seed_source_run(
         campaign,
         "linkedin_companies",
         ref=str(out),
-        seeds_added=len(rows),
+        seeds_added=len(new_rows) if append else len(rows),
         why_chosen="LinkedIn company search URLs from ICP → company seeds",
         source_type="linkedin_companies",
         config_update={
@@ -395,8 +495,174 @@ def run_linkedin_companies(
             "actor": actor_id,
             "geo_segment": segment,
             "scraper_mode": scraper_mode,
+            "next_start_page": next_page,
         },
     )
+    if apify_usd > 0:
+        _record_seed_apify_cost(campaign, apify_usd)
+    return out
+
+
+def _read_raw_seed_rows(campaign: CampaignConfig) -> list[dict[str, Any]]:
+    raw = stage_path(campaign, "raw_seeds")
+    if not raw.is_file():
+        return []
+    try:
+        with raw.open(encoding="utf-8-sig", newline="") as f:
+            return list(csv.DictReader(f))
+    except OSError:
+        return []
+
+
+def run_google_search(
+    campaign: CampaignConfig,
+    *,
+    queries: list[Any] | None = None,
+    max_results: int | None = None,
+    pages_per_query: int | None = None,
+    country_code: str = "",
+    language_code: str = "",
+    location: str = "",
+    geo_segment: str = "",
+    exclude_domains: list[str] | None = None,
+    actor: str | None = None,
+    firmographics: bool = True,
+    append: bool = False,
+    reuse_raw: bool = False,
+) -> Path:
+    """
+    Google Search (Apify) → stages/01_raw_seeds.csv.
+
+    Queries, country/language, location label and campaign-specific domain excludes
+    come from seed_sources.json `google_search.config`. One root domain = one seed.
+    `max_results` caps NEW seeds kept (default 150). `append` keeps existing raw
+    seeds (e.g. a curated csv_ingest) and adds only unseen domains after them.
+    `reuse_raw` re-parses the saved google_search_raw.json (no Apify spend), e.g.
+    after editing exclude_domains; prior Google rows are dropped before re-adding.
+    Firmographics trust domain matches only: the SERP host is ground truth.
+    """
+    from agent.utils.contactable_fill import company_key
+    from agent.utils.google_search_seeds import (
+        DEFAULT_ACTOR,
+        DEFAULT_PAGES_PER_QUERY,
+        DEFAULT_RESULTS_PER_PAGE,
+        DEFAULT_TARGET,
+        host_of,
+        normalize_queries,
+        registrable_domain,
+        scrape_google_search,
+        serp_items_to_seed_rows,
+    )
+
+    cfg = load_seed_sources(campaign)
+    entry = cfg.source_by_id("google_search") or cfg.source_by_type("google_search")
+    conf = (entry.config or {}) if entry else {}
+    resolved = normalize_queries(queries or conf.get("queries") or [])
+    if not resolved:
+        raise ValueError(
+            "google_search requires config.queries in seed_sources.json "
+            "(list of search strings)."
+        )
+    target = int(max_results or conf.get("max_results") or DEFAULT_TARGET)
+    pages = int(pages_per_query or conf.get("pages_per_query") or DEFAULT_PAGES_PER_QUERY)
+    per_page = int(conf.get("results_per_page") or DEFAULT_RESULTS_PER_PAGE)
+    country = country_code or str(conf.get("country_code") or "")
+    language = language_code or str(conf.get("language_code") or "")
+    loc = location or str(conf.get("location") or "")
+    segment = geo_segment or str(conf.get("geo_segment") or "") or (
+        campaign.segment_order[0] if campaign.segment_order else "default"
+    )
+    excludes = list(exclude_domains or conf.get("exclude_domains") or [])
+    actor_id = actor or conf.get("actor") or DEFAULT_ACTOR
+    if conf.get("firmographics") is False:
+        firmographics = False
+
+    existing = _read_raw_seed_rows(campaign) if append else []
+    if reuse_raw:
+        existing = [r for r in existing if "Google Search" not in (r.get("notes") or "")]
+    seen_hosts = {
+        registrable_domain(host_of(r.get("website") or "")) for r in existing
+    } - {""}
+    seen_keys = {company_key(r) for r in existing} - {""}
+
+    raw_path = campaign.campaign_dir / "google_search_raw.json"
+    if reuse_raw:
+        if not raw_path.is_file():
+            raise FileNotFoundError(f"reuse_raw: {raw_path} not found; run without it first")
+        items, apify_usd = json.loads(raw_path.read_text(encoding="utf-8")), 0.0
+    else:
+        items, apify_usd = scrape_google_search(
+            resolved,
+            pages_per_query=pages,
+            results_per_page=per_page,
+            country_code=country,
+            language_code=language,
+            actor_id=actor_id,
+        )
+        try:
+            raw_path.write_text(
+                json.dumps(items, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+            )
+        except OSError:
+            pass
+
+    rows, dropped = serp_items_to_seed_rows(
+        items,
+        geo_segment=segment,
+        location=loc,
+        exclude_domains=excludes,
+        seen_hosts=seen_hosts,
+    )
+    rows = [r for r in rows if company_key(r) not in seen_keys][:target]
+    if firmographics and rows:
+        from agent.utils.firmographics import enrich_seed_rows_firmographics
+
+        rows = enrich_seed_rows_firmographics(
+            rows, prefer_enriched_website=False, match_by_name=False, fill_name=True
+        )
+    offset = len(existing)
+    for i, row in enumerate(rows, start=offset + 1):
+        row["seed_id"] = f"{campaign.seed_id_prefix}-{i:04d}"
+    combined = existing + rows
+
+    out = _write_raw_seeds_csv(campaign, combined)
+    with campaign.seeds_csv.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=SEED_HEADERS, extrasaction="ignore")
+        w.writeheader()
+        for row in combined:
+            w.writerow(row)
+
+    touch_seed_source_run(
+        campaign,
+        entry.id if entry else "google_search",
+        ref=str(out),
+        seeds_added=len(rows),
+        why_chosen="Google Search queries (Apify) → one seed per root domain",
+        source_type="google_search",
+        config_update={
+            # One-off CLI overrides (queries / excludes) are not persisted over config.
+            **({} if queries else {"queries": resolved}),
+            **({} if exclude_domains else {"exclude_domains": excludes}),
+            "max_results": target,
+            "pages_per_query": pages,
+            "results_per_page": per_page,
+            "country_code": country,
+            "language_code": language,
+            "location": loc,
+            "geo_segment": segment,
+            "actor": actor_id,
+            "firmographics": firmographics,
+            "excluded_hits": len(dropped),
+        },
+    )
+    if apify_usd > 0:
+        _record_seed_apify_cost(
+            campaign,
+            apify_usd,
+            source_id="google_search",
+            label="Google search seeds",
+            actor=actor_id,
+        )
     return out
 
 
@@ -578,13 +844,14 @@ def run_linkedin_people(
 def _blocked_apollo(**_kwargs: Any) -> Path:
     raise RuntimeError(
         "Apollo company search (mixed_companies/search) is not a registered seed source. "
-        "Use csv_ingest, google_maps, or linkedin_jobs. See docs/OPERATOR-WORKFLOW.md."
+        "Use csv_ingest, google_search, google_maps or linkedin_companies."
     )
 
 
 REGISTRY: dict[str, Runner] = {
     "csv_ingest": run_csv_ingest,
     "google_maps": run_google_maps,
+    "google_search": run_google_search,
     "linkedin_companies": run_linkedin_companies,
     # linkedin_jobs kept for legacy CLI only — gated auto-seed never calls it
     "linkedin_jobs": run_linkedin_jobs,

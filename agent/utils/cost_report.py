@@ -439,12 +439,26 @@ def build_campaign_report(campaign_id: str, root: Optional[Path] = None) -> dict
         }
 
         if stage == "seeding":
-            start = _parse_dt(entry["started_at_utc"])
-            end = _parse_dt(entry["ended_at_utc"])
-            apify_runs = _fetch_apify_runs(client, start, end)
-            apify_runs = _resolve_pinned_apify_runs(client, entry, apify_runs)
-            apify_usd = _round_usd(sum(float(r["usd"]) for r in apify_runs))
-            breakdown = _group_apify_by_actor(apify_runs)
+            stored = (entry.get("apify") or {}).get("api_truth_usd")
+            start_raw = entry.get("started_at_utc")
+            end_raw = entry.get("ended_at_utc")
+            if stored is not None:
+                apify_usd = _round_usd(float(stored))
+                breakdown = list((entry.get("apify") or {}).get("by_actor") or [])
+                apify_runs: list[dict[str, Any]] = []
+            elif start_raw and end_raw:
+                start = _parse_dt(start_raw)
+                end = _parse_dt(end_raw)
+                apify_runs = _fetch_apify_runs(client, start, end)
+                apify_runs = _resolve_pinned_apify_runs(client, entry, apify_runs)
+                apify_usd = _round_usd(sum(float(r["usd"]) for r in apify_runs))
+                breakdown = _group_apify_by_actor(apify_runs)
+            else:
+                apify_usd = _round_usd(
+                    float((entry.get("cost_tracker") or {}).get("total_usd") or 0)
+                )
+                breakdown = []
+                apify_runs = []
             detail = {
                 "usd": apify_usd,
                 "basis": "apify_api",

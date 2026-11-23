@@ -81,10 +81,28 @@ python scripts/stage_dedupe.py --campaign {campaign_id}
 python scripts/stage_apollo.py --campaign {campaign_id}
 python scripts/stage_enrich.py --campaign {campaign_id}
 python scripts/stage_score.py --campaign {campaign_id}
+python scripts/stage_segment.py --campaign {campaign_id}
 python scripts/stage_qa_flags.py --campaign {campaign_id}
 ```
 
 Or orchestrate with `scripts/run_deterministic_campaign.py` / `POST /run` (curated seeds).
+
+**Seed sources** (`--source`): `csv_ingest` (free), `linkedin_companies` (company search),
+`google_search` (web SERP queries via Apify `apify/google-search-scraper`, one seed per
+registrable domain, ~$0.14 per 150 seeds), `google_maps` (local businesses). Queries,
+country and campaign-specific `exclude_domains` live in the campaign's `seed_sources.json`.
+
+```powershell
+# Add 150 Google seeds after an existing curated list
+python scripts/run_seed_source.py --campaign {campaign_id} --source google_search --append
+# Re-parse the saved SERP after editing exclude_domains (no SERP spend)
+python scripts/run_seed_source.py --campaign {campaign_id} --source google_search --append --reuse-raw
+```
+
+**Audit sheet:** `python scripts/publish_audit_sheet.py --campaign {campaign_id}` publishes every
+stage CSV (kept + rejected, with reject reasons) as one tab each in a Google Sheet in the client's
+Drive folder; re-running refreshes the same file (`audit_sheet.json`).
+`stage_apollo.py` reveals phones only when `enrichment_plan.json` has `modules.apollo_phone: true`.
 
 After a run:
 

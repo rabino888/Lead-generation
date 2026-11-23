@@ -55,5 +55,27 @@ def get_run_logger(run_id: str, client_id: str, *, keyword: str | None = None) -
     return get_logger(f"run.{run_id}", client_id=client_id, run_id=run_id, keyword=keyword)
 
 
+def attach_leadgen_mirror(run_logger: logging.Logger) -> list[logging.Handler]:
+    """Copy this run's file handler onto the process logger.
+
+    treg and Apify log on ``leadgen``, which otherwise only hits the console.
+    A posts or jobs failure then never appears in the run log, and the list
+    still completes as a success.
+    """
+    leadgen = logging.getLogger("leadgen")
+    added: list[logging.Handler] = []
+    for handler in run_logger.handlers:
+        if isinstance(handler, logging.FileHandler) and handler not in leadgen.handlers:
+            leadgen.addHandler(handler)
+            added.append(handler)
+    return added
+
+
+def detach_leadgen_mirror(handlers: list[logging.Handler]) -> None:
+    leadgen = logging.getLogger("leadgen")
+    for handler in handlers:
+        leadgen.removeHandler(handler)
+
+
 # Module-level logger for startup/health/auth messages
 log = get_logger("leadgen")

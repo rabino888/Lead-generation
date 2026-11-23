@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from agent.utils.apollo_contact_gate import apollo_requires_dm_linkedin
+from agent.utils.icp_rules import ensure_stages_dir, stage_path
 
 APOLLO_PERSON_COLUMNS = (
     "decision_maker_apollo_person_id",
@@ -152,7 +153,7 @@ def write_apollo_contactable_csv(
             fieldnames.insert(0, col)
 
     with path.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(fieldnames=fieldnames, extrasaction="ignore")
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         for row in out_rows:
             writer.writerow({k: row.get(k, "") for k in fieldnames})

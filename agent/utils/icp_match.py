@@ -12,6 +12,81 @@ from urllib.parse import urlparse
 from agent.utils.icp_rules import IcpRules
 from agent.utils.icp_seed_quality import weak_seed_reason
 
+# LinkedIn labels a marketing agency "Advertising Services", not "marketing and advertising".
+_INDUSTRY_STOP = frozenset(
+    {
+        "and",
+        "or",
+        "the",
+        "of",
+        "for",
+        "services",
+        "service",
+        "other",
+        "general",
+        "goods",
+    }
+)
+SERVICE_PROVIDER_RE = re.compile(
+    r"\bagenc(y|ies)\b|\bconsultancy\b|\bshopify\s+(plus\s+|platinum\s+)?partner\b",
+    re.I,
+)
+
+
+def industry_tokens(text: str) -> set[str]:
+    parts = re.split(r"[^a-z0-9]+", (text or "").lower())
+    return {part for part in parts if len(part) >= 4 and part not in _INDUSTRY_STOP}
+
+
+def industry_matches_allowed(industry: str, allowed: list[str]) -> bool:
+    observed = (industry or "").lower()
+    tokens = industry_tokens(observed)
+    for name in allowed:
+        label = (name or "").lower().strip()
+        if not label:
+            continue
+        # The allow phrase is contained in the company industry.
+        # The reverse (company industry contained in a longer allow phrase)
+        # would treat a bare "Manufacturing" as personal-care manufacturing.
+        if label in observed:
+            return True
+        label_tokens = industry_tokens(label)
+        overlap = label_tokens & tokens
+        if not overlap:
+            continue
+        # A long allow label needs two shared tokens. One shared word such as
+        # "manufacturing" must not pull in machinery or generic manufacturers.
+        if len(label_tokens) >= 3 and len(overlap) < 2:
+            continue
+        return True
+    return False
+
+
+def excluded_industry_hit(industry: str, excluded: list[str], allowed: list[str]) -> str:
+    """Return the excluded industry label that this company industry belongs to."""
+    if industry_matches_allowed(industry, allowed):
+        return ""
+    observed = (industry or "").lower()
+    tokens = industry_tokens(observed)
+    for blocked in excluded:
+        label = (blocked or "").strip()
+        if not label:
+            continue
+        low = label.lower()
+        if low in observed or industry_tokens(low) & tokens:
+            return label
+    return ""
+
+
+def targets_operators_not_agencies(rules: IcpRules) -> bool:
+    """True when the ICP excludes marketing/advertising and does not target it."""
+    excluded = " ".join(rules.excluded_industries).lower()
+    allowed = " ".join(rules.industries_list()).lower()
+    blocks = "marketing" in excluded or "advertising" in excluded
+    wants = "marketing" in allowed or "advertising" in allowed
+    return blocks and not wants
+
+
 # Always-on cheap gate: LinkedIn jobs often label recruiters as the client's industry.
 RECRUITER_NAME_RE = re.compile(
     r"\b("
@@ -34,7 +109,7 @@ def _parse_employee_count(size: str | int | None) -> int | None:
     if size is None or size == "":
         return None
     if isinstance(size, int):
-        return size
+        return size or None
     text = str(size).strip().lower().replace(",", "")
     # Ranges like "51-200", "200,50000", "1,100"
     m = re.match(r"^(\d+)\s*[-–to]+\s*(\d+)$", text)
@@ -45,7 +120,8 @@ def _parse_employee_count(size: str | int | None) -> int | None:
         return int(m.group(1))
     m = re.search(r"(\d+)", text)
     if m:
-        return int(m.group(1))
+        # 0 employees is a vendor's "unknown", never a real headcount.
+        return int(m.group(1)) or None
     return None
 
 
@@ -203,9 +279,26 @@ def match_company(
         m = re.search(r"industry:\s*([^|]+)", blob, re.I)
         if m:
             industry_lower = m.group(1).strip().lower()
-    for blocked in rules.excluded_industries:
-        if blocked and blocked.lower() in industry_lower:
-            return False, [f"excluded_industry:{blocked}"]
+    blocked = excluded_industry_hit(
+        industry_lower, list(rules.excluded_industries), rules.industries_list()
+    )
+    if blocked:
+        return False, [f"excluded_industry:{blocked}"]
+
+    if targets_operators_not_agencies(rules):
+        provider_text = " ".join(
+            str(seed_row.get(key) or "")
+            for key in (
+                "company_name",
+                "industry",
+                "website_summary",
+                "about_summary",
+                "services_offered",
+                "company_linkedin_description",
+            )
+        )
+        if SERVICE_PROVIDER_RE.search(provider_text):
+            return False, ["service_provider"]
 
     # Required name signal
     signal_re = rules.name_signal_re()
@@ -244,8 +337,7 @@ def match_company(
             return False, ["missing_include_keyword"]
 
     if rules.require_industry_match and rules.industries_list() and industry_lower:
-        allowed = [i.lower() for i in rules.industries_list() if i]
-        if allowed and not any(a in industry_lower or industry_lower in a for a in allowed):
+        if not industry_matches_allowed(industry_lower, rules.industries_list()):
             return False, ["industry_mismatch"]
 
     if rules.apply_weak_seed_checks:

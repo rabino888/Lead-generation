@@ -150,6 +150,18 @@ def campaign_lead_counts(campaign_dir: Path) -> dict[str, int]:
             p for p in sorted((campaign_dir / "batches").glob("*.csv")) if _is_live_stage_csv(p)
         ]
 
+    contactable = _count_unique_csv(
+        pick("04_apollo_contactable*.csv", "04_apollo_contactable", merged=True),
+        _PERSON_KEY,
+    )
+    enriched = _count_unique_csv(
+        pick("05_enriched*.csv", "05_enriched", merged=True), _PERSON_KEY
+    )
+    # Agent-run batches can enrich from a usable-leads file and never write
+    # 04_apollo_contactable.csv. Those people are still the delivered list.
+    if contactable == 0:
+        contactable = enriched
+
     return {
         "seeds": _count_unique_csv(seed_paths, _COMPANY_KEY),
         "icp_matched": _count_unique_csv(
@@ -158,13 +170,8 @@ def campaign_lead_counts(campaign_dir: Path) -> dict[str, int]:
         "deduped": _count_unique_csv(
             pick("03_deduped*.csv", "03_deduped"), _COMPANY_KEY
         ),
-        "contactable": _count_unique_csv(
-            pick("04_apollo_contactable*.csv", "04_apollo_contactable", merged=True),
-            _PERSON_KEY,
-        ),
-        "enriched": _count_unique_csv(
-            pick("05_enriched*.csv", "05_enriched", merged=True), _PERSON_KEY
-        ),
+        "contactable": contactable,
+        "enriched": enriched,
         "scored": _count_unique_csv(pick("06_scored*.csv", "06_scored", merged=True), _PERSON_KEY),
     }
 

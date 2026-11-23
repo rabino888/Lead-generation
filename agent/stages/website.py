@@ -12,8 +12,10 @@ from typing import Any, Optional, Protocol
 from agent.integrations.careers import (
     careers_index_needs_portal_hop,
     find_careers_page,
-    open_roles_from_ats,
+    is_generic_job_board,
+    open_roles_from_careers_page,
     pick_careers_portal_hop,
+    without_generic_job_boards,
 )
 from agent.integrations.firecrawl import (
     crawl_website_with_fallback,
@@ -28,13 +30,17 @@ from agent.utils.concurrency import env_int, map_ordered
 from agent.utils.cost_tracker import get_cost_tracker
 from agent.utils.logger import get_run_logger
 from agent.utils.website_markdown_cache import load_markdown, save_markdown
+from agent.utils.collector_suggestions import apply_jobs_extracts, website_page_hints
 from agent.utils.website_outreach import (
     DEFAULT_OUTREACH_MAX_PAGES,
     augment_mapped_with_content_hubs,
     extract_decision_maker_mentions,
     extract_social_links,
+    fill_social_links_from_homepage,
     merge_mentions,
+    other_social_profiles,
     parse_blog_posts_from_llm,
+    prefer_brief_relevant_urls,
     select_outreach_urls,
 )
 
@@ -58,12 +64,32 @@ def _apply_outreach_signals(
     careers_url: Optional[str],
     hiring: Optional[dict],
     dm_name: Optional[str],
+    website: Optional[str] = None,
 ) -> WebsiteAnalysis:
     social = extract_social_links(markdown)
+    if website:
+        social = fill_social_links_from_homepage(website, social)
     analysis.social_facebook = social.get("facebook") or analysis.social_facebook
     analysis.social_instagram = social.get("instagram") or analysis.social_instagram
     analysis.social_tiktok = social.get("tiktok") or analysis.social_tiktok
     analysis.social_x = social.get("x") or analysis.social_x
+    analysis.social_youtube = social.get("youtube") or analysis.social_youtube
+    analysis.social_pinterest = social.get("pinterest") or analysis.social_pinterest
+    analysis.social_reddit = social.get("reddit") or analysis.social_reddit
+    analysis.social_threads = social.get("threads") or analysis.social_threads
+    analysis.social_snapchat = social.get("snapchat") or analysis.social_snapchat
+    analysis.social_linkedin = social.get("linkedin") or analysis.social_linkedin
+    rolled = {
+        "tiktok": analysis.social_tiktok,
+        "x": analysis.social_x,
+        "youtube": analysis.social_youtube,
+        "pinterest": analysis.social_pinterest,
+        "reddit": analysis.social_reddit,
+        "threads": analysis.social_threads,
+        "snapchat": analysis.social_snapchat,
+        "linkedin": analysis.social_linkedin,
+    }
+    analysis.other_social_profiles = other_social_profiles(rolled) or analysis.other_social_profiles
     if plan:
         analysis.blog_url = analysis.blog_url or plan.blog_url
         analysis.news_url = analysis.news_url or plan.news_url
@@ -91,6 +117,137 @@ def _website_analysis_mode(client_profile) -> str:
     return mode if mode in ("full", "hiring_first") else "full"
 
 
+def _campaign_extracts(campaign_dir: Optional[Path]) -> list[dict]:
+    """Accepted extracts on the enrichment plan. Empty when the plan has none."""
+    if campaign_dir is None:
+        return []
+    try:
+        from agent.utils.enrichment_plan import load_plan
+
+        plan = load_plan(Path(campaign_dir), Path(campaign_dir).name)
+    except Exception:
+        return []
+    raw = plan.get("extracts") or []
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def website_extract_prompt_inserts(
+    extracts: Optional[list[dict]] = None,
+) -> tuple[str, str]:
+    """
+    Extra JSON fields and rules for accepted website extracts.
+
+    Both strings are empty when the plan has no website extracts, so the
+    default prompt — including the tech-stack ban — stays unchanged.
+    """
+    rows: list[tuple[dict, list[str]]] = []
+    for row in extracts or []:
+        if not isinstance(row, dict) or row.get("kind") != "website_extract":
+            continue
+        columns = [str(col).strip() for col in (row.get("columns") or []) if str(col).strip()]
+        if columns:
+            rows.append((row, columns))
+    if not rows:
+        return "", ""
+    fields: list[str] = []
+    rules = [
+        "Named extract columns are the only exception to the bans above. "
+        "Leave a column null when the page does not name it."
+    ]
+    for row, columns in rows:
+        instruction = str(row.get("instruction") or row.get("why") or "Copy only what is visible.").strip()
+        instruction = " ".join(instruction.split())
+        hints = [str(hint).strip() for hint in (row.get("page_hints") or []) if str(hint).strip()][:5]
+        for col in columns:
+            fields.append(f'  "{col}": null')
+        hint_note = f" Pages to check: {', '.join(hints)}." if hints else ""
+        rules.append(f"{', '.join(columns)}: {instruction}{hint_note}")
+    return ",\n" + ",\n".join(fields), "\n- " + "\n- ".join(rules)
+
+
+def build_outreach_prompt(
+    *,
+    company_name: str,
+    content: str,
+    dm_name: Optional[str] = None,
+    extracts: Optional[list[dict]] = None,
+) -> str:
+    """Website outreach prompt. extracts=None or [] reproduces the default prompt."""
+    dm_block = ""
+    if dm_name:
+        dm_block = f"""
+DECISION MAKER: {dm_name}
+If this person is named on about/team/leadership pages, copy the verbatim bio or mention into decision_maker_mentions (max 5). If they are not named, return an empty list.
+"""
+    json_extra, rules_extra = website_extract_prompt_inserts(extracts)
+    return f"""Extract outreach intelligence from this company website. Only use what is visible in the content.
+
+COMPANY: {company_name}
+{dm_block}
+WEBSITE CONTENT (Markdown, pages separated by ---, each page headed by its source URL):
+{content}
+
+Return JSON only:
+{{
+  "services_offered": ["specific products/services, max 12"],
+  "about_summary": "<2-4 sentences from About / Our story / Team: who they are, what they stand for, leadership if named>",
+  "has_blog": <true if a blog, news, insights, or press section exists, else false>,
+  "blog_url": "<blog index URL if visible, else null>",
+  "news_url": "<news/press index URL if visible, else null>",
+  "blog_posts": [
+    {{
+      "title": "<latest post title>",
+      "published_at": "<date as written, preferably YYYY-MM-DD, else null>",
+      "description": "<1-2 sentence summary or excerpt>",
+      "url": "<post URL if visible, else null>"
+    }}
+  ],
+  "website_summary": "<3-5 sentences for a salesperson: what they do, who they serve, notable hiring or news>",
+  "decision_maker_mentions": ["verbatim quotes or bio lines about the decision maker if present"]{json_extra}
+}}
+
+Rules:
+- blog_posts: up to 5 most recent posts or news items. Omit the array if none are visible.
+- Do not invent dates, titles, or URLs.
+- Do not extract tech stack, SEO, chatbot, or testimonials.
+- about_summary should come from About / Team pages, not the homepage nav.{rules_extra}
+"""
+
+
+def _extract_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            text = str(item).strip()
+            if text and text.lower() not in ("null", "none", "n/a"):
+                parts.append(text)
+        return "; ".join(parts)
+    text = str(value).strip()
+    if text.lower() in ("null", "none", "n/a"):
+        return ""
+    return text
+
+
+def _website_extract_values(data: dict, extracts: Optional[list[dict]]) -> dict[str, str]:
+    allowed: list[str] = []
+    for row in extracts or []:
+        if not isinstance(row, dict) or row.get("kind") != "website_extract":
+            continue
+        for col in row.get("columns") or []:
+            name = str(col).strip()
+            if name and name not in allowed:
+                allowed.append(name)
+    out: dict[str, str] = {}
+    for name in allowed:
+        if name in data:
+            out[name] = _extract_cell(data.get(name))
+    return out
+
+
 def run(
     companies: list[_HasWebsite],
     client_profile,
@@ -108,6 +265,7 @@ def run(
     concurrency = env_int("WEBSITE_ENRICHMENT_CONCURRENCY", default=4)
     mode = _website_analysis_mode(client_profile)
     hiring_first = mode == "hiring_first"
+    extracts = _campaign_extracts(campaign_dir)
     log.info(
         "Stage 4 — Website enrichment (%d companies, concurrency=%d, mode=%s, "
         "crawl=%s, firecrawl_flag=%s)",
@@ -147,8 +305,10 @@ def run(
                         company.website,
                     )
                     return None
-                combined = cached.markdown
+                combined = without_generic_job_boards(cached.markdown)
                 careers_url = cached.careers_url
+                if careers_url and is_generic_job_board(careers_url):
+                    careers_url = None
                 log.info(
                     "LLM-only repair: using cached markdown for %s (%d chars)",
                     company.company_name,
@@ -168,6 +328,15 @@ def run(
                 plan = select_outreach_urls(
                     sitemap_urls, company.website, max_pages=max_pages
                 )
+                hints = website_page_hints(extracts)
+                if hints:
+                    plan.urls = prefer_brief_relevant_urls(
+                        sitemap_urls,
+                        company.website or "",
+                        hints,
+                        base_urls=plan.urls,
+                        max_pages=max_pages,
+                    )
 
                 markdown = scrape_urls(plan.urls) if plan.urls else None
                 crawl_source = f"{website_crawler()}_selected"
@@ -198,7 +367,15 @@ def run(
                     markdown,
                     sitemap_urls=sitemap_urls,
                 )
-                ats = open_roles_from_ats(careers_url) if careers_url else None
+                if careers_url and is_generic_job_board(careers_url):
+                    log.warning(
+                        "Rejected generic job board %s for %s — .co.uk is the suffix, not the company",
+                        careers_url,
+                        company.company_name,
+                    )
+                    careers_url = None
+                # HTML listing CTAs ("See all N roles") hop once inside this call.
+                ats = open_roles_from_careers_page(careers_url) if careers_url else None
                 if ats:
                     careers_url = ats["careers_url"]
                     careers_markdown = ats["markdown"]
@@ -246,6 +423,8 @@ def run(
                         company.website or "",
                         current_url=careers_url,
                     )
+                    if hop_url and is_generic_job_board(hop_url):
+                        hop_url = None
                     if hop_url and hop_url.rstrip("/") != careers_url.rstrip("/"):
                         log.info(
                             "Careers portal hop for %s: %s → %s",
@@ -253,7 +432,9 @@ def run(
                             careers_url,
                             hop_url,
                         )
-                        ats = open_roles_from_ats(hop_url)
+                        ats = open_roles_from_careers_page(
+                            hop_url, allow_cta_hop=False
+                        )
                         if ats:
                             careers_url = ats["careers_url"]
                             careers_markdown = ats["markdown"]
@@ -276,7 +457,10 @@ def run(
                                 careers_url = hop_url
                                 careers_markdown = hop_md
 
-                combined = markdown or ""
+                combined = without_generic_job_boards(markdown or "")
+                if careers_url and is_generic_job_board(careers_url):
+                    careers_url = None
+                    careers_markdown = None
                 if careers_markdown and careers_url:
                     already = careers_url.rstrip("/") in combined
                     if not already:
@@ -318,7 +502,11 @@ def run(
             analysis = None
             if combined:
                 analysis = _analyse_outreach(
-                    combined, company.company_name, log, dm_name=dm_name
+                    combined,
+                    company.company_name,
+                    log,
+                    dm_name=dm_name,
+                    extracts=extracts,
                 )
             if not analysis:
                 if not (hiring or careers_markdown or combined):
@@ -328,19 +516,27 @@ def run(
                     if not combined
                     else None,
                 )
-            return _apply_outreach_signals(
+            analysis = _apply_outreach_signals(
                 analysis,
                 markdown=combined,
                 plan=plan,
                 careers_url=careers_url,
                 hiring=hiring,
                 dm_name=dm_name,
+                website=company.website,
             )
+            apply_jobs_extracts(
+                analysis,
+                website_open_roles=analysis.website_open_roles,
+                company_open_jobs_summary=getattr(
+                    company, "company_open_jobs_summary", None
+                ),
+                extracts=extracts,
+            )
+            return analysis
 
         def _enrich_with_social() -> Optional[WebsiteAnalysis]:
             analysis = _enrich()
-            if analysis is None:
-                return None
             fb_on = os.environ.get("FACEBOOK_COMPANY_POSTS", "").lower() in (
                 "1",
                 "true",
@@ -351,7 +547,8 @@ def run(
                 "true",
                 "yes",
             )
-            if fb_on or ig_on:
+            ads_on = os.environ.get("META_ADS", "").lower() in ("1", "true", "yes")
+            if analysis is not None and (fb_on or ig_on):
                 try:
                     from agent.utils.company_social_posts import enrich_website_social_posts
 
@@ -364,6 +561,27 @@ def run(
                         company.company_name,
                         exc,
                     )
+            if ads_on:
+                try:
+                    from agent.utils.meta_ads import fetch_meta_ads
+
+                    summary = fetch_meta_ads(
+                        company_name=company.company_name,
+                        website=company.website or "",
+                        facebook_url=(
+                            getattr(analysis, "social_facebook", None) or ""
+                            if analysis is not None
+                            else ""
+                        ),
+                    )
+                    if summary:
+                        if analysis is None:
+                            analysis = WebsiteAnalysis()
+                        analysis.meta_ads_active = summary["meta_ads_active"]
+                        analysis.meta_ads_count = summary["meta_ads_count"]
+                        analysis.meta_ads_summary = summary["meta_ads_summary"] or None
+                except Exception as exc:
+                    log.info("Meta ads enrich skipped for %s: %s", company.company_name, exc)
             return analysis
 
         if isinstance(company, Lead) and tracker:
@@ -417,48 +635,16 @@ def _analyse_outreach(
     log: logging.Logger,
     *,
     dm_name: Optional[str] = None,
+    extracts: Optional[list[dict]] = None,
 ) -> Optional[WebsiteAnalysis]:
     """Extract outreach fields: services, about, recent blog/news, DM mentions."""
     content = _select_content(markdown, per_page_chars=4000, total_chars=26000)
-    dm_block = ""
-    if dm_name:
-        dm_block = f"""
-DECISION MAKER: {dm_name}
-If this person is named on about/team/leadership pages, copy the verbatim bio or mention into decision_maker_mentions (max 5). If they are not named, return an empty list.
-"""
-
-    prompt = f"""Extract outreach intelligence from this company website. Only use what is visible in the content.
-
-COMPANY: {company_name}
-{dm_block}
-WEBSITE CONTENT (Markdown, pages separated by ---, each page headed by its source URL):
-{content}
-
-Return JSON only:
-{{
-  "services_offered": ["specific products/services, max 12"],
-  "about_summary": "<2-4 sentences from About / Our story / Team: who they are, what they stand for, leadership if named>",
-  "has_blog": <true if a blog, news, insights, or press section exists, else false>,
-  "blog_url": "<blog index URL if visible, else null>",
-  "news_url": "<news/press index URL if visible, else null>",
-  "blog_posts": [
-    {{
-      "title": "<latest post title>",
-      "published_at": "<date as written, preferably YYYY-MM-DD, else null>",
-      "description": "<1-2 sentence summary or excerpt>",
-      "url": "<post URL if visible, else null>"
-    }}
-  ],
-  "website_summary": "<3-5 sentences for a salesperson: what they do, who they serve, notable hiring or news>",
-  "decision_maker_mentions": ["verbatim quotes or bio lines about the decision maker if present"]
-}}
-
-Rules:
-- blog_posts: up to 5 most recent posts or news items. Omit the array if none are visible.
-- Do not invent dates, titles, or URLs.
-- Do not extract tech stack, SEO, chatbot, or testimonials.
-- about_summary should come from About / Team pages, not the homepage nav.
-"""
+    prompt = build_outreach_prompt(
+        company_name=company_name,
+        content=content,
+        dm_name=dm_name,
+        extracts=extracts,
+    )
 
     try:
         data = _normalize_llm_object(
@@ -484,7 +670,7 @@ Rules:
             if text.lower() in ("null", "none", "n/a"):
                 return None
             return text
-        return WebsiteAnalysis(
+        analysis = WebsiteAnalysis(
             services_offered=data.get("services_offered") or [],
             about_summary=_opt_url(data.get("about_summary")),
             has_blog=has_blog if isinstance(has_blog, bool) else None,
@@ -495,6 +681,10 @@ Rules:
             website_summary=_opt_url(data.get("website_summary")),
             raw_markdown_length=len(markdown),
         )
+        extra = _website_extract_values(data, extracts)
+        if extra:
+            analysis.collector_extracts = extra
+        return analysis
     except Exception as e:
         log.warning("Outreach website analysis failed for '%s': %s — plain-text fallback", company_name, e)
         try:

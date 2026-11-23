@@ -195,14 +195,43 @@ def persist_auto_linkedin_company_seed_sources(
     return entry
 
 
+LINKEDIN_PAGE_SIZE = 10
+
+
+def per_query_limits(max_results: int, query_count: int) -> list[int]:
+    """Split a seed cap across searches so the requested rows add up to the cap."""
+    count = max(1, int(query_count))
+    total = max(1, int(max_results))
+    base, remainder = divmod(total, count)
+    return [base + (1 if i < remainder else 0) for i in range(count)]
+
+
+def pages_for_items(item_count: int, page_size: int = LINKEDIN_PAGE_SIZE) -> int:
+    count = max(0, int(item_count))
+    size = max(1, int(page_size))
+    if count == 0:
+        return 0
+    return (count + size - 1) // size
+
+
+def advance_start_page(
+    start_page: int,
+    items_requested: int,
+    page_size: int = LINKEDIN_PAGE_SIZE,
+) -> int:
+    """Next LinkedIn page after a search that asked for this many companies."""
+    return max(1, int(start_page)) + pages_for_items(items_requested, page_size)
+
+
 def scrape_linkedin_companies(
     queries: list[dict[str, Any]],
     *,
     max_results: int = 80,
     actor_id: str = DEFAULT_ACTOR,
     scraper_mode: str = "full",
-) -> list[dict]:
-    """Run harvestapi company search once per query; return merged company dicts."""
+    start_page: int = 1,
+) -> tuple[list[dict], float]:
+    """Run harvestapi company search once per query; return companies and Apify USD."""
     from apify_client import ApifyClient
 
     token = os.environ.get("APIFY_TOKEN")
@@ -210,24 +239,35 @@ def scrape_linkedin_companies(
         raise RuntimeError("APIFY_TOKEN required")
 
     client = ApifyClient(token)
-    per_query = max(5, int(max_results) // max(1, len(queries)))
+    usable = [
+        q for q in queries
+        if (q.get("searchQuery") or q.get("keyword") or "").strip()
+    ]
+    limits = per_query_limits(max_results, len(usable) or 1)
     seen: set[str] = set()
     items: list[dict] = []
+    apify_usd = 0.0
 
-    for q in queries:
-        search_query = (q.get("searchQuery") or q.get("keyword") or "").strip()
-        if not search_query:
+    for q, per_query in zip(usable, limits):
+        if per_query <= 0 or len(items) >= max_results:
             continue
+        search_query = (q.get("searchQuery") or q.get("keyword") or "").strip()
         locations = list(q.get("locations") or [])
         run_input: dict[str, Any] = {
             "scraperMode": scraper_mode if scraper_mode in ("short", "full") else "full",
             "searchQuery": search_query,
             "maxItems": per_query,
-            "startPage": 1,
+            "startPage": max(1, int(start_page)),
         }
         if locations:
             run_input["locations"] = locations
         run = client.actor(actor_id).call(run_input=run_input)
+        try:
+            from agent.utils.apify_spend import refetch_run_usd
+
+            apify_usd += refetch_run_usd(run)
+        except Exception:
+            pass
         dataset_id = (
             run.default_dataset_id
             if hasattr(run, "default_dataset_id")
@@ -248,8 +288,8 @@ def scrape_linkedin_companies(
             seen.add(key)
             items.append(item)
             if len(items) >= max_results:
-                return items
-    return items
+                return items, round(apify_usd, 4)
+    return items, round(apify_usd, 4)
 
 
 def _normalize_website(url: str) -> str:

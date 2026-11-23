@@ -6,8 +6,8 @@ Crawl priority (most → least):
   2. Blog / news index + latest articles, and services
   3. About / meet the team
 
-Social profile URLs (Facebook, Instagram, TikTok, X) are parsed from markdown
-rather than inferred by the LLM.
+Social profile URLs (Facebook, Instagram, TikTok, X) are parsed from crawled
+text and from homepage HTML footers, rather than inferred by the LLM.
 """
 from __future__ import annotations
 
@@ -106,6 +106,30 @@ _SOCIAL_RE = {
         r"(?!intent|share|i/|search|hashtag|home)[A-Za-z0-9_]+/?",
         re.I,
     ),
+    "youtube": re.compile(
+        r"https?://(?:www\.)?youtube\.com/(?:c/|channel/|user/|@)?[A-Za-z0-9._\-]+/?",
+        re.I,
+    ),
+    "pinterest": re.compile(
+        r"https?://(?:www\.)?pinterest\.com/[A-Za-z0-9._\-]+/?",
+        re.I,
+    ),
+    "reddit": re.compile(
+        r"https?://(?:www\.)?reddit\.com/(?:user|u|r)/[A-Za-z0-9._\-]+/?",
+        re.I,
+    ),
+    "threads": re.compile(
+        r"https?://(?:www\.)?threads\.net/@?[A-Za-z0-9._]+/?",
+        re.I,
+    ),
+    "snapchat": re.compile(
+        r"https?://(?:www\.)?snapchat\.com/add/[A-Za-z0-9._\-]+/?",
+        re.I,
+    ),
+    "linkedin": re.compile(
+        r"https?://(?:www\.)?linkedin\.com/(?:company|in)/[A-Za-z0-9._\-]+/?",
+        re.I,
+    ),
 }
 
 WEBSITE_CSV_FIELDS = [
@@ -122,8 +146,18 @@ WEBSITE_CSV_FIELDS = [
     "social_instagram",
     "social_tiktok",
     "social_x",
+    "social_youtube",
+    "social_pinterest",
+    "social_reddit",
+    "social_threads",
+    "social_snapchat",
+    "social_linkedin",
+    "other_social_profiles",
     "facebook_post_summary",
     "instagram_post_summary",
+    "meta_ads_active",
+    "meta_ads_count",
+    "meta_ads_summary",
     "decision_maker_mentions",
     "website_summary",
 ]
@@ -446,21 +480,177 @@ def prefer_brief_relevant_urls(
     return ordered[:max_pages]
 
 
+_SOCIAL_SLUG_SKIP = {
+    "facebook": {
+        "sharer",
+        "share",
+        "dialog",
+        "plugins",
+        "tr",
+        "privacy",
+        "policy",
+        "policies",
+        "login",
+        "help",
+        "watch",
+        "settings",
+        "legal",
+        "recover",
+        "lite",
+        "pages",
+        "groups",
+        "events",
+        "hashtag",
+    },
+    "instagram": {
+        "p",
+        "reel",
+        "reels",
+        "stories",
+        "explore",
+        "accounts",
+        "directory",
+        "about",
+        "legal",
+    },
+    "tiktok": {"share", "legal", "login"},
+    "x": {"intent", "share", "i", "search", "hashtag", "home", "privacy", "login", "settings"},
+    "youtube": {"watch", "playlist", "results", "feed", "embed", "redirect", "premium", "shorts"},
+    "pinterest": {"pin", "ideas", "search", "today"},
+    "reddit": set(),
+    "threads": {"login", "intent"},
+    "snapchat": set(),
+    "linkedin": {"share", "feed", "login", "jobs", "school"},
+}
+
+
+def _social_slug(network: str, url: str) -> str:
+    parts = [part for part in urlparse(url).path.strip("/").split("/") if part]
+    if not parts:
+        return ""
+    if network == "tiktok":
+        return parts[0].lstrip("@").lower()
+    if network == "linkedin":
+        if parts[0].lower() not in {"company", "in"} or len(parts) < 2:
+            return ""
+        return parts[1].lower()
+    if network == "reddit":
+        return parts[1].lower() if len(parts) > 1 else ""
+    if network == "youtube" and parts[0].lower() in {"c", "channel", "user"}:
+        return parts[1].lower() if len(parts) > 1 else ""
+    if network == "snapchat":
+        return parts[1].lower() if len(parts) > 1 else ""
+    return parts[0].lstrip("@").lower()
+
+
+_OTHER_SOCIAL_LABELS = (
+    ("tiktok", "TikTok"),
+    ("x", "X"),
+    ("youtube", "YouTube"),
+    ("pinterest", "Pinterest"),
+    ("reddit", "Reddit"),
+    ("threads", "Threads"),
+    ("snapchat", "Snapchat"),
+    ("linkedin", "LinkedIn"),
+)
+
+
+def other_social_profiles(found: dict[str, Optional[str]]) -> str:
+    """Profiles other than the Facebook and Instagram pages we fetch posts for."""
+    parts: list[str] = []
+    for key, label in _OTHER_SOCIAL_LABELS:
+        url = (found.get(key) or "").strip()
+        if url:
+            parts.append(f"{label}: {url}")
+    return "; ".join(parts)
+
+
 def extract_social_links(markdown: str) -> dict[str, Optional[str]]:
-    """First clean profile URL per network from crawled markdown."""
+    """First profile URL per network from crawled text or footer HTML.
+
+    Footer icons are plain links such as https://www.facebook.com/ofracosmetics/
+    and https://www.instagram.com/slmdskincare/. Share buttons and post URLs
+    are skipped so the company profile is the one that is kept.
+    """
     found = {key: None for key in _SOCIAL_RE}
     if not markdown:
         return found
+    linkedin_urls: list[str] = []
     for network, pattern in _SOCIAL_RE.items():
         for match in pattern.finditer(markdown):
-            url = match.group(0).rstrip(").,;\"'")
+            url = match.group(0).rstrip(").,;\"'?>")
+            url = url.split("?")[0].split("#")[0].rstrip("/")
             if _SHARE_SKIP.search(url):
                 continue
-            if network == "instagram" and re.search(r"/p/|/reel/", url, re.I):
+            slug = _social_slug(network, url)
+            if (
+                not slug
+                or slug.isdigit()
+                or slug in {"profile.php", "photo.php", "story.php"}
+                or slug in _SOCIAL_SLUG_SKIP.get(network, set())
+            ):
                 continue
-            found[network] = url.rstrip("/")
+            if network == "linkedin":
+                linkedin_urls.append(url)
+                continue
+            found[network] = url
             break
+    if linkedin_urls:
+        company = [url for url in linkedin_urls if "/company/" in url.lower()]
+        found["linkedin"] = (company or linkedin_urls)[0]
     return found
+
+
+def fill_social_links_from_homepage(
+    website: str,
+    found: dict[str, Optional[str]],
+) -> dict[str, Optional[str]]:
+    """Fill profile URLs from the live homepage footer when the crawl missed them."""
+    html = _fetch_homepage_html(website)
+    if not html:
+        return found
+    extra = extract_social_links(html)
+    merged = dict(found)
+    for key, url in extra.items():
+        if url and not merged.get(key):
+            merged[key] = url
+    return merged
+
+
+def _fetch_homepage_html(website: str) -> str:
+    base = _site_base(website)
+    if not base:
+        return ""
+    try:
+        import httpx
+    except ImportError:
+        return ""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html",
+    }
+    try:
+        import time
+
+        with httpx.Client(follow_redirects=True, timeout=12, headers=headers) as client:
+            resp = None
+            for attempt in range(3):
+                resp = client.get(base + "/")
+                if resp.status_code != 429 or attempt == 2:
+                    break
+                time.sleep(3 * (attempt + 1))
+    except Exception:
+        return ""
+    if resp is None or resp.status_code >= 400:
+        return ""
+    ctype = (resp.headers.get("content-type") or "").lower()
+    if ctype and "html" not in ctype and "text/" not in ctype:
+        return ""
+    return resp.text[:500_000]
 
 
 def extract_decision_maker_mentions(
@@ -575,13 +765,23 @@ def website_analysis_to_csv(wa: Optional[WebsiteAnalysis]) -> dict[str, str]:
         "social_instagram": wa.social_instagram or "",
         "social_tiktok": wa.social_tiktok or "",
         "social_x": wa.social_x or "",
+        "social_youtube": wa.social_youtube or "",
+        "social_pinterest": wa.social_pinterest or "",
+        "social_reddit": wa.social_reddit or "",
+        "social_threads": wa.social_threads or "",
+        "social_snapchat": wa.social_snapchat or "",
+        "social_linkedin": wa.social_linkedin or "",
+        "other_social_profiles": wa.other_social_profiles or "",
         "facebook_post_summary": wa.facebook_post_summary or "",
         "instagram_post_summary": wa.instagram_post_summary or "",
+        "meta_ads_active": wa.meta_ads_active or "",
+        "meta_ads_count": "" if wa.meta_ads_count is None else str(wa.meta_ads_count),
+        "meta_ads_summary": wa.meta_ads_summary or "",
     }
     has_blog = ""
     if wa.has_blog is not None:
         has_blog = str(wa.has_blog)
-    return {
+    row = {
         "website_is_hiring": wa.website_is_hiring or "",
         "website_open_roles": _join(wa.website_open_roles),
         "website_careers_url": wa.website_careers_url or "",
@@ -595,6 +795,14 @@ def website_analysis_to_csv(wa: Optional[WebsiteAnalysis]) -> dict[str, str]:
         "decision_maker_mentions": _join(wa.decision_maker_mentions),
         "website_summary": wa.website_summary or "",
     }
+    for key, val in getattr(wa, "collector_extracts", None) or {}:
+        if (
+            isinstance(key, str)
+            and key not in row
+            and re.fullmatch(r"[a-z][a-z0-9_]{0,32}", key)
+        ):
+            row[key] = "" if val is None else str(val)
+    return row
 
 
 def website_csv_row(wa: Optional[WebsiteAnalysis]) -> list[str]:
@@ -621,6 +829,15 @@ def _parse_bool(value) -> Optional[bool]:
     return None
 
 
+def _parse_count(value) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
 def website_analysis_from_csv(row: dict) -> Optional[WebsiteAnalysis]:
     keys = WEBSITE_CSV_FIELDS + ["last_blog_post", "tech_stack", "has_chatbot"]
     if not any(str(row.get(k) or "").strip() for k in keys):
@@ -643,8 +860,18 @@ def website_analysis_from_csv(row: dict) -> Optional[WebsiteAnalysis]:
         social_instagram=(row.get("social_instagram") or "").strip() or None,
         social_tiktok=(row.get("social_tiktok") or "").strip() or None,
         social_x=(row.get("social_x") or "").strip() or None,
+        social_youtube=(row.get("social_youtube") or "").strip() or None,
+        social_pinterest=(row.get("social_pinterest") or "").strip() or None,
+        social_reddit=(row.get("social_reddit") or "").strip() or None,
+        social_threads=(row.get("social_threads") or "").strip() or None,
+        social_snapchat=(row.get("social_snapchat") or "").strip() or None,
+        social_linkedin=(row.get("social_linkedin") or "").strip() or None,
+        other_social_profiles=(row.get("other_social_profiles") or "").strip() or None,
         facebook_post_summary=(row.get("facebook_post_summary") or "").strip() or None,
         instagram_post_summary=(row.get("instagram_post_summary") or "").strip() or None,
+        meta_ads_active=(row.get("meta_ads_active") or "").strip() or None,
+        meta_ads_count=_parse_count(row.get("meta_ads_count")),
+        meta_ads_summary=(row.get("meta_ads_summary") or "").strip() or None,
         decision_maker_mentions=_split(row.get("decision_maker_mentions")),
         website_summary=(row.get("website_summary") or "").strip() or None,
         website_is_hiring=(row.get("website_is_hiring") or "").strip() or None,

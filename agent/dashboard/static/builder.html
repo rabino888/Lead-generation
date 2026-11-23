@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>List-building control</title>
+  <title>Campaign builder — Lead List Ledger</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -16,7 +16,7 @@
     <a href="/dashboard" class="brand brand-title">Lead List Ledger</a>
     <div class="nav-btns">
       <a href="/dashboard">Overview</a>
-      <a href="/builder" class="here">Campaign builder</a>
+      <a href="/builder?new=1" class="here">Campaign builder</a>
     </div>
   </div>
 
@@ -86,7 +86,7 @@
 
     <div id="view-board" class="hidden">
       <div class="board-nav">
-        <a class="back" href="/dashboard" id="back">← Cost ledger</a>
+        <a class="back" href="/dashboard" id="back">← Lead List Ledger</a>
       </div>
       <header class="top">
         <span class="eyebrow">Campaign</span>
@@ -184,13 +184,14 @@
         </div>
 
         <div class="savebar">
-          <span class="savehint" id="save-hint">PUT /builder/api/campaigns/…/plan</span>
+          <span class="savehint" id="save-hint">Enrichment plan</span>
           <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
             <span class="savehint" id="save-status"></span>
             <button type="button" class="btn" id="save-btn">Save plan</button>
             <button type="button" class="btn primary" id="btn-to-confirm">Continue to confirm build</button>
           </div>
         </div>
+        <div id="collector-suggestions" class="panel" style="margin-top:14px"></div>
       </div>
 
       <div id="confirm-build" class="hidden">
@@ -228,6 +229,7 @@
           <div class="setup-actions" style="margin-top:16px">
             <button type="button" class="btn primary" id="btn-confirm-yes">Start seed + smoke gate</button>
             <button type="button" class="btn hidden" id="btn-confirm-resmoke">Re-run smoke</button>
+            <button type="button" class="btn hidden" id="btn-confirm-discard">Discard smoke</button>
             <button type="button" class="btn primary hidden" id="btn-confirm-approve">Approve full batch</button>
             <button type="button" class="btn" id="btn-confirm-no">Save for later</button>
             <button type="button" class="btn ghost" id="btn-confirm-back">← Back to modules</button>
@@ -266,6 +268,7 @@
     setupVisible: false,
     icpDetailVisible: false,
     modulesVisible: false,
+    collectorSuggestions: null,
     confirmVisible: false,
   };
 
@@ -280,6 +283,7 @@
     ['linkedin_company_jobs', 'Company open jobs', 'treg', 'Core'],
     ['facebook_company_posts', 'Facebook recent posts', 'treg', 'Optional'],
     ['instagram_company_posts', 'Instagram recent posts', 'treg', 'Optional'],
+    ['meta_ads', 'Meta ads running', 'treg', 'Optional'],
     ['apollo_phone', 'Decision-maker phone reveal', 'Apollo', 'Optional'],
   ];
   const KNOB = {
@@ -293,6 +297,7 @@
     linkedin_company_jobs: 'off → skip open-jobs enrich',
     facebook_company_posts: 'needs social URL from website scrape · soft-fail',
     instagram_company_posts: 'needs IG handle from website scrape · soft-fail',
+    meta_ads: 'Ad Library by domain or company name · stored, not a reject',
     apollo_phone: 'off → APOLLO_SKIP_PHONE=1',
   };
 
@@ -331,6 +336,44 @@
       return err.message;
     }
     return formatApiDetail(err.detail || err.message, fallback || 'Request failed');
+  }
+
+  function esc(value) {
+    return String(value == null ? '' : value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderCollectorSuggestions() {
+    const el = document.getElementById('collector-suggestions');
+    if (!el) return;
+    const doc = state.collectorSuggestions;
+    const rows = (doc && doc.suggestions) || [];
+    if (!rows.length) {
+      el.innerHTML = '<div class="panel-head"><h3>Collector suggestions</h3></div>'
+        + '<p class="setup-note" style="margin:0">No suggestions yet. Run '
+        + '<code>python scripts/suggest_collectors.py --campaign …</code></p>';
+      return;
+    }
+    const items = rows.map((row) => {
+      const cols = (row.columns && row.columns.length)
+        ? row.columns.join(', ')
+        : ((row.existing_fields || []).join(', ') || '—');
+      return '<li style="margin:0 0 8px"><b>' + esc(row.id) + '</b> · '
+        + esc(row.status) + ' · ' + esc(row.kind)
+        + '<div class="mrow-sub">' + esc(cols) + '</div>'
+        + '<div class="mrow-sub">' + esc(row.why || '') + '</div></li>';
+    }).join('');
+    const off = ((doc && doc.leave_off) || []).map((row) => {
+      return '<li><b>' + esc(row.module) + '</b> — ' + esc(row.reason || '')
+        + ' <span class="hint">' + esc(row.cost_note || '') + '</span></li>';
+    }).join('');
+    el.innerHTML = '<div class="panel-head"><h3>Collector suggestions</h3>'
+      + '<span class="hint">Read only · accept or reject with scripts/suggest_collectors.py</span></div>'
+      + '<ul style="margin:8px 0 0;padding-left:18px">' + items + '</ul>'
+      + (off ? '<p class="setup-note" style="margin:10px 0 4px">Leave off</p><ul style="margin:0;padding-left:18px">' + off + '</ul>' : '');
   }
 
   function api(path, opts) {
@@ -868,7 +911,8 @@
       } else {
         flowNote.textContent = 'Smoke gate: seeds → ICP match → dedupe → paid Apollo (+ Core modules) on a small slice. '
           + 'If there is no seeds.csv, the dashboard auto-builds LinkedIn company-search URLs from the ICP '
-          + 'and scrapes companies via Apify (paid, never jobs), then continues. After smoke, Approve runs the full batch.';
+          + 'and scrapes companies via Apify (paid, never jobs). After you approve, the batch keeps searching '
+          + 'and enriching until it reaches the target contactable number, or LinkedIn stops returning new companies.';
       }
     }
     const mods = (p.modules) || {};
@@ -1072,6 +1116,7 @@
     const hint = document.getElementById('confirm-status');
     const startBtn = document.getElementById('btn-confirm-yes');
     const resmokeBtn = document.getElementById('btn-confirm-resmoke');
+    const discardBtn = document.getElementById('btn-confirm-discard');
     const approveBtn = document.getElementById('btn-confirm-approve');
     if (!el) return;
     const smokeRan = !!(lr && (lr.smoke_run_id
@@ -1135,6 +1180,11 @@
     if (resmokeBtn) {
       resmokeBtn.classList.toggle('hidden', !canResmoke || active);
       resmokeBtn.disabled = active;
+    }
+    const canDiscard = ['seeding', 'matching', 'smoking', 'awaiting_approval', 'error'].indexOf(lr.phase) >= 0;
+    if (discardBtn) {
+      discardBtn.classList.toggle('hidden', !canDiscard);
+      discardBtn.disabled = false;
     }
     if (approveBtn) {
       approveBtn.classList.toggle('hidden', !canApprove);
@@ -1281,6 +1331,14 @@
     ]);
     state.icp = icpRes.data || {};
     state.seeds = seedRes.data || { sources: [] };
+    state.collectorSuggestions = { suggestions: [], leave_off: [], present: false };
+    try {
+      state.collectorSuggestions = await api(
+        '/builder/api/campaigns/' + encodeURIComponent(id) + '/collector_suggestions'
+      );
+    } catch (err) {
+      state.collectorSuggestions = { suggestions: [], leave_off: [], error: errText(err) };
+    }
     document.getElementById('setup-panel').classList.add('hidden');
     state.icpDetailVisible = !!opts.showIcpDetail;
     state.modulesVisible = !!opts.showModules;
@@ -1744,11 +1802,13 @@
       locked.textContent = (TYPE_LABEL[p.campaign_type] || outreachLabel(p.campaign_type))
         + ' · locked at ' + targetingLabel(p.campaign_type) + ' creation';
     }
-    document.getElementById('save-hint').textContent = `PUT /builder/api/campaigns/${c.campaign_id}/plan · ${p.campaign_type}`;
+    document.getElementById('save-hint').textContent =
+      (TYPE_LABEL[p.campaign_type] || outreachLabel(p.campaign_type)) + ' enrichment plan';
     document.getElementById('save-status').textContent = state.dirty ? 'Unsaved changes' : (p.updated_at_utc ? 'Saved ' + p.updated_at_utc : 'Using defaults until save');
     document.getElementById('board-left').innerHTML = isTalent ? talentLeft() : companyLeft();
     document.getElementById('board-right').innerHTML = estimateRight(isTalent);
     bindBoardControls(isTalent);
+    renderCollectorSuggestions();
   }
 
   function toggleHtml(on, locked) {
@@ -2219,6 +2279,25 @@
     const hint = document.getElementById('confirm-status');
     try {
       await startSmokeGateFromConfirm();
+    } catch (err) {
+      if (hint) hint.textContent = errText(err);
+      alert(errText(err));
+    }
+  });
+  document.getElementById('btn-confirm-discard').addEventListener('click', async () => {
+    const hint = document.getElementById('confirm-status');
+    if (!window.confirm('Discard this smoke and start over? The seed list is cleared. Spend already recorded stays on this campaign.')) return;
+    try {
+      const id = state.current && state.current.campaign_id;
+      if (!id) throw new Error('No campaign selected');
+      const res = await api('/builder/api/campaigns/' + encodeURIComponent(id) + '/run/discard', {
+        method: 'POST',
+        body: JSON.stringify({ confirm: true }),
+      });
+      state.listRun = res.list_run;
+      if (state.current) state.current.list_run = res.list_run;
+      renderListRunStatus(res.list_run);
+      if (hint) hint.textContent = (res.list_run && res.list_run.message) || 'Smoke discarded.';
     } catch (err) {
       if (hint) hint.textContent = errText(err);
       alert(errText(err));

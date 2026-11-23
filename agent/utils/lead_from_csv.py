@@ -79,7 +79,8 @@ def lead_from_row(row: dict[str, Any], *, run_id: str, client_id: str) -> Lead:
         score_method=(row.get("score_method") or "").strip() or None,
         matched_terms=_split(row.get("matched_terms")),
         score_evidence=_split(row.get("score_evidence")),
-        pain_points=_split(row.get("pain_points")),
+        pain_points=_split(row.get("solvable_pain") or row.get("pain_points")),
+        pain_point_evidence=_split(row.get("pain_evidence") or row.get("pain_point_evidence")),
         qualification_notes=(row.get("qualification_notes") or "").strip() or None,
         enrichment_status=EnrichmentStatus.COMPLETE if email else EnrichmentStatus.PARTIAL,
     )

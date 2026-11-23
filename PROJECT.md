@@ -93,6 +93,10 @@ seed_sources.json  →  scrape  →  match_campaign_icp.py  →  dedup + pre_apo
                                                       ▼
                                             06_scored → QA → 07_qa_flags
                                                       │
+                                                      ▼
+                                          08_outreach_segments
+                                    (company, open roles, buyer, size)
+                                                      │
                                     optional: phones / cost dashboard
 ```
 
@@ -256,7 +260,7 @@ data/clients/{client_id}/
     ├── enrichment_plan.json Module toggles + estimate inputs
     ├── run_payload.json     Optional sender + icp for Apollo/enrichment
     ├── stages/              Funnel artifacts — row counts = run metrics
-    │   ├── 01_raw_seeds.csv … 07_qa_flags.csv
+    │   ├── 01_raw_seeds.csv … 08_outreach_segments.csv
     └── …
 ```
 
@@ -289,6 +293,7 @@ All campaign scripts require `--campaign {campaign_id}`.
 
 ```bash
 python scripts/run_seed_source.py --campaign {campaign_id} --source csv_ingest --csv path/to/seeds.csv
+python scripts/run_seed_source.py --campaign {campaign_id} --source google_search --append  # SERP seeds
 python scripts/match_campaign_icp.py --campaign {campaign_id}
 python scripts/run_deterministic_campaign.py --campaign {campaign_id} --skip-enrichment
 python scripts/run_deterministic_campaign.py --campaign {campaign_id} --max-leads 40

@@ -170,6 +170,16 @@ _GEO_TRAILING = frozenset(
 )
 
 _PUNCT_EDGE = re.compile(r"^[\s\"'`“”‘’(\[]+|[\s\"'`“”‘’)\],.;:\-–—]+$")
+# Page chrome scraped as a company name: careers CTAs and copyright lines.
+_PAGE_PREFIX = re.compile(
+    r"^(?:únete al equipo|únete a|unete al equipo|unete a|empleo en|trabaja con nosotros en|trabaja en)\s+",
+    re.I,
+)
+_PAGE_SUFFIX = re.compile(
+    r"[\s.|:–—-]+todos los derechos(?:\s+reservados)?.*$",
+    re.I,
+)
+_COUNTRY_TAG = re.compile(r",\s*(?:ES|UK|US)\s*$", re.I)
 _MULTI_SPACE = re.compile(r"\s+")
 _AT_SPLIT = re.compile(r"\s+(?:@|at|en)\s+", re.I)
 _DASH_WRAP = re.compile(r"\s*[-–—]\s*[^-–—]{2,40}\s*[-–—]\s*")
@@ -211,6 +221,9 @@ def humanize_company_name(name: str | None) -> str:
         return ""
 
     cleaned = _MULTI_SPACE.sub(" ", raw)
+    cleaned = _PAGE_PREFIX.sub("", cleaned)
+    cleaned = _PAGE_SUFFIX.sub("", cleaned)
+    cleaned = _COUNTRY_TAG.sub("", cleaned)
     cleaned = _split_alias(cleaned)
     cleaned = _PAREN.sub(" ", cleaned)
     cleaned = _DASH_WRAP.sub(" ", cleaned)

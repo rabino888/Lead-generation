@@ -42,3 +42,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Marketing screen recordings (may show client data; large binaries)
+marketing/videos/

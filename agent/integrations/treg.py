@@ -165,6 +165,12 @@ def call_catalog(
             call_id,
             detail,
         )
+        try:
+            from agent.utils.raw_replies import store_raw_reply
+
+            store_raw_reply(endpoint_id, resp.json(), key=call_id or "error")
+        except Exception:
+            pass
         resp.raise_for_status()
     try:
         data = resp.json()
@@ -180,6 +186,12 @@ def call_catalog(
         cost,
         call_id or "—",
     )
+    try:
+        from agent.utils.raw_replies import store_raw_reply
+
+        store_raw_reply(endpoint_id, data, key=call_id)
+    except Exception:
+        pass
     return data, cost
 
 
@@ -600,6 +612,13 @@ def get_linkedin_person_profile_full(profile_url: Optional[str]) -> dict:
     return result
 
 
+def _post_items(data: Any) -> list[dict]:
+    """Row objects inside a posts payload. Field names are matched separately."""
+    from agent.utils.inbound_payload import iter_records
+
+    return iter_records(data)
+
+
 def get_linkedin_profile_posts(
     profile_url: Optional[str],
     max_posts: Optional[int] = None,
@@ -609,7 +628,6 @@ def get_linkedin_profile_posts(
         _default_max_posts,
         _extract_interests,
         _normalize_linkedin_url,
-        _normalize_post,
         _summarize_posts,
         detect_hiring_from_posts,
     )
@@ -618,9 +636,15 @@ def get_linkedin_profile_posts(
         max_posts = _default_max_posts()
     profile_url = _normalize_linkedin_url(profile_url)
     if not profile_url:
-        return {"posts": [], "interests": [], "summary": None}
+        return {"posts": [], "interests": [], "summary": None, "posts_status": "empty"}
     if not treg_configured():
-        return {"posts": [], "interests": [], "summary": None}
+        return {
+            "posts": [],
+            "interests": [],
+            "summary": None,
+            "posts_status": "error",
+            "posts_error": "TREG_TOKEN is not set",
+        }
 
     handle = _linkedin_handle(profile_url)
     query: dict[str, Any] = {"page": 1}
@@ -638,40 +662,32 @@ def get_linkedin_profile_posts(
         )
     except Exception as e:
         log.warning("treg LinkedIn posts failed for %s: %s", profile_url, e)
-        return {"posts": [], "interests": [], "summary": None}
+        return {
+            "posts": [],
+            "interests": [],
+            "summary": None,
+            "posts_status": "error",
+            "posts_error": str(e),
+        }
 
-    items: list[dict] = []
-    if isinstance(data, dict):
-        for key in ("elements", "items", "posts", "data"):
-            val = data.get(key)
-            if isinstance(val, list):
-                items = [x for x in val if isinstance(x, dict)]
-                break
-        if not items and isinstance(data.get("element"), dict):
-            items = [data["element"]]
-    elif isinstance(data, list):
-        items = [x for x in data if isinstance(x, dict)]
+    from agent.utils.inbound_payload import map_inbound
 
+    inbound = map_inbound(data, "post", source=POSTS_ENDPOINT)
     normalized: list[dict] = []
-    for item in items[: max(1, max_posts)]:
-        # Harvest nests postedAt.date / engagement.likes
-        posted = item.get("postedAt")
-        if isinstance(posted, dict):
-            item = {**item, "postedAt": posted.get("date") or posted.get("timestamp")}
-        eng = item.get("engagement")
-        if isinstance(eng, dict):
-            item = {
-                **item,
-                "likes": eng.get("likes") or item.get("likes"),
-                "comments": eng.get("comments") or item.get("comments"),
+    for record in inbound["records"][: max(1, max_posts)]:
+        text = str(record.get("text") or "").strip()[:1000]
+        url = record.get("url")
+        if not text and not url:
+            continue
+        normalized.append(
+            {
+                "text": text,
+                "url": url,
+                "posted_at": record.get("posted_at"),
+                "likes": record.get("likes"),
+                "comments": record.get("comments"),
             }
-        if not item.get("content") and item.get("text"):
-            pass
-        elif item.get("content") and not item.get("text"):
-            item = {**item, "text": item.get("content")}
-        post = _normalize_post(item)
-        if post.get("text") or post.get("url"):
-            normalized.append(post)
+        )
 
     interests = _extract_interests(normalized)
     summary = _summarize_posts(normalized, interests)
@@ -682,6 +698,7 @@ def get_linkedin_profile_posts(
         "interests": interests,
         "summary": summary,
         "is_hiring": hiring,
+        "posts_status": "ok" if normalized else "empty",
     }
 
 
@@ -702,16 +719,29 @@ def get_linkedin_company_profile(company_linkedin_url: Optional[str]) -> dict:
     except Exception as e:
         log.warning("treg LinkedIn company failed for %s: %s", company_linkedin_url, e)
         return {}
-    out = _unwrap_routed(data)
-    description = (out.get("description") or out.get("about") or "").strip()
+    from agent.utils.inbound_payload import map_object
+
+    mapped = map_object(data, "company", source=COMPANY_ENDPOINT)
+    description = mapped.get("description") or ""
+    if not isinstance(description, str):
+        description = str(description)
+    description = description.strip()
     return {
-        "name": out.get("name") or out.get("company_name"),
-        "linkedin_url": out.get("linkedin_url") or company_linkedin_url,
+        "name": mapped.get("name"),
+        "linkedin_url": mapped.get("linkedin_url") or company_linkedin_url,
         "description": description[:2000] if description else None,
-        "industry": out.get("industry"),
-        "employee_count": out.get("employee_count") or out.get("staff_count"),
-        "website": out.get("website") or out.get("website_url") or out.get("websiteUrl"),
+        "industry": mapped.get("industry"),
+        "employee_count": mapped.get("employee_count"),
+        "website": mapped.get("website"),
     }
+
+
+def _ascii_key(value: str) -> str:
+    """HTTP idempotency headers are ASCII. Drop marks such as ó."""
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", value)
+    return normalized.encode("ascii", "ignore").decode("ascii")
 
 
 def _domain_from_website(website: Optional[str]) -> str:
@@ -732,64 +762,27 @@ def _domain_from_website(website: Optional[str]) -> str:
 
 
 def _job_items(data: Any) -> list:
-    """Normalize treg/Apify job payloads.
+    """Row objects inside a jobs payload. Titles are matched separately."""
+    from agent.utils.inbound_payload import iter_records
 
-    Routed company-jobs returns ``{output: {jobs: [...]}}``.
-    LinkedIn job search returns the dataset as ``{output: [{title: ...}, ...]}``.
-    Treating a list ``output`` as the wrapper dict drops every title.
-    """
-    if isinstance(data, list):
-        return data
-    if not isinstance(data, dict):
-        return []
-    output = data.get("output")
-    if isinstance(output, list):
-        return output
-    if isinstance(output, dict):
-        data = output
-    jobs = data.get("jobs")
-    if isinstance(jobs, list):
-        return jobs
-    for key in ("items", "elements", "data"):
-        nested = data.get(key)
-        if isinstance(nested, list):
-            return nested
-        if isinstance(nested, dict):
-            inner = nested.get("items") or nested.get("jobs") or nested.get("elements")
-            if isinstance(inner, list):
-                return inner
-    return []
+    return iter_records(data)
 
 
 def _job_titles_from_payload(data: Any) -> list[str]:
-    titles: list[str] = []
-    items = _job_items(data)
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        title = (
-            item.get("title")
-            or item.get("jobTitle")
-            or item.get("job_title")
-            or item.get("position")
-            or ""
-        )
-        if isinstance(title, str) and title.strip():
-            titles.append(title.strip())
-        details = item.get("job_details")
-        if isinstance(details, dict):
-            t2 = details.get("title")
-            if isinstance(t2, str) and t2.strip():
-                titles.append(t2.strip())
-    # de-dupe preserve order
+    from agent.utils.inbound_payload import map_inbound
+
+    inbound = map_inbound(data, "job", source="company_jobs")
     seen: set[str] = set()
     out_titles: list[str] = []
-    for t in titles:
-        key = t.lower()
+    for record in inbound["records"]:
+        title = record.get("title")
+        if not isinstance(title, str) or not title.strip():
+            continue
+        key = title.strip().lower()
         if key in seen:
             continue
         seen.add(key)
-        out_titles.append(t)
+        out_titles.append(title.strip())
     return out_titles
 
 
@@ -850,7 +843,7 @@ def get_company_open_jobs(
                 COMPANY_JOBS_DOMAIN_ENDPOINT,
                 method="POST",
                 body={"name": company_name.strip(), "limit": max_jobs},
-                idempotency_key=f"co-jobs-name:{company_name.strip().lower()}",
+                idempotency_key=_ascii_key(f"co-jobs-name:{company_name.strip().lower()}"),
                 timeout=90.0,
             )
             titles = _job_titles_from_payload(data)[:max_jobs]
@@ -909,6 +902,7 @@ def enrich_decision_maker_linkedin(
             "interests": [],
             "post_summary": None,
             "is_hiring": None,
+            "posts_status": "skipped",
         }
     posts_data = get_linkedin_profile_posts(profile_url, max_posts=max_posts)
     posts = posts_data.get("posts") or []
@@ -920,4 +914,6 @@ def enrich_decision_maker_linkedin(
         "is_hiring": posts_data.get("is_hiring")
         if posts_data.get("is_hiring") is not None
         else detect_hiring_from_posts(posts),
+        "posts_status": posts_data.get("posts_status") or ("ok" if posts else "empty"),
+        "posts_error": posts_data.get("posts_error") or "",
     }

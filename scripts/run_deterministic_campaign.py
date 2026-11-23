@@ -29,9 +29,11 @@ load_dotenv(ROOT / ".env", override=True)
 from agent.models import CompanySeed, ICPProfile, InputMode, RunRequest, SenderProfile
 from agent.pipeline import run_pipeline
 from agent.utils import run_tracker
-from agent.utils.campaign_config import load_campaign, load_run_payload
+from agent.utils.campaign_config import load_campaign, load_icp, load_run_payload
 from agent.utils.icp_rules import ensure_stages_dir, load_icp_rules, stage_path
+from agent.utils.outreach_segments import segment_outreach_rows
 from agent.utils.pre_apollo_gate import filter_pre_apollo
+from agent.utils.website_seed_check import apply_website_seed_gate
 from agent.utils.seed_sources import run_source
 from agent.utils.seeds import load_company_seeds_csv
 from agent.utils.apollo_contactable import write_apollo_contactable_csv
@@ -168,6 +170,7 @@ def main() -> int:
 
     # ── Stage 6b: pre-Apollo hard gate ─────────────────────────────────────────
     pre_kept, pre_rejected = filter_pre_apollo(kept, rules, campaign.campaign_dir)
+    pre_kept, pre_rejected = apply_website_seed_gate(pre_kept, pre_rejected)
     if pre_rejected:
         rej_fields = list(fields)
         if "pre_apollo_reason" not in rej_fields:
@@ -248,6 +251,19 @@ def main() -> int:
     )
     write_stage_csv(campaign, "enriched", contactable)
     write_stage_csv(campaign, "scored", contactable)
+    role_groups = []
+    if campaign.icp_path.exists():
+        role_groups = [group.model_dump() for group in load_icp(campaign).outreach_role_groups]
+    write_stage_csv(
+        campaign,
+        "outreach_segments",
+        segment_outreach_rows(
+            contactable,
+            company_size_min=rules.company_size_min,
+            company_size_max=rules.company_size_max,
+            role_groups=role_groups,
+        ),
+    )
 
     # QA flags from scored CSV rows (lightweight)
     qa_rows = []
@@ -264,7 +280,7 @@ def main() -> int:
             if need and loc and need.lower() not in loc:
                 reasons.append("location_mismatch")
                 break
-        if not (r.get("matched_terms") or r.get("pain_points")):
+        if not (r.get("matched_terms") or r.get("solvable_pain") or r.get("pain_points")):
             reasons.append("no_matched_terms")
         if reasons:
             out = dict(r)

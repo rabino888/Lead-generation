@@ -15,7 +15,7 @@ data/clients/{client_id}/
       enrichment_plan.json
       seed_sources.json
       icp.json                # snapshot of the linked ICP for pipeline tools
-      stages/                 # 01_raw_seeds … 07_qa_flags
+      stages/                 # 01_raw_seeds … 08_outreach_segments
     saved_for_later/{campaign_id}/
     completed/
       company_outreach/{campaign_id}/

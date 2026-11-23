@@ -18,7 +18,10 @@ Compat: `data/campaigns/{id}/` may be a junction into the client campaign folder
 - FastAPI + uvicorn on Railway. Entry point: `main.py`.
 - **Deterministic funnel:** `run_seed_source.py` → `match_campaign_icp.py` →
  `stage_dedupe.py` (pre-Apollo gate) → `stage_apollo.py` → enrich stages → `stage_score.py` →
- stage CSVs under `data/campaigns/{id}/stages/01_*` … `07_qa_flags.csv`.
+ stage CSVs under `data/campaigns/{id}/stages/01_*` … `08_outreach_segments.csv`.
+ Outreach segments (`stage_segment.py`) group any campaign by company, open roles,
+ buyer seniority, and size versus that campaign's ICP. Optional role buckets
+ belong in `icp.json` `outreach_role_groups`, never in shared code.
  Or orchestrate via `run_deterministic_campaign.py` / `POST /run` (curated seeds).
  Post-run: `scripts/build_cost_dashboard.py` then `scripts/serve_cost_dashboard.py` (or `GET /dashboard` on `main.py`).
  Pre-run list builder: `GET /builder` — module toggles + $/lead estimate; saves `enrichment_plan.json` per campaign.
@@ -26,6 +29,13 @@ Compat: `data/campaigns/{id}/` may be a junction into the client campaign folder
  `campaigns/` (`icp.json`, `campaign.json` with `icp_id`, `seed_sources.json`,
  `enrichment_plan.json`, `stages/`). Prefer `/builder` create flow.
 - All external API clients are in `agent/integrations/`.
+- **Seed sources:** `csv_ingest`, `linkedin_companies`, `google_search`, `google_maps`
+  (`agent/utils/seed_sources.py` REGISTRY). `google_search` = Apify SERP queries from
+  `seed_sources.json` → one seed per registrable domain; built-in excludes cover social,
+  directories, job boards, generic news and gov/edu TLDs; industry media / trade bodies go
+  in that campaign's `config.exclude_domains`. Firmographics on Google seeds trust
+  **domain matches only** (Owler fuzzy-name hits picked wrong companies), and Owler
+  `employees: 0` means unknown, never a real size.
 - Current `/run` flow is request-driven: `RunRequest.sender` + `RunRequest.icp` provide client,
   offer, and ICP context directly. Do not reintroduce LeadGen Clients Sheet auth unless asked.
 - Google Sheets output and the "Dedup" tab are still used.

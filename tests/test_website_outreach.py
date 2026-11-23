@@ -6,6 +6,7 @@ from agent.utils.website_outreach import (
     extract_decision_maker_mentions,
     extract_social_links,
     format_blog_posts,
+    other_social_profiles,
     parse_blog_posts,
     select_outreach_urls,
     website_analysis_from_csv,
@@ -88,6 +89,51 @@ def test_select_skips_job_postings_and_blog_pagination():
     assert "https://acme.com/careers/senior-engineer" not in plan.urls
     assert "https://acme.com/blog/page/2" not in plan.urls
     assert "https://acme.com/blog/how-we-hire" in plan.urls
+
+
+def test_extract_social_links_from_footer_icons():
+    ofra = """
+    <a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>
+    <ul class="list-unstyled list-social footer__list-social">
+      <li><a href="https://www.facebook.com/ofracosmetics/" class="link list-social__link">Facebook</a></li>
+      <li><a href="https://www.instagram.com/ofracosmetics/" class="link list-social__link">Instagram</a></li>
+      <li><a href="https://twitter.com/OFRACosmetics" class="link list-social__link">X</a></li>
+      <li><a href="https://www.tiktok.com/@ofracosmetics" class="link list-social__link">TikTok</a></li>
+      <li><a href="https://www.pinterest.com/ofracosmetics/" class="link list-social__link">Pinterest</a></li>
+      <li><a href="https://www.youtube.com/c/ofracosmeticsusa" class="link list-social__link">YouTube</a></li>
+      <li><a href="https://www.linkedin.com/in/someone"></a></li>
+      <li><a href="https://www.linkedin.com/company/ofra-cosmetics"></a></li>
+    </ul>
+    """
+    slmd = """
+    <div class="footerIcons">
+      <a href="https://www.instagram.com/slmdskincare/" aria-label="SLMD Instagram"></a>
+      <a href="https://www.tiktok.com/@slmdskincare?" aria-label="SLMD TikTok"></a>
+      <a href="https://www.reddit.com/user/slmdskincareofficial/" aria-label="SLMD Reddit"></a>
+      <a href="https://www.facebook.com/slmdskincare" aria-label="SLMD Facebook"></a>
+    </div>
+    """
+    ofra_links = extract_social_links(ofra)
+    assert ofra_links["facebook"] == "https://www.facebook.com/ofracosmetics"
+    assert ofra_links["instagram"] == "https://www.instagram.com/ofracosmetics"
+    assert ofra_links["x"] == "https://twitter.com/OFRACosmetics"
+    assert ofra_links["tiktok"] == "https://www.tiktok.com/@ofracosmetics"
+    assert ofra_links["pinterest"] == "https://www.pinterest.com/ofracosmetics"
+    assert ofra_links["youtube"] == "https://www.youtube.com/c/ofracosmeticsusa"
+    assert ofra_links["linkedin"] == "https://www.linkedin.com/company/ofra-cosmetics"
+    assert "YouTube:" in other_social_profiles(ofra_links)
+    assert "Pinterest:" in other_social_profiles(ofra_links)
+    assert "Facebook" not in other_social_profiles(ofra_links)
+    slmd_links = extract_social_links(slmd)
+    assert slmd_links["instagram"] == "https://www.instagram.com/slmdskincare"
+    assert slmd_links["facebook"] == "https://www.facebook.com/slmdskincare"
+    assert slmd_links["tiktok"] == "https://www.tiktok.com/@slmdskincare"
+    assert slmd_links["reddit"] == "https://www.reddit.com/user/slmdskincareofficial"
+    assert extract_social_links(
+        "http://www.facebook.com/2008/fbml https://www.facebook.com/ofracosmetics"
+    )["facebook"] == "https://www.facebook.com/ofracosmetics"
+    assert extract_social_links("https://www.facebook.com/profile.php?id=9")["facebook"] is None
+    assert extract_social_links("https://www.facebook.com/groups")["facebook"] is None
 
 
 def test_extract_social_links_skips_share_buttons():

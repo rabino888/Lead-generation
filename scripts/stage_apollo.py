@@ -29,6 +29,8 @@ from agent.utils.cost_tracker import get_cost_tracker, init_cost_tracker
 from agent.utils.deduplication import filter_seen_contacts
 from agent.utils.pre_apollo_gate import record_apollo_attempted_domains
 from agent.utils.apollo_contactable import write_apollo_contactable_csv
+from agent.utils.enrichment_plan import load_plan
+from agent.utils.list_run import apply_plan_runtime
 from agent.utils.stage_runner import (
     campaign_arg_load,
     get_logger,
@@ -78,13 +80,19 @@ def main() -> int:
     init_cost_tracker(run_id, client.client_id)
     log.info("Apollo stage run_id=%s companies=%d", run_id, len(companies))
 
-    qualified, rejected = contacts.run(
-        companies=companies,
-        client_profile=client,
-        input_mode=InputMode.CURATED_SEEDS,
-        run_id=run_id,
-        logger=log,
-    )
+    # enrichment_plan.json decides phone reveal (modules.apollo_phone), not the mere
+    # presence of APOLLO_PHONE_WEBHOOK_URL in .env.
+    plan = load_plan(campaign.campaign_dir, campaign.campaign_id)
+    phone_on = bool((plan.get("modules") or {}).get("apollo_phone"))
+    log.info("Apollo phone reveal: %s (enrichment_plan modules.apollo_phone)", "on" if phone_on else "off")
+    with apply_plan_runtime(plan):
+        qualified, rejected = contacts.run(
+            companies=companies,
+            client_profile=client,
+            input_mode=InputMode.CURATED_SEEDS,
+            run_id=run_id,
+            logger=log,
+        )
     qualified = filter_seen_contacts(client.client_id, qualified, log)
 
     q_rows = leads_to_rows(qualified)

@@ -158,6 +158,33 @@ def test_linkedin_handle_decodes_percent_encoding():
     )
 
 
+def test_posts_unwrap_routed_output_and_linkedin_url(monkeypatch):
+    payload = {
+        "output": {
+            "elements": [
+                {
+                    "content": "New creative for the spring drop",
+                    "linkedinUrl": "https://www.linkedin.com/feed/update/urn:li:activity:1",
+                    "postedAt": {"date": "2026-10-01T00:00:00Z"},
+                    "engagement": {"likes": 3, "comments": 1},
+                }
+            ]
+        }
+    }
+
+    def _fake_call(*_args, **_kwargs):
+        return payload, 0.004
+
+    monkeypatch.setattr("agent.integrations.treg.call_catalog", _fake_call)
+    out = treg.get_linkedin_profile_posts(
+        "https://www.linkedin.com/in/jsurda", max_posts=5
+    )
+    assert out["posts_status"] == "ok"
+    assert len(out["posts"]) == 1
+    assert "spring drop" in out["posts"][0]["text"]
+    assert out["posts"][0]["url"].endswith("activity:1")
+
+
 def test_get_linkedin_profile_posts_normalizes_harvest_elements(monkeypatch):
     body = {
         "elements": [

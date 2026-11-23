@@ -16,6 +16,7 @@
     <a href="/dashboard" class="brand brand-title">Lead List Ledger</a>
     <div class="nav-btns">
       <a href="/dashboard" class="here">Overview</a>
+      <a href="/builder?new=1">Campaign builder</a>
     </div>
   </div>
   <nav class="crumbs" id="crumbs" aria-label="Breadcrumb"></nav>
@@ -240,8 +241,12 @@
     if (linked) row.href = '#/campaign/' + encodeURIComponent(c.campaign_id);
 
     const id = el('div', 'id-cell');
-    id.append(el('span', 'name', c.campaign_id));
+    const label = c.display_name || c.campaign_id;
+    id.append(el('span', 'name', label));
     const meta = el('div', 'meta');
+    if (c.display_name && c.campaign_id && c.display_name !== c.campaign_id) {
+      meta.append(el('span', 'mono', c.campaign_id));
+    }
     meta.append(el('span', null, c.client_name || c.client_id || 'unknown client'));
     const ctype = campaignTypeOf(c);
     meta.append(el('span', 'ctype ' + (ctype === 'talent_search' ? 'ts' : 'co'),
@@ -725,6 +730,7 @@
     ['linkedin_company_jobs', 'Company open jobs'],
     ['facebook_company_posts', 'Facebook posts'],
     ['instagram_company_posts', 'Instagram posts'],
+    ['meta_ads', 'Meta ads'],
     ['apollo_phone', 'Phone reveal'],
   ];
 
@@ -1117,7 +1123,7 @@
       eyebrow: 'New client',
       title: 'Create client',
       sub: 'Profile only — source file + CLIENT.md. Draft ICPs afterward.',
-      crumbs: [['All clients', '#/']],
+      crumbs: [['Overview', '#/']],
       showBrand: false,
       headerActions: [],
       view: view
@@ -1587,15 +1593,9 @@
       title: name,
       sub: mine.length + (mine.length === 1 ? ' campaign' : ' campaigns') + ' under this client.',
       crumbs: [['Overview', '#/']],
-      titleSuffix: clientId,
+      titleSuffix: name,
       clientId: clientId,
-      headerActions: [
-        {
-          href: '/builder?client=' + encodeURIComponent(clientId) + '&new=1',
-          label: 'Build new campaign',
-          primary: true
-        }
-      ],
+      headerActions: [],
       view: view
     };
   }
@@ -1727,6 +1727,78 @@
         if (lr.error) {
           gatePanel.append(el('div', 'callout', lr.error));
         }
+        if (['seeding', 'matching', 'smoking', 'awaiting_approval', 'error'].indexOf(lr.phase) >= 0) {
+          const discard = el('button', null, 'Discard smoke and start over');
+          discard.type = 'button';
+          discard.style.marginTop = '10px';
+          discard.addEventListener('click', async () => {
+            if (!window.confirm('Discard this smoke and start over? The seed list is cleared. Spend already recorded stays on this campaign.')) return;
+            discard.disabled = true;
+            const res = await fetch('/builder/api/campaigns/' + encodeURIComponent(campaignId) + '/run/discard', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ confirm: true }),
+            });
+            if (!res.ok) {
+              discard.disabled = false;
+              alert(await res.text());
+              return;
+            }
+            location.reload();
+          });
+          gatePanel.append(discard);
+        }
+        const audit = lr.enrichment_audit || {};
+        const auditChecks = (audit.checks || []).filter((c) => c.enabled && c.status !== 'ok' && c.status !== 'off');
+        if (audit.summary) {
+          gatePanel.append(el('h3', null, 'Enrichment check'));
+          const auditBox = el('div', audit.ok ? 'note' : 'callout', audit.summary);
+          gatePanel.append(auditBox);
+          if (auditChecks.length) {
+            const ul = el('ul', 'seed-list');
+            auditChecks.forEach((c) => {
+              ul.appendChild(el('li', null, c.label + ' — ' + c.detail));
+            });
+            gatePanel.append(ul);
+          }
+          const misses = ((audit.company_qa || {}).companies || []).filter((row) => !row.fit);
+          if (misses.length) {
+            const ul = el('ul', 'seed-list');
+            misses.forEach((row) => {
+              ul.appendChild(el('li', null,
+                (row.company_name || 'Company')
+                + ' — ' + (row.industry || 'no industry')
+                + ' — ' + (row.reason_text || row.reason || '')
+              ));
+            });
+            gatePanel.append(ul);
+          }
+        }
+        if (lr.phase === 'completed' && !lr.delivery_accepted) {
+          gatePanel.append(el('p', 'note', lr.raw_replies_kept
+            ? 'Vendor replies for this run are kept until you accept the list.'
+            : 'This run has no stored vendor replies. The next run keeps them until you accept the list.'));
+          const accept = el('button', 'primary',
+            (audit.company_qa && audit.company_qa.ok === false)
+              ? 'Accept this list anyway'
+              : 'Accept list and clear raw replies');
+          accept.type = 'button';
+          accept.style.marginTop = '10px';
+          accept.addEventListener('click', () => {
+            accept.disabled = true;
+            fetch('/builder/api/campaigns/' + encodeURIComponent(campaignId) + '/run/accept', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ confirm: true }),
+            }).then((r) => r.json().then((body) => ({ ok: r.ok, body }))).then((res) => {
+              accept.textContent = res.ok ? 'Accepted' : ((res.body && res.body.detail) || 'Could not accept');
+            }).catch(() => {
+              accept.disabled = false;
+              accept.textContent = 'Accept failed';
+            });
+          });
+          gatePanel.append(accept);
+        }
       })
       .catch(() => {
         clear(gatePanel);
@@ -1826,7 +1898,7 @@
     myRuns.forEach((r) => runPanel.append(runCard(r, campaignId, true)));
     view.append(section('Pipeline stages', 'Stage-level spend (seeding, Apollo, enrichment, repair). The campaign as a whole is one generated list on the ledger.', runPanel));
 
-    const crumbs = [['All clients', '#/']];
+    const crumbs = [['Overview', '#/']];
     if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
     return {
       eyebrow: 'Campaign',
@@ -1885,9 +1957,9 @@
       }
     );
 
-    const crumbs = [['All clients', '#/']];
+    const crumbs = [['Overview', '#/']];
     if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
-    crumbs.push([c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
+    crumbs.push([c.display_name || c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
     return {
       eyebrow: 'Pipeline stage',
       title: r.label || r.run_key || runKey,
@@ -1925,12 +1997,12 @@
       }
     );
 
-    const crumbs = [['All clients', '#/']];
+    const crumbs = [['Overview', '#/']];
     if (c.client_id) crumbs.push([c.client_name || c.client_id, '#/client/' + encodeURIComponent(c.client_id)]);
-    crumbs.push([c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
+    crumbs.push([c.display_name || c.campaign_id, '#/campaign/' + encodeURIComponent(campaignId)]);
     return {
       eyebrow: 'Generated leads',
-      title: c.campaign_id + ' · leads',
+      title: (c.display_name || c.campaign_id) + ' · leads',
       sub: int(c.delivered_leads) + ' contactable leads on disk for this campaign.',
       crumbs: crumbs,
       titleSuffix: 'leads',
@@ -1979,20 +2051,53 @@
     return true;
   }
 
+  function viewNotFound(kind, id) {
+    const view = document.createDocumentFragment();
+    const panel = el('div', 'panel');
+    panel.append(el('div', 'empty',
+      'This ' + (kind === 'client' ? 'client' : 'list')
+      + ' was not found in the ledger'
+      + (id ? (' (“' + id + '”).') : '.')));
+    const actions = el('div', 'toolbar-row');
+    const home = el('a', 'btn primary', 'Back to overview');
+    home.href = '#/';
+    actions.append(home);
+    const builder = el('a', 'btn', 'Campaign builder');
+    builder.href = '/builder?new=1';
+    actions.append(builder);
+    panel.append(actions);
+    view.append(panel);
+    return {
+      eyebrow: 'Not found',
+      title: 'List not found',
+      sub: 'The link may be outdated, or the campaign has not been indexed yet. Try Refresh costs on Overview.',
+      crumbs: [['Overview', '#/']],
+      headerActions: [],
+      view: view
+    };
+  }
+
   function resolve() {
     if (route.kind === 'new-client') return viewNewClient();
     if (route.kind === 'client') {
       const page = viewClient(route.id);
       if (page) return page;
-    } else if (route.kind === 'campaign') {
+      return viewNotFound('client', route.id);
+    }
+    if (route.kind === 'campaign') {
       const page = viewCampaign(route.id);
       if (page) return page;
-    } else if (route.kind === 'run') {
+      return viewNotFound('campaign', route.id);
+    }
+    if (route.kind === 'run') {
       const page = viewRun(route.id, route.runKey);
       if (page) return page;
-    } else if (route.kind === 'leads') {
+      return viewNotFound('campaign', route.id);
+    }
+    if (route.kind === 'leads') {
       const page = viewLeads(route.id);
       if (page) return page;
+      return viewNotFound('campaign', route.id);
     }
     return viewOverview();
   }
@@ -2024,8 +2129,7 @@
     const link = e.target.closest ? e.target.closest('a[href^="#/"]') : null;
     if (!link) return;
     e.preventDefault();
-    const next = parseHash(link.getAttribute('href'));
-    if (routeResolves(next)) navigate(next, false);
+    navigate(parseHash(link.getAttribute('href')), false);
   });
 
   function render() {
@@ -2095,8 +2199,7 @@
   }
 
   window.addEventListener('hashchange', function () {
-    const next = parseHash(location.hash);
-    if (routeResolves(next)) navigate(next, true);
+    navigate(parseHash(location.hash), true);
   });
 
   const embedded = parseEmbedded();

@@ -16,7 +16,12 @@ from typing import Any, Callable, Sequence
 
 log = logging.getLogger("leadgen.talent_list_run")
 
-from agent.utils.list_run import load_list_run, update_list_run
+from agent.utils.list_run import (
+    _record_enrichment_audit,
+    _with_audit_message,
+    load_list_run,
+    update_list_run,
+)
 from agent.utils.enrichment_plan import plan_module
 from agent.utils.talent_people import (
     STAGE_T01_RAW_PEOPLE,
@@ -392,18 +397,31 @@ def start_talent_smoke_gate(
             "smoke_seeds": smoke_n,
             "smoke_contactable": contactable_n,
         }
+        audit: dict[str, Any] = {}
+        try:
+            audit = _record_enrichment_audit(
+                campaign_dir,
+                campaign_id,
+                t05_path if t05_path.is_file() else None,
+            )
+        except Exception:
+            log.debug("enrichment audit after talent smoke skipped", exc_info=True)
         state = update_list_run(
             campaign_dir,
             phase="awaiting_approval",
-            message=(
-                f"Smoke complete: {contactable_n} contactable of {smoke_n} people smoked. "
-                f"{seed_n} seeds on disk. Review results, then approve the full batch."
+            message=_with_audit_message(
+                (
+                    f"Smoke complete: {contactable_n} contactable of {smoke_n} people smoked. "
+                    f"{seed_n} seeds on disk. Review results, then approve the full batch."
+                ),
+                audit,
             ),
             smoke_run_id=f"talent-smoke:{campaign_id}",
             smoke_csv_path=_display_stage_path(campaign_dir, t05_path) if t05_path.is_file() else "",
             seed_preview=seed_preview,
             smoke_preview=smoke_preview,
             counts=counts,
+            enrichment_audit=audit,
             error="",
         )
         try:
@@ -558,11 +576,22 @@ def approve_talent_full_batch(campaign_dir: Path, campaign_id: str) -> dict[str,
         msg = f"Full talent batch finished — {delivered_n} contactable lead(s) on disk."
         if sheet_url:
             msg = f"{msg} Sheet: {sheet_url}"
+        audit: dict[str, Any] = {}
+        try:
+            audit = _record_enrichment_audit(
+                campaign_dir,
+                campaign_id,
+                t05_path if t05_path.is_file() else None,
+            )
+        except Exception:
+            log.debug("enrichment audit after talent full batch skipped", exc_info=True)
+        msg = _with_audit_message(msg, audit)
 
         state = update_list_run(
             campaign_dir,
             phase="completed",
             message=msg,
+            enrichment_audit=audit,
             full_run_id=f"talent-full:{campaign_id}",
             smoke_csv_path=(
                 _display_stage_path(campaign_dir, t05_path)

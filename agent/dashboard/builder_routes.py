@@ -9,6 +9,7 @@ SPEC-dashboard.md · SPEC-talent-search.md
   GET  /builder/api/campaigns/{id}      — summary + plan
   POST /builder/api/campaigns/{id}/estimate
   PUT  /builder/api/campaigns/{id}/plan
+  GET  /builder/api/campaigns/{id}/collector_suggestions
   GET/PUT /builder/api/campaigns/{id}/icp
   GET/PUT /builder/api/campaigns/{id}/seed_sources
   GET  /builder/api/rates
@@ -40,6 +41,7 @@ from agent.utils.list_run import (
     ACTIVE_PHASES,
     approve_full_batch,
     assert_can_start_smoke_gate,
+    discard_smoke_run,
     load_list_run,
     start_smoke_gate,
     update_list_run,
@@ -617,6 +619,9 @@ async def builder_create_campaign(
         seeds_doc = {"campaign_id": campaign_id, "sources": []}
     _write_json_file(path / "seed_sources.json", seeds_doc)
     plan = default_plan(campaign_id, campaign_type=ctype)
+    from agent.utils.enrichment_plan import apply_icp_module_overrides
+
+    apply_icp_module_overrides(plan, icp_stub if isinstance(icp_stub, dict) else None)
     save_plan(path, plan)
 
     # Legacy path for scripts that still open data/campaigns/{id}
@@ -689,6 +694,28 @@ async def builder_save_plan(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     sync_campaign_config_to_client(path)
     return {"ok": True, "plan": saved}
+
+
+@router.get("/api/campaigns/{campaign_id}/collector_suggestions")
+async def builder_collector_suggestions(
+    campaign_id: str, _: None = Depends(_check_access)
+):
+    """Read-only collector suggestions. Accept and reject stay on the CLI."""
+    path = _campaign_dir(campaign_id)
+    file_path = path / "collector_suggestions.json"
+    if not file_path.is_file():
+        return {
+            "campaign_id": campaign_id,
+            "suggestions": [],
+            "leave_off": [],
+            "present": False,
+        }
+    data = _read_json_file(file_path, {})
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="collector_suggestions.json must be an object")
+    data.setdefault("campaign_id", campaign_id)
+    data["present"] = True
+    return data
 
 
 def _read_json_file(path: Path, default: dict[str, Any] | list[Any]) -> Any:
@@ -848,13 +875,15 @@ async def builder_get_seeds(campaign_id: str, _: None = Depends(_check_access)):
             "registered_types": [
                 "csv_ingest",
                 "linkedin_companies",
+                "google_search",
                 "google_maps",
                 "people_csv_ingest (talent T01)",
                 "linkedin_people (talent T01; default harvestapi/linkedin-profile-search)",
             ],
             "operator_note": (
                 "Company discovery: csv_ingest (free), linkedin_companies (ICP → company "
-                "search + Apify), or google_maps. Talent: people_csv_ingest or "
+                "search + Apify), google_search (web SERP queries, one seed per domain) or "
+                "google_maps. Talent: people_csv_ingest or "
                 "linkedin_people → stages/T01_raw_people.csv. Confirm / Start in /builder "
                 "runs the gated talent funnel (T01→T05 smoke, then Approve for full batch)."
             ),
@@ -1070,6 +1099,12 @@ async def builder_get_list_run(campaign_id: str, _: None = Depends(_check_access
                                 state["smoke_preview"] = rows
         except Exception:
             pass
+    try:
+        from agent.utils.raw_replies import raw_replies_kept
+
+        state["raw_replies_kept"] = raw_replies_kept(path)
+    except Exception:
+        state["raw_replies_kept"] = False
     return {"ok": True, "list_run": state}
 
 
@@ -1133,6 +1168,23 @@ async def builder_start_list_run(
     }
 
 
+@router.post("/api/campaigns/{campaign_id}/run/discard")
+async def builder_discard_smoke(
+    campaign_id: str,
+    body: ListRunApproveRequest = ListRunApproveRequest(),
+    _: None = Depends(_check_access),
+):
+    """Clear the smoke gate so it can be started again. Campaign cost log is kept."""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    path = _campaign_dir(campaign_id)
+    try:
+        state = discard_smoke_run(path, campaign_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "list_run": state, "campaign": campaign_summary(path)}
+
+
 @router.post("/api/campaigns/{campaign_id}/run/approve")
 async def builder_approve_full_batch(
     campaign_id: str,
@@ -1183,3 +1235,33 @@ async def builder_approve_full_batch(
         "list_run": load_list_run(path, campaign_id),
         "campaign": campaign_summary(path),
     }
+
+
+@router.post("/api/campaigns/{campaign_id}/run/accept")
+async def builder_accept_delivery(
+    campaign_id: str,
+    body: ListRunApproveRequest = ListRunApproveRequest(),
+    _: None = Depends(_check_access),
+):
+    """Operator accepts the finished list. Raw vendor replies are deleted only here."""
+    if not body.confirm:
+        raise HTTPException(status_code=400, detail="confirm must be true")
+    path = _campaign_dir(campaign_id)
+    state = load_list_run(path, campaign_id)
+    if state.get("phase") != "completed":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Accept the list after it is generated (phase={state.get('phase')}).",
+        )
+    from agent.utils.raw_replies import clear_raw_replies
+
+    removed = clear_raw_replies(path)
+    update_list_run(
+        path,
+        delivery_accepted=True,
+        message=(state.get("message") or "List accepted.")
+        + f" Raw vendor replies cleared ({removed} file(s)).",
+    )
+    accepted = load_list_run(path, campaign_id)
+    accepted["raw_replies_kept"] = False
+    return {"ok": True, "removed_files": removed, "list_run": accepted}

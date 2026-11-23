@@ -35,5 +35,6 @@
   "apply_weak_seed_checks": false,
   "weak_seed_rule_pack": "",
   "weak_seed_extra_patterns": [],
-  "website_analysis_mode": "full"
+  "website_analysis_mode": "full",
+  "outreach_role_groups": []
 }

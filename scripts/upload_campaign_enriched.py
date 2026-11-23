@@ -50,7 +50,7 @@ ENRICHED_HEADERS = [
     "company_linkedin_description", "company_is_hiring", "company_open_jobs_count",
     "company_open_jobs_summary",
     "decision_maker_direct_phone", "decision_maker_mobile_phone",
-    "icp_match_score", "lead_score", "pain_points", "qualification_notes",
+    "icp_match_score", "lead_score", "solvable_pain", "pain_evidence", "qualification_notes",
     "website_summary", "enriched_at",
 ]
 
@@ -124,7 +124,8 @@ def _csv_to_enriched_rows(
             lead.get("decision_maker_mobile_phone", ""),
             lead.get("icp_match_score", ""),
             lead.get("lead_score", ""),
-            lead.get("pain_points", ""),
+            lead.get("solvable_pain") or lead.get("pain_points", ""),
+            lead.get("pain_evidence") or lead.get("pain_point_evidence", ""),
             lead.get("qualification_notes", ""),
             lead.get("website_summary", ""),
             "new",
@@ -248,7 +249,16 @@ def _create_run_sheet(
                 apollo_signals=ApolloSignals(),
                 icp_match_score=int(row["icp_match_score"]) if row.get("icp_match_score") else None,
                 lead_score=int(row["lead_score"]) if row.get("lead_score") else None,
-                pain_points=[p.strip() for p in (row.get("pain_points") or "").split(";") if p.strip()],
+                pain_points=[
+                    p.strip()
+                    for p in (row.get("solvable_pain") or row.get("pain_points") or "").split(";")
+                    if p.strip()
+                ],
+                pain_point_evidence=[
+                    p.strip()
+                    for p in (row.get("pain_evidence") or row.get("pain_point_evidence") or "").split(";")
+                    if p.strip()
+                ],
                 qualification_notes=row.get("qualification_notes") or None,
                 enrichment_status=EnrichmentStatus.COMPLETE,
                 run_id=run_id,

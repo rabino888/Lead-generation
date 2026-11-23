@@ -127,6 +127,46 @@ def run(
     return qualified, partial
 
 
+def _company_jobs_key(url: str) -> str:
+    from agent.integrations.apify import _normalize_linkedin_url
+
+    li = _normalize_linkedin_url(url) or ""
+    if li.endswith("/jobs"):
+        li = li[: -len("/jobs")]
+    li = li.rstrip("/").lower().replace("http://", "https://")
+    return li.replace("https://www.", "https://")
+
+
+def _jobs_for_url(jobs_by_url: dict[str, dict], url: str) -> dict:
+    """Match a company jobs bucket when http/https or a trailing slash differ."""
+    key = _company_jobs_key(url)
+    if not key:
+        return {}
+    for raw, bucket in jobs_by_url.items():
+        if _company_jobs_key(str(raw)) == key:
+            return bucket or {}
+    if "/company/" in key:
+        slug = key.split("/company/")[-1].split("/")[0]
+        if slug:
+            for raw, bucket in jobs_by_url.items():
+                other = _company_jobs_key(str(raw))
+                other_slug = other.split("/company/")[-1].split("/")[0] if "/company/" in other else ""
+                if other_slug and other_slug == slug:
+                    return bucket or {}
+    return {}
+
+
+def _apply_company_jobs(data: dict, jobs: dict) -> None:
+    """Write a jobs lookup onto company enrichment, including a confirmed zero."""
+    if not jobs:
+        return
+    if jobs.get("is_hiring") is None and not jobs.get("job_titles") and "open_jobs_count" not in jobs:
+        return
+    data["is_hiring"] = jobs.get("is_hiring")
+    data["open_jobs_count"] = jobs.get("open_jobs_count", 0)
+    data["open_jobs_summary"] = jobs.get("summary")
+
+
 def enrich_linkedin_for_leads(
     leads: list[Lead],
     client_profile: ClientProfile,
@@ -200,6 +240,19 @@ def enrich_linkedin_for_leads(
                     names_by_linkedin=names_by_li,
                 )
             )
+        with_titles = sum(1 for bucket in jobs_by_url.values() if bucket.get("job_titles"))
+        log.info(
+            "Company open jobs: %d companies checked, %d with titles",
+            len(jobs_by_url),
+            with_titles,
+        )
+        if not jobs_by_url:
+            log.info(
+                "Company open jobs batch had no company LinkedIn URLs; "
+                "lookup runs after each company profile resolves"
+            )
+    else:
+        log.info("Company open jobs skipped — APIFY_SKIP_LINKEDIN_JOBS is set")
 
     def _fetch_company(lead: Lead) -> None:
         """Enrich one unique company; runs in the pool, one lead per key."""
@@ -221,14 +274,7 @@ def enrich_linkedin_for_leads(
                 fetch_open_jobs=not jobs_by_url,
             )
         if jobs_by_url and data.get("linkedin_url"):
-            li = data["linkedin_url"].split("?")[0].rstrip("/")
-            if li.endswith("/jobs"):
-                li = li[:-len("/jobs")]
-            jobs = jobs_by_url.get(li) or {}
-            if jobs.get("job_titles") or jobs.get("open_jobs_count"):
-                data["is_hiring"] = jobs.get("is_hiring")
-                data["open_jobs_count"] = jobs.get("open_jobs_count", 0)
-                data["open_jobs_summary"] = jobs.get("summary")
+            _apply_company_jobs(data, _jobs_for_url(jobs_by_url, data["linkedin_url"]))
         with company_cache_lock:
             company_cache[key] = data
 
@@ -298,6 +344,19 @@ def enrich_linkedin_for_leads(
             dm.linkedin_about = linkedin_context.get("about")
             dm.linkedin_headline = linkedin_context.get("headline")
             dm.is_hiring = linkedin_context.get("is_hiring")
+            posts_status = linkedin_context.get("posts_status") or ""
+            if posts_status == "error":
+                log.warning(
+                    "LinkedIn posts failed for %s: %s",
+                    lead.company_name,
+                    linkedin_context.get("posts_error") or "unknown error",
+                )
+            elif posts_status == "empty":
+                log.info(
+                    "LinkedIn posts empty for %s (%s)",
+                    lead.company_name,
+                    dm.linkedin_url,
+                )
 
         if tracker:
             with tracker.lead_context(lead.lead_id, lead.company_name):

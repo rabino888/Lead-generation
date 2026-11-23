@@ -63,3 +63,13 @@ def test_property_management_phrases():
 def test_avoids_useless_stub():
     # Strip industry, but keep geo when the leftover brand would be tiny.
     assert humanize_company_name("Buy Marbella Property") == "Buy Marbella"
+
+
+def test_strips_page_chrome_and_country_tag():
+    assert humanize_company_name("Únete a Miranza") == "Miranza"
+    assert humanize_company_name("Empleo en MedPlaya") == "MedPlaya"
+    assert (
+        humanize_company_name("Stima Centros de dia. Todos los derechos reservados")
+        == "Stima Centros de dia"
+    )
+    assert humanize_company_name("Grupopoliclinica, ES") == "Grupopoliclinica"

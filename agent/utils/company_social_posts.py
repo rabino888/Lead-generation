@@ -24,9 +24,12 @@ def instagram_handle_from_url(url: str) -> str:
     return handle
 
 
-def _summarize_social_posts(posts: list[dict[str, Any]], *, limit: int = 5) -> str:
-    snippets: list[str] = []
-    for post in posts[:limit]:
+def format_recent_posts(posts: list[dict[str, Any]], *, limit: int = 5) -> str:
+    """One line per post, for the five latest posts that have text."""
+    lines: list[str] = []
+    for post in posts or []:
+        if len(lines) >= limit:
+            break
         if not isinstance(post, dict):
             continue
         text = (
@@ -37,9 +40,20 @@ def _summarize_social_posts(posts: list[dict[str, Any]], *, limit: int = 5) -> s
             or ""
         )
         text = re.sub(r"\s+", " ", str(text).strip())
-        if text:
-            snippets.append(text[:220])
-    return " | ".join(snippets)
+        if not text:
+            continue
+        when = str(post.get("posted_at") or post.get("date") or "").strip()
+        snippet = text[:500]
+        number = len(lines) + 1
+        if when:
+            lines.append(f"{number}. {when} — {snippet}")
+        else:
+            lines.append(f"{number}. {snippet}")
+    return "\n".join(lines)
+
+
+def _summarize_social_posts(posts: list[dict[str, Any]], *, limit: int = 5) -> str:
+    return format_recent_posts(posts, limit=limit)
 
 
 def _posts_from_treg_payload(data: Any) -> list[dict[str, Any]]:
@@ -80,8 +94,10 @@ def fetch_facebook_posts_summary(page_url: str) -> str:
             idempotency_key=f"fb-posts:{url}",
             timeout=90.0,
         )
-        posts = _posts_from_treg_payload(data)
-        return _summarize_social_posts(posts)
+        from agent.utils.inbound_payload import map_inbound
+
+        inbound = map_inbound(data, "post", source="treg.facebook.user.posts")
+        return _summarize_social_posts(inbound["records"])
     except Exception as exc:
         log.info("Facebook posts skipped for %s: %s", url, exc)
         return ""
@@ -104,8 +120,10 @@ def fetch_instagram_posts_summary(profile_url: str) -> str:
             idempotency_key=f"ig-posts:{handle}",
             timeout=90.0,
         )
-        posts = _posts_from_treg_payload(data)
-        return _summarize_social_posts(posts)
+        from agent.utils.inbound_payload import map_inbound
+
+        inbound = map_inbound(data, "post", source="treg.instagram.user.posts")
+        return _summarize_social_posts(inbound["records"])
     except Exception as exc:
         log.info("Instagram posts skipped for @%s: %s", handle, exc)
         return ""

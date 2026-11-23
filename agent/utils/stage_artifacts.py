@@ -120,7 +120,8 @@ def lead_to_stage_row(lead: Lead) -> dict[str, Any]:
         "score_method": lead.score_method or "",
         "matched_terms": _join(lead.matched_terms),
         "score_evidence": _join(lead.score_evidence),
-        "pain_points": _join(lead.pain_points),
+        "solvable_pain": _join(lead.pain_points),
+        "pain_evidence": _join(lead.pain_point_evidence),
         "qualification_notes": lead.qualification_notes or "",
         "run_id": lead.run_id,
     }

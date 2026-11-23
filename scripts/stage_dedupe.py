@@ -22,6 +22,7 @@ load_dotenv(ROOT / ".env", override=True)
 from agent.utils.deduplication import filter_seen_leads
 from agent.utils.icp_rules import load_icp_rules
 from agent.utils.pre_apollo_gate import filter_pre_apollo
+from agent.utils.website_seed_check import apply_website_seed_gate
 from agent.utils.stage_artifacts import dedupe_seed_rows
 from agent.utils.stage_runner import (
     campaign_arg_load,
@@ -54,6 +55,11 @@ def main() -> int:
         action="store_true",
         help="Pre-Apollo gate: keep seeds without employee count",
     )
+    parser.add_argument(
+        "--skip-homepage-check",
+        action="store_true",
+        help="Skip the pre-Apollo homepage liveness and site check",
+    )
     args = parser.parse_args()
 
     log = get_logger("stage_dedupe")
@@ -81,6 +87,8 @@ def main() -> int:
             campaign.campaign_dir,
             drop_unknown_size=not args.allow_unknown_size,
         )
+        if not args.skip_homepage_check:
+            pre_kept, pre_rejected = apply_website_seed_gate(pre_kept, pre_rejected)
         if pre_rejected:
             rej_fields = list(kept[0].keys()) if kept else ["company_name", "website"]
             if "pre_apollo_reason" not in rej_fields:

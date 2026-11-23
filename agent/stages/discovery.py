@@ -69,7 +69,9 @@ def _from_curated_seeds(
             RawCompany(
                 company_name=name,
                 website=website,
-                industry=seed.industry or icp.industry,
+                # Blank seed industry stays blank. icp.industry is only the first
+                # ICP industry and was being copied onto every company.
+                industry=seed.industry,
                 location=seed.location or icp.location,
                 company_size=seed.company_size,
                 company_linkedin_url=seed.company_linkedin_url,

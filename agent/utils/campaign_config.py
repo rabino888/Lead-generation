@@ -7,7 +7,7 @@ Each campaign lives under data/campaigns/{campaign_id}/:
   seed_sources.json   — chosen scrapers/directories and per-source config
   run_payload.json    — sender + icp for pipeline runs
   seeds.csv           — curated company seeds (built or hand-maintained)
-  stages/             — funnel stage artifacts (01_raw_seeds.csv … 07_qa_flags.csv)
+  stages/             — funnel stage artifacts (01_raw_seeds.csv … 08_outreach_segments.csv)
   curated_supplement.json — optional manual seed additions
 """
 from __future__ import annotations
@@ -48,7 +48,7 @@ ENRICHED_HEADERS = [
     "decision_maker_apollo_person_id", "decision_maker_name", "decision_maker_title",
     "decision_maker_email", "decision_maker_email_status", "decision_maker_linkedin",
     "decision_maker_direct_phone", "decision_maker_mobile_phone",
-    "icp_match_score", "lead_score", "pain_points", "qualification_notes",
+    "icp_match_score", "lead_score", "solvable_pain", "pain_evidence", "qualification_notes",
     "website_summary", "enriched_at",
 ]
 
@@ -68,6 +68,7 @@ STAGE_APOLLO_REJECTED = "04_apollo_rejected.csv"
 STAGE_ENRICHED = "05_enriched.csv"
 STAGE_SCORED = "06_scored.csv"
 STAGE_QA_FLAGS = "07_qa_flags.csv"
+STAGE_OUTREACH_SEGMENTS = "08_outreach_segments.csv"
 
 STAGE_ARTIFACTS: tuple[str, ...] = (
     STAGE_RAW_SEEDS,
@@ -80,6 +81,7 @@ STAGE_ARTIFACTS: tuple[str, ...] = (
     STAGE_ENRICHED,
     STAGE_SCORED,
     STAGE_QA_FLAGS,
+    STAGE_OUTREACH_SEGMENTS,
 )
 
 STAGE_REJECT_ARTIFACTS: frozenset[str] = frozenset({
@@ -149,6 +151,20 @@ class DiscoveryConfig(BaseModel):
         return domains
 
 
+class OutreachRoleGroup(BaseModel):
+    """
+    Optional outreach bucket declared on a campaign ICP.
+
+    Patterns are case-insensitive substrings. They match open roles first,
+    then services offered, so similar titles can share a segment without
+    hardcoding an industry in the pipeline.
+    """
+
+    id: str
+    label: str
+    patterns: list[str] = Field(default_factory=list)
+
+
 class RequiredSignals(BaseModel):
     """Name/industry patterns a seed must match before ICP acceptance."""
     name_signal_required: bool = Field(
@@ -210,11 +226,15 @@ class CampaignIcpConfig(BaseModel):
     weak_seed_extra_patterns: list[str] = Field(default_factory=list)
     # Pitch-intelligence campaigns: careers probe + open roles over SEO/blog/chatbot LLM.
     website_analysis_mode: str = "full"
-    # None = auto (on when ICP is location-bound). Explicit true/false overrides.
+    # None = auto (on when the ICP is location-bound). Explicit true/false overrides.
     require_location_match: bool | None = None
+    # None = auto (on when the ICP has both an industry allow-list and an exclude list).
+    require_industry_match: bool | None = None
     # None = allow recruiter/staffing names only when target industries include them.
     # True forces allow. False keeps the gate even if staffing is a target industry.
     allow_recruiter_companies: bool | None = None
+    # Optional. Empty means segments use the recorded industry and the raw open roles.
+    outreach_role_groups: list[OutreachRoleGroup] = Field(default_factory=list)
 
     def merged_excluded_name_pattern(self) -> str:
         parts = [self.excluded_name_patterns]

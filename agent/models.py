@@ -176,14 +176,26 @@ class WebsiteAnalysis(BaseModel):
     social_instagram: Optional[str] = None
     social_tiktok: Optional[str] = None
     social_x: Optional[str] = None
+    social_youtube: Optional[str] = None
+    social_pinterest: Optional[str] = None
+    social_reddit: Optional[str] = None
+    social_threads: Optional[str] = None
+    social_snapchat: Optional[str] = None
+    social_linkedin: Optional[str] = None
+    other_social_profiles: Optional[str] = None
     facebook_post_summary: Optional[str] = None
     instagram_post_summary: Optional[str] = None
+    meta_ads_active: Optional[str] = None
+    meta_ads_count: Optional[int] = None
+    meta_ads_summary: Optional[str] = None
     decision_maker_mentions: list[str] = Field(default_factory=list)
     website_summary: Optional[str] = None
     raw_markdown_length: Optional[int] = None
     website_is_hiring: Optional[str] = None  # yes | no | unknown | None
     website_open_roles: list[str] = Field(default_factory=list)
     website_careers_url: Optional[str] = None
+    # Columns from an accepted enrichment_plan extract. Empty for every other campaign.
+    collector_extracts: dict[str, str] = Field(default_factory=dict)
 
 
 # ── Contact ───────────────────────────────────────────────────────────────────

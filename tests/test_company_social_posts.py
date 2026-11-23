@@ -4,8 +4,22 @@ from __future__ import annotations
 from agent.models import WebsiteAnalysis
 from agent.utils.company_social_posts import (
     enrich_website_social_posts,
+    format_recent_posts,
     instagram_handle_from_url,
 )
+
+
+def test_format_recent_posts_numbers_each_of_five():
+    posts = [
+        {"text": f"Post {i}", "posted_at": f"2026-10-0{i}"}
+        for i in range(1, 8)
+    ]
+    summary = format_recent_posts(posts)
+    lines = summary.splitlines()
+    assert len(lines) == 5
+    assert lines[0] == "1. 2026-10-01 — Post 1"
+    assert lines[4].startswith("5. ")
+    assert "Post 6" not in summary
 
 
 def test_instagram_handle_from_url():

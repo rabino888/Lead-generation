@@ -45,6 +45,36 @@ def test_lead_counts_fall_back_to_root_seeds(tmp_path):
     assert counts["contactable"] == 0
 
 
+def test_enriched_fills_contactable_when_apollo_csv_missing(tmp_path):
+    campaign = tmp_path / "agent_enriched"
+    header = "lead_id,decision_maker_email"
+    _write_csv(
+        campaign / "stages" / "05_enriched.csv",
+        header,
+        ["1,a@x.com", "2,b@x.com"],
+    )
+
+    counts = campaign_lead_counts(campaign)
+    assert counts["contactable"] == 2
+    assert counts["enriched"] == 2
+    assert counts["scored"] == 0
+
+
+def test_apollo_contactable_is_not_replaced_by_enriched(tmp_path):
+    campaign = tmp_path / "both"
+    person = "lead_id,decision_maker_email"
+    _write_csv(campaign / "stages" / "04_apollo_contactable.csv", person, ["1,a@x.com"])
+    _write_csv(
+        campaign / "stages" / "05_enriched.csv",
+        person,
+        ["1,a@x.com", "2,b@x.com"],
+    )
+
+    counts = campaign_lead_counts(campaign)
+    assert counts["contactable"] == 1
+    assert counts["enriched"] == 2
+
+
 def test_lead_counts_ignore_backup_contactable_files(tmp_path):
     campaign = tmp_path / "c"
     header = "lead_id,decision_maker_email"

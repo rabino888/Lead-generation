@@ -169,13 +169,14 @@ Used by `POST /run`, `scripts/run_curated_csv.py`, `scripts/run_enrichment_batch
 
 | Step | Stage artifact | Status |
 |------|----------------|--------|
-| Seed scrape | `stages/01_raw_seeds.csv` | `run_seed_source.py` — `csv_ingest`, `linkedin_jobs` (Apollo blocked) |
+| Seed scrape | `stages/01_raw_seeds.csv` | `run_seed_source.py` — `csv_ingest`, `linkedin_companies`, `google_search` (2026-11-10), `google_maps`; `linkedin_jobs` legacy (Apollo blocked) |
 | ICP match | `stages/02_icp_matched.csv` | `match_campaign_icp.py` + `agent/utils/icp_match.py` |
 | Dedup + pre-Apollo | `stages/03_deduped.csv` | `stage_dedupe.py` (gate default on) + `stage_pre_apollo.py` |
 | Apollo contact | `stages/04_apollo_contactable.csv` | `stage_apollo.py` + merge guard; CostTracker |
 | Enrich | `stages/05_enriched.csv` | Firecrawl + Apify; `hiring_first` website mode; repair/LinkedIn-only scripts |
 | Keyword score | `stages/06_scored.csv` | `keyword_score.py` (+ hiring boost when configured) |
 | QA flags | `stages/07_qa_flags.csv` | Borderline / location / empty-match flags |
+| Outreach segments | `stages/08_outreach_segments.csv` | `stage_segment.py` — company, open roles, buyer, size vs ICP |
 | Cost dashboard | SPA `/dashboard` + `data/cost_dashboard_index.json` | `build_cost_dashboard.py`; serve: `serve_cost_dashboard.py` or FastAPI; create/edit: `/builder` |
 
 Campaign contract: `icp.json` + `seed_sources.json` + `stages/` + `run_payload.json`.
@@ -337,6 +338,16 @@ Source: `Leads generation unstructured/docs/specs/2026-08-06-outreach-newsletter
 ---
 
 ## Short-Term Improvements (Next 1–2 Weeks)
+
+### Open roles on JS careers portals [TODO 2026-11-12]
+Plain HTTP now reads vacancy-card headings, `talent.community.com/projects/{slug}` links, class/id strings such as `vacancies` and `open-roles`, and one "See all roles" / "Check out open positions" hop (`agent/integrations/careers.py`). On `golemui_insurance_uk` that raised rows with role titles from 10 to 14. The rest of the careers URLs still have `website_is_hiring` of yes or unknown and an empty `website_open_roles` because the job list is not in the first HTML response.
+
+Still empty, and why:
+- Aviva (`careers.aviva.co.uk`, `/apply/`) returns HTTP 403. The live page has `js-latestVacancies_container` cards linking to `aviva.talent.community.com/projects/{slug}` and a "See all 151 roles" button. `aviva.talent.community.com` did not resolve from this machine.
+- Animal Friends (`animalfriends.co.uk/careers`) returns an empty `vacancy-card` plus a Handlebars template (`{{this.title}}`) filled by `RetrieveVacancies` after load. A rendered card would yield titles such as "Reward Partner - Europe".
+- Workday, SmartRecruiters, and iCIMS shells (Simply Business, AEGIS London, esure, AXA) and pages that keep titles inside a script or an iframe (Markerstudy → `talosats-careers.com`, Beazley).
+
+Next step when we pick this up: one rendered-page fetch per careers URL (browser or Playwright), then run the existing parser. Do not add another HTML-only pass, and do not treat `jobs.co.uk` as a company portal (`.co.uk` is the public suffix). Do not spend Apollo or a second LinkedIn jobs actor for this.
 
 ### Better Discovery Quality
 - Deterministic ICP match replaces LLM prefilter for curated campaigns — tune `icp.json` rules

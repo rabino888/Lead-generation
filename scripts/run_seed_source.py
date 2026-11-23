@@ -7,6 +7,7 @@ Talent sources (people_csv_ingest / linkedin_people) write stages/T01_raw_people
 Usage:
   python scripts/run_seed_source.py --campaign {campaign_id} --source csv_ingest --csv path/to/seeds.csv
   python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_companies
+  python scripts/run_seed_source.py --campaign {campaign_id} --source google_search --max-results 150 --append
   python scripts/run_seed_source.py --campaign {campaign_id} --source people_csv_ingest --csv people.csv
   python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_people --url "…"
   python scripts/run_seed_source.py --campaign {campaign_id} --source linkedin_jobs --url "…"  # legacy
@@ -19,6 +20,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from dotenv import load_dotenv
+
+load_dotenv(ROOT / ".env", override=True)
 
 from agent.utils.seed_sources import BLOCKED_APOLLO_SOURCES, list_sources, run_source
 
@@ -37,9 +42,36 @@ def main() -> int:
     parser.add_argument("--url", action="append", default=[], help="LinkedIn search/people URL")
     parser.add_argument("--url-file", default="", help="File with LinkedIn URLs")
     parser.add_argument("--count", type=int, default=100)
-    parser.add_argument("--max-results", type=int, default=80)
+    parser.add_argument("--max-results", type=int, default=0, help="0 = source/config default")
     parser.add_argument("--actor", default="")
     parser.add_argument("--geo-segment", default="")
+    parser.add_argument(
+        "--query",
+        action="append",
+        default=[],
+        help="google_search: search string (repeatable; overrides seed_sources.json queries)",
+    )
+    parser.add_argument(
+        "--pages-per-query",
+        type=int,
+        default=0,
+        help="google_search: SERP pages per query (default from config, else 3)",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        help="google_search / linkedin_companies: keep existing 01_raw_seeds rows, add unseen only",
+    )
+    parser.add_argument(
+        "--reuse-raw",
+        action="store_true",
+        help="google_search: re-parse saved google_search_raw.json (no Apify SERP spend)",
+    )
+    parser.add_argument(
+        "--no-firmographics",
+        action="store_true",
+        help="google_search: skip foxlabs size/industry fill (~$0.001/company)",
+    )
     args = parser.parse_args()
 
     sid = args.source.strip().lower()
@@ -62,17 +94,33 @@ def main() -> int:
     elif sid == "linkedin_people":
         kwargs["urls"] = args.url or None
         kwargs["url_file"] = args.url_file or ""
-        kwargs["max_results"] = args.max_results or args.count
+        kwargs["max_results"] = args.max_results or 80
         if args.actor:
             kwargs["actor"] = args.actor
+    elif sid == "google_search":
+        if args.max_results:
+            kwargs["max_results"] = args.max_results
+        if args.query:
+            kwargs["queries"] = args.query
+        if args.pages_per_query:
+            kwargs["pages_per_query"] = args.pages_per_query
+        if args.actor:
+            kwargs["actor"] = args.actor
+        if args.geo_segment:
+            kwargs["geo_segment"] = args.geo_segment
+        kwargs["append"] = args.append
+        kwargs["reuse_raw"] = args.reuse_raw
+        if args.no_firmographics:
+            kwargs["firmographics"] = False
     elif sid == "linkedin_companies":
-        kwargs["max_results"] = args.max_results or args.count
+        kwargs["max_results"] = args.max_results or 80
+        kwargs["append"] = args.append
         if args.actor:
             kwargs["actor"] = args.actor
         if args.geo_segment:
             kwargs["geo_segment"] = args.geo_segment
     elif sid == "google_maps":
-        kwargs["max_results"] = args.max_results or args.count
+        kwargs["max_results"] = args.max_results or 80
         if args.geo_segment:
             kwargs["geo_segment"] = args.geo_segment
     elif sid == "linkedin_jobs":

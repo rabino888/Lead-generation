@@ -32,7 +32,7 @@ from agent.utils.deduplication import (
     mark_leads_as_delivered,
 )
 from agent.utils.keyword_score import score_leads
-from agent.utils.logger import get_run_logger
+from agent.utils.logger import attach_leadgen_mirror, detach_leadgen_mirror, get_run_logger
 
 
 async def run_pipeline(
@@ -58,6 +58,18 @@ async def run_pipeline(
     reset_tokens_used()
     reset_cost_tracker()
     init_cost_tracker(run_id, client_profile.client_id)
+    leadgen_mirror = attach_leadgen_mirror(log)
+    raw_tokens = None
+    campaign_id = (getattr(request, "campaign_id", None) or "").strip()
+    if campaign_id:
+        try:
+            from agent.utils.campaign_config import load_campaign
+            from agent.utils.raw_replies import bind_raw_replies
+
+            raw_tokens = bind_raw_replies(load_campaign(campaign_id).campaign_dir, run_id)
+        except Exception:
+            log.warning("raw reply capture not attached", exc_info=True)
+            raw_tokens = None
 
     run_tracker.update_run(run_id, status=RunStatus.RUNNING)
 
@@ -95,55 +107,34 @@ async def run_pipeline(
         log.info("── Stage 2: ICP passthrough (rules applied upstream) ──")
         filtered_companies = companies
 
-        initial_window_size = max(request.max_leads * 5, 20)
-        processing_window = filtered_companies[:initial_window_size]
-        log.info("Processing window: %d companies", len(processing_window))
-
         run_tracker.update_run(run_id, current_stage="contact_enrichment")
         log.info("── Stage 3: Contact enrichment (Apollo) ──")
-
-        qualified_batch, rejected_batch = contacts.run(
-            companies=processing_window,
-            client_profile=client_profile,
-            input_mode=request.mode,
-            run_id=run_id,
-            logger=log,
+        log.info(
+            "Walking %d companies until %d contactable",
+            len(filtered_companies),
+            request.max_leads,
         )
-        all_qualified.extend(qualified_batch)
-        all_rejected.extend(rejected_batch)
 
-        remaining = filtered_companies[initial_window_size:]
+        remaining = list(filtered_companies)
         batch_size = 20
-        MAX_EXTRA_BATCHES = 2
-        extra_batches_done = 0
-
-        while (
-            len(all_qualified) < request.max_leads
-            and remaining
-            and extra_batches_done < MAX_EXTRA_BATCHES
-        ):
-            extra_batches_done += 1
-            extra_batch = remaining[:batch_size]
+        while remaining and len(all_qualified) < request.max_leads:
+            batch = remaining[:batch_size]
             remaining = remaining[batch_size:]
-
             log.info(
-                "Need more qualified leads (%d/%d) — processing %d more companies (batch %d/%d)",
+                "Contact batch: %d companies (%d/%d contactable so far)",
+                len(batch),
                 len(all_qualified),
                 request.max_leads,
-                len(extra_batch),
-                extra_batches_done,
-                MAX_EXTRA_BATCHES,
             )
-
-            extra_qualified, extra_rejected = contacts.run(
-                companies=extra_batch,
+            qualified_batch, rejected_batch = contacts.run(
+                companies=batch,
                 client_profile=client_profile,
                 input_mode=request.mode,
                 run_id=run_id,
                 logger=log,
             )
-            all_qualified.extend(extra_qualified)
-            all_rejected.extend(extra_rejected)
+            all_qualified.extend(qualified_batch)
+            all_rejected.extend(rejected_batch)
 
         all_qualified = _dedupe_leads_by_contact(all_qualified, log)
         all_qualified = filter_seen_contacts(client_profile.client_id, all_qualified, log)
@@ -229,6 +220,12 @@ async def run_pipeline(
         error_msg = f"{type(e).__name__}: {str(e)}"
         log.error("PIPELINE FAILED: %s\n%s", error_msg, traceback.format_exc())
         run_tracker.fail_run(run_id, error_msg)
+    finally:
+        detach_leadgen_mirror(leadgen_mirror)
+        if raw_tokens is not None:
+            from agent.utils.raw_replies import unbind_raw_replies
+
+            unbind_raw_replies(raw_tokens)
 
 
 def _raise_if_breached() -> None:
