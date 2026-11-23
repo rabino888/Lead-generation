@@ -37,6 +37,7 @@ from agent.models import (
 from agent.pipeline import run_pipeline
 from agent.dashboard.routes import router as dashboard_router
 from agent.dashboard.builder_routes import router as builder_router
+from agent.dashboard.autopilot_routes import router as autopilot_router
 from agent.utils.auth import invalidate_cache
 from agent.utils.deduplication import clear_registry, get_seen_count
 from agent.utils.logger import log
@@ -50,6 +51,7 @@ app = FastAPI(
 
 app.include_router(dashboard_router)
 app.include_router(builder_router)
+app.include_router(autopilot_router)
 
 from agent.dashboard.static_mount import mount_portal_static
 

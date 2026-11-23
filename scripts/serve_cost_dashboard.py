@@ -53,6 +53,7 @@ def main() -> int:
     import uvicorn
     from fastapi import FastAPI
 
+    from agent.dashboard.autopilot_routes import router as autopilot_router
     from agent.dashboard.builder_routes import router as builder_router
     from agent.dashboard.routes import router as dashboard_router
     from agent.dashboard.static_mount import mount_portal_static
@@ -60,11 +61,13 @@ def main() -> int:
     app = FastAPI(title="Lead-gen cost dashboard + list builder")
     app.include_router(dashboard_router)
     app.include_router(builder_router)
+    app.include_router(autopilot_router)
     mount_portal_static(app)
 
     base = f"http://{args.host}:{args.port}"
     print(f"Cost ledger (home):    {base}/dashboard")
     print(f"Campaign builder:      {base}/builder?client=… or ?new=1")
+    print(f"Autopilot:             {base}/autopilot")
     print("  /builder/api/campaigns              list campaigns")
     print("  /builder/api/campaigns/{id}         plan + ICP summary")
     print("  /builder/api/campaigns/{id}/estimate")

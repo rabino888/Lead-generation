@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Autopilot — Lead List Ledger</title>
+  <link rel="stylesheet" href="/static/portal.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="appnav" aria-label="App navigation">
+    <a href="/dashboard" class="brand brand-title">Lead List Ledger</a>
+    <div class="nav-btns">
+      <a href="/dashboard">Overview</a>
+      <a href="/builder?new=1">Campaign builder</a>
+      <a href="/autopilot" class="here">Autopilot</a>
+    </div>
+  </div>
+  <header class="masthead">
+    <p class="eyebrow">One approval, then the funnel</p>
+    <h1>Autopilot</h1>
+    <p class="sub">Paste a company URL. You approve three times: the plan, the companies, then whether to draft a sequence. Nothing is sent.</p>
+  </header>
+  <main>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>New plan</h3>
+        <span class="hint">Research only — no Apollo or Apify spend yet</span>
+      </div>
+      <form id="start-form" class="field-stack">
+        <label>Company URL
+          <input id="url" name="url" type="url" required placeholder="https://example.com">
+        </label>
+        <div class="field-row">
+          <label>Client id (optional)
+            <input id="client-id" name="client_id" autocomplete="off">
+          </label>
+          <label>Target leads
+            <input id="target-leads" name="target_leads" type="number" min="1" max="500" value="25">
+          </label>
+        </div>
+        <label>Spend cap (USD)
+          <input id="max-usd" name="max_usd" type="number" min="0" step="0.01" value="25">
+        </label>
+        <label>Notes for the plan
+          <textarea id="notes" name="notes" placeholder="Buyer geo, titles, or a constraint"></textarea>
+        </label>
+        <p id="start-error" class="hint" role="alert"></p>
+        <button class="btn primary" type="submit">Build plan</button>
+      </form>
+    </section>
+    <section class="panel" id="detail" hidden>
+      <div class="panel-head">
+        <h3 id="detail-title">Plan</h3>
+        <span class="hint" id="detail-phase"></span>
+      </div>
+      <div id="assistant" class="field-stack"></div>
+      <pre id="plan-text" style="white-space:pre-wrap;font-family:var(--font-mono);font-size:.8rem"></pre>
+      <div class="field-stack">
+        <label>Notes for the assistant
+          <textarea id="decision-notes" placeholder="What to change before the next step"></textarea>
+        </label>
+        <div class="nav-btns">
+          <button class="btn primary" id="approve" type="button">Approve and continue</button>
+          <button class="btn" id="generate" type="button">Generate sequence</button>
+          <button class="btn" id="skip" type="button">Skip sequence</button>
+          <button class="btn danger" id="reject" type="button">Revise from notes</button>
+        </div>
+        <p id="detail-error" class="hint" role="alert"></p>
+      </div>
+      <h3>Log</h3>
+      <pre id="log-text" style="white-space:pre-wrap;font-family:var(--font-mono);font-size:.78rem"></pre>
+    </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h3>Runs</h3>
+      </div>
+      <div id="runs"></div>
+    </section>
+  </main>
+</div>
+<script>
+(function () {
+  const runsEl = document.getElementById('runs');
+  const detail = document.getElementById('detail');
+  const planText = document.getElementById('plan-text');
+  const logText = document.getElementById('log-text');
+  let current = '';
+
+  function showError(id, message) {
+    document.getElementById(id).textContent = message || '';
+  }
+
+  async function read(path, options) {
+    const response = await fetch(path, options);
+    const body = await response.json().catch(function () { return {}; });
+    if (!response.ok) {
+      const detailText = body.detail || response.statusText;
+      throw new Error(typeof detailText === 'string' ? detailText : JSON.stringify(detailText));
+    }
+    return body;
+  }
+
+  function renderList(runs) {
+    runsEl.replaceChildren();
+    if (!runs.length) {
+      runsEl.textContent = 'No autopilot runs yet.';
+      return;
+    }
+    runs.forEach(function (run) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'btn ghost';
+      button.textContent = (run.company_name || run.company_url) + ' — ' + run.phase;
+      button.addEventListener('click', function () { openRun(run.run_id); });
+      const row = document.createElement('p');
+      row.appendChild(button);
+      runsEl.appendChild(row);
+    });
+  }
+
+  function renderAssistant(note) {
+    const host = document.getElementById('assistant');
+    host.replaceChildren();
+    if (!note || !note.headline) return;
+    const title = document.createElement('h3');
+    title.textContent = note.headline;
+    host.appendChild(title);
+    const summary = document.createElement('p');
+    summary.textContent = note.narrative || note.summary || '';
+    host.appendChild(summary);
+    (note.findings || []).forEach(function (line) {
+      const p = document.createElement('p');
+      p.className = 'hint';
+      p.textContent = line;
+      host.appendChild(p);
+    });
+    const rec = document.createElement('p');
+    rec.textContent = note.recommendation || '';
+    host.appendChild(rec);
+    (note.sample || []).slice(0, 12).forEach(function (row) {
+      const p = document.createElement('p');
+      p.textContent = [row.company_name, row.website, row.industry].filter(Boolean).join(' — ');
+      host.appendChild(p);
+    });
+  }
+
+  function renderRun(run) {
+    current = run.run_id;
+    detail.hidden = false;
+    document.getElementById('detail-title').textContent = run.company_name || run.run_id;
+    document.getElementById('detail-phase').textContent = run.phase + (run.halt_reason ? ' — ' + run.halt_reason : '');
+    planText.textContent = (run.plan && run.plan.markdown) || '';
+    renderAssistant(run.assistant || {});
+    const phase = run.phase || '';
+    document.getElementById('approve').hidden = phase === 'awaiting_sequence_approval' || phase === 'completed';
+    document.getElementById('generate').hidden = phase !== 'awaiting_sequence_approval';
+    document.getElementById('skip').hidden = phase !== 'awaiting_sequence_approval';
+    const approve = document.getElementById('approve');
+    if (phase === 'awaiting_plan_approval' || phase === 'awaiting_approval') approve.textContent = 'Approve plan';
+    else if (phase === 'awaiting_company_approval') approve.textContent = 'Approve companies';
+    else approve.textContent = 'Approve and continue';
+    const lines = (run.log || []).map(function (entry) {
+      return entry.at + '  ' + entry.event + (entry.summary ? '  ' + entry.summary : '') + (entry.why ? '  ' + entry.why : '');
+    });
+    logText.textContent = lines.join('\n');
+  }
+
+  async function refresh() {
+    const body = await read('/autopilot/api/runs');
+    renderList(body.runs || []);
+  }
+
+  async function openRun(id) {
+    showError('detail-error', '');
+    const run = await read('/autopilot/api/runs/' + encodeURIComponent(id));
+    renderRun(run);
+  }
+
+  document.getElementById('start-form').addEventListener('submit', async function (event) {
+    event.preventDefault();
+    showError('start-error', '');
+    const payload = {
+      url: document.getElementById('url').value,
+      client_id: document.getElementById('client-id').value,
+      notes: document.getElementById('notes').value,
+      target_leads: Number(document.getElementById('target-leads').value || 25),
+      max_usd: Number(document.getElementById('max-usd').value || 25)
+    };
+    try {
+      const body = await read('/autopilot/api/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      renderRun(body.run);
+      await refresh();
+    } catch (error) {
+      showError('start-error', error.message);
+    }
+  });
+
+  async function decide(path, payload) {
+    showError('detail-error', '');
+    if (!current) return;
+    try {
+      const body = await read('/autopilot/api/runs/' + encodeURIComponent(current) + path, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      renderRun(body.run);
+      await refresh();
+    } catch (error) {
+      showError('detail-error', error.message);
+    }
+  }
+
+  document.getElementById('approve').addEventListener('click', function () {
+    decide('/approve', { confirm: true, and_run: true, generate_sequence: false, notes: document.getElementById('decision-notes').value });
+  });
+  document.getElementById('generate').addEventListener('click', function () {
+    const ok = window.confirm('Draft the outreach sequence? This can spend model tokens. No email is sent.');
+    if (!ok) return;
+    decide('/approve', { confirm: true, gate: 'sequence', and_run: true, generate_sequence: true, notes: document.getElementById('decision-notes').value });
+  });
+  document.getElementById('skip').addEventListener('click', function () {
+    decide('/approve', { confirm: true, gate: 'sequence', and_run: true, generate_sequence: false, notes: document.getElementById('decision-notes').value });
+  });
+  document.getElementById('reject').addEventListener('click', function () {
+    decide('/reject', { notes: document.getElementById('decision-notes').value, rerun: false });
+  });
+
+  refresh().catch(function (error) { showError('start-error', error.message); });
+})();
+</script>
+</body>
+</html>
