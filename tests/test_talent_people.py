@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import csv
-import json
 from pathlib import Path
 
 import pytest
@@ -23,9 +22,6 @@ from agent.utils.talent_people import (
     person_row_from_mapping,
     read_people_csv,
 )
-
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
-
 
 def test_normalize_linkedin_person_url():
     assert (
@@ -177,23 +173,51 @@ def test_build_people_search_input_from_people_search_url():
 
 
 def test_harvestapi_fixture_maps_to_t01(tmp_path: Path):
-    fixture = FIXTURES / "harvestapi_people_search_short.json"
-    items = json.loads(fixture.read_text(encoding="utf-8"))
+    # Inline stand-in for a HarvestAPI Short payload. The vanity id wins over an opaque member URL.
+    items = [
+        {
+            "linkedinUrl": "https://www.linkedin.com/in/ACwAAAopaqueexample",
+            "publicIdentifier": "ada-north",
+            "firstName": "Ada",
+            "lastName": "North",
+            "location": {"linkedinText": "Los Angeles, California, United States"},
+            "currentPosition": [
+                {
+                    "title": "Staff Pharmacist",
+                    "companyName": "Pineyard Health",
+                    "companyLinkedinUrl": "https://www.linkedin.com/company/pineyard-health",
+                }
+            ],
+        },
+        {
+            "publicIdentifier": "hamid-example",
+            "fullName": "Hamid R. Example",
+            "headline": "Backend Engineer",
+            "location": "Madrid, Community of Madrid, Spain",
+            "currentPosition": [
+                {
+                    "title": "Backend Engineer",
+                    "companyName": "Example SA",
+                    "companyLinkedinUrl": "https://www.linkedin.com/company/example-sa",
+                }
+            ],
+        },
+    ]
     rows = items_from_apify_people(
         items, seed_source_id="linkedin_people", campaign_id="talent_es"
     )
     assert len(rows) == 2
     by_url = {r["linkedin_url"]: r for r in rows}
-    ada = by_url["https://www.linkedin.com/in/towhid-rahman"]
-    assert ada["first_name"] == "Towhid"
-    assert ada["last_name"] == "Rahman"
+    ada = by_url["https://www.linkedin.com/in/ada-north"]
+    assert ada["first_name"] == "Ada"
+    assert ada["last_name"] == "North"
     assert "Los Angeles" in ada["location"]
-    assert ada["company_name"] == "CVS Health"
+    assert ada["company_name"] == "Pineyard Health"
     assert ada["title"] == "Staff Pharmacist"
-    assert "cvshealth" in ada["company_linkedin_url"]
-    hamid = by_url["https://www.linkedin.com/in/hamidsharif"]
+    assert "pineyard-health" in ada["company_linkedin_url"]
+    hamid = by_url["https://www.linkedin.com/in/hamid-example"]
     assert hamid["headline"] == "Backend Engineer"
-    assert hamid["full_name"] == "Hamid R. Sharif"
+    assert hamid["full_name"] == "Hamid R. Example"
     assert hamid["company_name"] == "Example SA"
     assert hamid["location"] == "Madrid, Community of Madrid, Spain"
     out = persist_t01(tmp_path, rows)

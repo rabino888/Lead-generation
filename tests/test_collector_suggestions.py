@@ -5,6 +5,8 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 from types import SimpleNamespace
 
 from agent.models import WebsiteAnalysis
@@ -301,6 +303,7 @@ def test_hiring_function_buckets_existing_titles():
     assert "tech_stack" not in row
 
 
+@pytest.mark.skipif(not GOLEM.is_dir(), reason="local client folder is not in the repo")
 def test_golem_prompt_omits_pitch_and_proof_line():
     context = load_collector_context(GOLEM)
     prompt = build_collector_prompt(context)
@@ -314,6 +317,7 @@ def test_golem_prompt_omits_pitch_and_proof_line():
     assert any("proposed" in warning for warning in context["warnings"])
 
 
+@pytest.mark.skipif(not GOLEM.is_dir(), reason="local client folder is not in the repo")
 def test_golem_suggestions_file_stays_proposed():
     doc = json.loads((GOLEM / "collector_suggestions.json").read_text(encoding="utf-8"))
     campaign = json.loads((GOLEM / "campaign.json").read_text(encoding="utf-8"))

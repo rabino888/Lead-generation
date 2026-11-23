@@ -278,7 +278,8 @@ def test_enrich_person_by_linkedin_fallback_name_org():
         )
     assert contact is not None
     assert contact.email == "ada@engines.dev"
-    assert get_credits_used() == 1
+    # Both reveal attempts are billed, including the LinkedIn match that found nobody.
+    assert get_credits_used() == 2
 
 
 def test_enrich_person_by_linkedin_falls_through_when_url_match_has_no_email():
